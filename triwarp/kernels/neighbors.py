@@ -926,6 +926,34 @@ def point_triangle_indices(out_indices: wp.array[wp.int32]) -> None:
     out_indices[c] = c // 3
 
 
+@wp.func
+def mesh_nearest_point(
+    mesh_id: wp.uint64, points: wp.array[wp.vec3], q: wp.vec3, max_radius: wp.float32
+) -> tuple[wp.int32, wp.float32]:
+    # The nearest point to ``q`` within ``max_radius``, by the mesh BVH's best-first closest-point
+    # descent over the collapsed triangles ``point_triangle_indices`` builds: ``(-1, inf)`` when
+    # none is in range. Its cost follows the tree's depth rather than the distance to the answer,
+    # which is what neither the grid's cell walk nor the BVH's radius deepening does. The closest
+    # point of a triangle whose three corners coincide is that corner, exactly, and the distance is
+    # recomputed with the ball searches' own ``wp.length`` so a row answers the same whichever
+    # search decided it.
+    #
+    # **This rests on a Warp implementation detail, read from ``native/mesh.h`` (Warp 1.17)**: the
+    # leaf test skips a sliver when ``|n| / sum(|e|^2) < 1e-6``, which for a collapsed triangle is
+    # ``0 / 0`` -- NaN, which compares false, so the triangle is *tested* rather than culled.
+    # ``tests/test_neighbors.py::test_mesh_from_points_answers_the_nearest_point`` fails if a
+    # release ever culls it.
+    index = wp.int32(-1)
+    distance = wp.float32(FLOAT32_INF_CONSTANT)
+    hit = wp.mesh_query_point_no_sign(mesh_id, q, max_radius)
+    if hit.result:
+        d = wp.length(points[hit.face] - q)
+        if d <= max_radius:
+            index = hit.face
+            distance = d
+    return index, distance
+
+
 @wp.kernel
 def nearest_point_via_mesh(
     mesh_id: wp.uint64,
@@ -935,24 +963,54 @@ def nearest_point_via_mesh(
     out_indices: wp.array2d[wp.int32],
     out_distances: wp.array2d[wp.float32],
 ) -> None:
-    # The ``k = 1`` rows the grid deferred, answered by the mesh BVH's best-first closest-point
-    # descent over the collapsed triangles ``point_triangle_indices`` builds. Its cost follows the
-    # tree's depth rather than the distance to the answer, which is exactly what the grid's does
-    # not. The closest point of a triangle whose three corners coincide is that corner, exactly,
-    # and the distance is recomputed here with the grid's own ``wp.length`` so a row answers the
-    # same whichever pass decided it.
+    # The ``k = 1`` rows the grid deferred; ``query_nearest_via_mesh`` answers every row instead.
     tid = wp.int32(wp.tid())
     if out_indices[tid, 0] != DEFERRED_ROW:
         return
-    q = queries[tid]
-    out_indices[tid, 0] = -1
-    out_distances[tid, 0] = wp.inf
-    hit = wp.mesh_query_point_no_sign(mesh_id, q, max_radius)
-    if hit.result:
-        d = wp.length(points[hit.face] - q)
-        if d <= max_radius:
-            out_indices[tid, 0] = hit.face
-            out_distances[tid, 0] = d
+    index, distance = mesh_nearest_point(mesh_id, points, queries[tid], max_radius)
+    out_indices[tid, 0] = index
+    out_distances[tid, 0] = distance
+
+
+@wp.kernel
+def query_nearest_via_mesh(
+    mesh_id: wp.uint64,
+    points: wp.array[wp.vec3],
+    queries: wp.array[wp.vec3],
+    max_radius: wp.float32,
+    out_indices: wp.array2d[wp.int32],
+    out_distances: wp.array2d[wp.float32],
+) -> None:
+    # ``query_nearest``'s ``k = 1`` BVH-backend search, every row through the collapsed-triangle
+    # mesh. Differs from ``nearest_point_via_mesh`` only in answering every row rather than the
+    # grid's deferred ones, which saves a ``DEFERRED_ROW`` pre-fill of the output.
+    tid = wp.int32(wp.tid())
+    index, distance = mesh_nearest_point(mesh_id, points, queries[tid], max_radius)
+    out_indices[tid, 0] = index
+    out_distances[tid, 0] = distance
+
+
+@wp.kernel
+def query_nearest_via_mesh_after_step(
+    mesh_id: wp.uint64,
+    points: wp.array[wp.vec3],
+    queries: wp.array[wp.vec3],
+    step: wp.array[wp.mat44],
+    max_radius: wp.float32,
+    out_indices: wp.array2d[wp.int32],
+    out_distances: wp.array2d[wp.float32],
+    out_moved: wp.array[wp.vec3],
+) -> None:
+    # ``query_nearest_via_mesh`` over queries moved by ``step[0]`` first, publishing the moved
+    # point: ``icp`` / ``icp_point_to_plane``'s cloud loops apply each iteration's rigid step at the
+    # next correspondence search, as their mesh loop does in
+    # ``registration.mesh_correspondence_pass``, rather than in a transform launch of its own.
+    tid = wp.int32(wp.tid())
+    q = transform_point_mat44(queries[tid], step[0])
+    out_moved[tid] = q
+    index, distance = mesh_nearest_point(mesh_id, points, q, max_radius)
+    out_indices[tid, 0] = index
+    out_distances[tid, 0] = distance
 
 
 @wp.kernel

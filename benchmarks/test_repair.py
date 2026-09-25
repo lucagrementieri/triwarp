@@ -1019,31 +1019,29 @@ def test_remove_degree3_vertices(bench_case: BenchCase) -> None:
     One pass over every vertex, plus a face compaction -- and usually nothing to remove.
 
     The scan meshes carry few valence-3 interior vertices, so this group mostly times the *search*:
-    a ``vertex_one_rings`` build, a candidate map, an independence pass and one readback. That is
-    the honest thing to measure, because the search is what a caller pays unconditionally in a
-    repair pipeline while the removal is proportional to a defect that may not be there.
+    one pass over the halfedges recording each vertex's face count and first three faces, one
+    selection-and-emit pass, and one readback. That is the honest thing to measure, because the
+    search is what a caller pays unconditionally in a repair pipeline while the removal is
+    proportional to a defect that may not be there.
 
     meshlib's row is ``findInnerVertsOfDegree(topology, 3)`` -- the candidate mask, not the removal,
     since ``eliminateDegree3Vertices`` mutates in place and would need a fresh mesh per round while
     finding nothing after the first. So it is the same *search* on both sides; where it is not a
     like-for-like is that meshlib is handed a ``MeshTopology`` built outside its row and triwarp
-    builds a halfedge structure inside its own.
+    validates edge-manifoldness inside its own.
 
-    Attributed on a clean mesh, where nothing is removed, two thirds of one pass is
-    ``vertex_one_rings`` and most of the rest is the vertex-count readback. So the floor is the
-    halfedge build, and a scan mesh's several milliseconds are that floor times the number of
-    passes -- removing one valence-3 vertex can expose another, so the loop runs until it finds
-    none. meshlib's row times only the *mask* and is correspondingly far cheaper.
+    **The pass needs no halfedge structure.** An interior degree-3 vertex's three opposite edges
+    close into one directed 3-cycle, which *is* the replacement triangle, so the per-pass
+    ``vertex_one_rings`` build (42-70 % of the call) became a face-count table, and the selection,
+    the emit and the next-pass signal one launch reading it. Byte-identical on the CPU device on the
+    three scan meshes and on a two-level cascade; 1.43x on ``bunny``, 1.59x on ``dragon``, 2.15x on
+    ``happy_buddha`` (one pass, two, three; interleaved, min, shared box). What is left is the one
+    validating ``halfedge_twins`` on the input -- the documented non-manifold ``ValueError``,
+    which is most of the call on the scan meshes -- and the final vertex compaction.
 
-    **The asymmetry with meshlib's prebuilt ``MeshTopology`` is not a hoist waiting to happen**,
-    which is worth saying because it reads like one. ``vertex_one_rings`` takes an optional
-    ``twins=``, so the build *could* be lifted out of the loop -- except that each pass deletes
-    faces, so the next pass's halfedge structure is over a different mesh and has to be rebuilt.
-    The last pass's build, which found nothing, was the one genuinely wasted one, and it is gone:
-    removing a fan changes only its rim vertices' face counts, so the emit kernel counts the rim
-    vertices it turns into candidates and a zero skips the confirming pass outright. That took
-    ``bunny`` from 2 passes to 1, ``dragon`` 3 to 2 and ``happy_buddha`` 4 to 3 (24 -> 16, 35 -> 27
-    and 46 -> 38 launches), byte-identical, for one 4-byte read per pass that removed something.
+    Removing a fan changes only its rim vertices' face counts, so the emit kernel counts the rim
+    vertices it may turn into candidates and a zero skips the confirming pass outright; that signal
+    is conservative (it cannot see a count that falls past 3) and ran no extra pass on a scan mesh.
 
     **The independent-set rewrite is declined, measured.** Every pass-0 candidate on all three scan
     meshes is selected -- no two candidates are adjacent (9, 1 285 and 1 839 candidates, zero

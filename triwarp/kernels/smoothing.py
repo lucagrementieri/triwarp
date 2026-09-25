@@ -1,6 +1,6 @@
 import warp as wp
 
-from triwarp.kernels.array import to_vec3d
+from triwarp.kernels.array import inverse_or_one, to_vec3d
 from triwarp.kernels.laplacian import cot_entries_from_l2, face_half_cotangents, operator_row
 from triwarp.kernels.linalg import free_row, selected_row, solve_normal_equations
 from triwarp.kernels.predicates import (
@@ -66,190 +66,680 @@ def clamp_cotan(w: wp.float32) -> wp.float32:
     return wp.clamp(w, wp.float32(-1.0), wp.float32(10.0))
 
 
+# The region solves never assemble a weight *matrix*. Everything they read of the connectivity is
+# the vertex -> unique-edge incidence (``incident_edge_counts`` / ``scatter_incident_edges``, then
+# ``array.sort_segments``), built once per region pair, and the per-solve weights stay a per-edge
+# array: a row walk reads ``weights[e]`` for each incident edge ``e``. Sorting a row by edge id
+# sorts it by neighbour too -- the unique-edge table is sorted with the smaller endpoint first, so a
+# vertex's edges to smaller neighbours ``(a, v)`` all precede its edges ``(v, b)`` to larger ones,
+# each run in neighbour order -- so every row walk visits the neighbours in ascending order, which
+# is the column order the ``bsr_from_triplets`` weight matrix these kernels replace stored them in.
+# The sums over a row therefore run in the same order and round the same way.
+#
+# A self-loop edge ``(v, v)`` (a face repeating a vertex) is left out of the incidence: it is no
+# neighbour, and in a row it would duplicate the diagonal's column.
+
+
 @wp.kernel
-def symmetric_weight_triplets(
+def incident_edge_counts(
     unique_edges: wp.array2d[wp.int32],
-    weights: wp.array[wp.float32],
-    out_rows: wp.array[wp.int32],
-    out_cols: wp.array[wp.int32],
-    out_vals: wp.array[wp.float64],
+    out_counts: wp.array[wp.int32],
+    out_ranks: wp.array2d[wp.int32],
 ) -> None:
-    # The cotangent clamp is applied here rather than by a separate map over ``weights``: it is
-    # the identity on the unit weights, so one kernel serves both ``edge_weights`` modes.
-    i = wp.int32(wp.tid())
-    a = unique_edges[i, 0]
-    b = unique_edges[i, 1]
-    w = wp.float64(clamp_cotan(weights[i]))
-    out_rows[2 * i] = a
-    out_cols[2 * i] = b
-    out_vals[2 * i] = w
-    out_rows[2 * i + 1] = b
-    out_cols[2 * i + 1] = a
-    out_vals[2 * i + 1] = w
+    # Each vertex's number of incident unique edges, one atomic per endpoint, and each edge's rank
+    # in its two endpoints' rows -- the value the atomic returns -- so the fill needs no cursor of
+    # its own. ``out_counts`` arrives zeroed and is the tail of an ``n + 1`` offsets buffer, which
+    # the caller scans in place.
+    e = wp.int32(wp.tid())
+    a = unique_edges[e, 0]
+    b = unique_edges[e, 1]
+    if a != b:
+        out_ranks[e, 0] = wp.atomic_add(out_counts, a, 1)
+        out_ranks[e, 1] = wp.atomic_add(out_counts, b, 1)
 
 
 @wp.kernel
-def dirichlet_system_triplets(
+def scatter_incident_edges(
+    unique_edges: wp.array2d[wp.int32],
     offsets: wp.array[wp.int32],
-    columns: wp.array[wp.int32],
-    values: wp.array[wp.float64],
+    ranks: wp.array2d[wp.int32],
+    out_edges: wp.array[wp.int32],
+) -> None:
+    # The counting-sort fill of the incidence: ``graph.scatter_neighbor_lists``, writing the edge id
+    # rather than the other endpoint -- which is what lets a row walk read the edge's weight -- at
+    # the rank ``incident_edge_counts`` handed out. The order within a row is arrival order until
+    # ``array.sort_segments`` sorts it.
+    e = wp.int32(wp.tid())
+    a = unique_edges[e, 0]
+    b = unique_edges[e, 1]
+    if a != b:
+        out_edges[offsets[a] + ranks[e, 0]] = e
+        out_edges[offsets[b] + ranks[e, 1]] = e
+
+
+@wp.func
+def incident_neighbor(unique_edges: wp.array2d[wp.int32], e: wp.int32, v: wp.int32) -> wp.int32:
+    # The endpoint of incident edge ``e`` that is not ``v``.
+    return unique_edges[e, 0] + unique_edges[e, 1] - v
+
+
+@wp.func
+def edge_weight(weights: wp.array[wp.float32], e: wp.int32, unit: wp.int32) -> wp.float64:
+    # The weight of unique edge ``e``: ``1`` for unit weights (no array is passed), else its
+    # clamped cotangent. ``unit`` is warp-uniform.
+    if unit != wp.int32(0):
+        return wp.float64(1.0)
+    return wp.float64(clamp_cotan(weights[e]))
+
+
+@wp.func
+def place_free_entry(
+    v: wp.int32, j: wp.int32, slot: wp.int32, diagonal: wp.int32
+) -> tuple[wp.int32, wp.int32, wp.int32]:
+    # The one layout rule of a free row ``v`` of the free-free pattern: its diagonal sits before
+    # its first free neighbour above ``v``, so the row's columns -- free ranks, which are monotone
+    # in the vertex index -- are sorted. Called for each free neighbour ``j`` in ascending order
+    # with the running ``slot`` and the diagonal's slot (``-1`` until placed); returns ``j``'s slot,
+    # the next free slot and the diagonal's. ``close_free_row`` places a diagonal no neighbour
+    # came after.
+    if diagonal < 0 and j > v:
+        diagonal = slot
+        slot = slot + 1
+    return slot, slot + 1, diagonal
+
+
+@wp.func
+def close_free_row(slot: wp.int32, diagonal: wp.int32) -> wp.int32:
+    # The diagonal's slot once the whole row has been walked: see ``place_free_entry``.
+    return wp.where(diagonal < 0, slot, diagonal)
+
+
+@wp.func
+def free_degree(
+    offsets: wp.array[wp.int32],
+    incident: wp.array[wp.int32],
+    unique_edges: wp.array2d[wp.int32],
+    free_mask: wp.array[wp.bool],
+    v: wp.int32,
+) -> wp.int32:
+    # ``v``'s free neighbours plus ``v`` itself when free: the length of ``v``'s row of the
+    # free-free pattern, and of the column set a least-squares row ``v`` carries.
+    count = wp.where(free_mask[v], wp.int32(1), wp.int32(0))
+    for k in range(offsets[v], offsets[v + 1]):
+        if free_mask[incident_neighbor(unique_edges, incident[k], v)]:
+            count += 1
+    return count
+
+
+@wp.kernel
+def free_pattern_counts(
+    offsets: wp.array[wp.int32],
+    incident: wp.array[wp.int32],
+    unique_edges: wp.array2d[wp.int32],
     free_mask: wp.array[wp.bool],
     free_map: wp.array[wp.int32],
-    points: wp.array[wp.vec3],
-    stabilizer: wp.float64,
-    out_rows: wp.array[wp.int32],
-    out_cols: wp.array[wp.int32],
-    out_vals: wp.array[wp.float64],
-    out_rhs_x: wp.array[wp.float64],
-    out_rhs_y: wp.array[wp.float64],
-    out_rhs_z: wp.array[wp.float64],
+    out_counts: wp.array[wp.int32],
 ) -> None:
-    # SPD umbrella system A = D - W over free verts, sharp boundary (weights in the
-    # CSR ``W``), fixed 1-ring neighbors folded into the right-hand side, plus optional stabilizer.
+    # Row lengths of the free-free pattern -- the diagonal plus the free neighbours -- which is the
+    # sparsity of the fixed-rim system ``D - W`` and of the smooth solve's square block ``L_ff``
+    # alike. ``out_counts`` is the tail of the ``n_free + 1`` offsets buffer.
+    v = wp.int32(wp.tid())
+    ri = selected_row(free_mask, free_map, v)
+    if ri >= 0:
+        out_counts[ri] = free_degree(offsets, incident, unique_edges, free_mask, v)
+
+
+@wp.kernel
+def free_pattern_columns(
+    offsets: wp.array[wp.int32],
+    incident: wp.array[wp.int32],
+    unique_edges: wp.array2d[wp.int32],
+    free_mask: wp.array[wp.bool],
+    free_map: wp.array[wp.int32],
+    pattern_offsets: wp.array[wp.int32],
+    out_columns: wp.array[wp.int32],
+) -> None:
+    # The free-free pattern's columns, sorted (``place_free_entry``). Positions only: every solve
+    # over the region writes its own values into these slots.
     v = wp.int32(wp.tid())
     ri = selected_row(free_mask, free_map, v)
     if ri < 0:
         return
-    start = offsets[v]
-    end = offsets[v + 1]
-    sum_w = stabilizer
-    rhs = stabilizer * to_vec3d(points[v])
-    base = start + v  # one reserved diagonal slot per vertex; off-diagonals follow
-    for k in range(start, end):
-        j = columns[k]
-        w = values[k]
-        sum_w += w
+    slot = pattern_offsets[ri]
+    diagonal = wp.int32(-1)
+    for k in range(offsets[v], offsets[v + 1]):
+        j = incident_neighbor(unique_edges, incident[k], v)
         cj = selected_row(free_mask, free_map, j)
         if cj >= 0:
-            slot = base + 1 + (k - start)
-            out_rows[slot] = ri
-            out_cols[slot] = cj
-            out_vals[slot] = -w
+            entry, slot, diagonal = place_free_entry(v, j, slot, diagonal)
+            out_columns[entry] = cj
+    out_columns[close_free_row(slot, diagonal)] = ri
+
+
+@wp.func
+def gather_free_positions(
+    points: wp.array[wp.vec3],
+    v: wp.int32,
+    i: wp.int32,
+    out_sol_x: wp.array[wp.float64],
+    out_sol_y: wp.array[wp.float64],
+    out_sol_z: wp.array[wp.float64],
+) -> None:
+    # Seed free unknown ``i`` (vertex ``v``) with its current position: the inverse of
+    # ``scatter_free_solution``, written by each region solve's assembly kernel for its own rows.
+    # Both solves ask CG for the free vertices' *new* positions, whose best available initial guess
+    # is their current ones -- and for a vertex no face refers to it is the only one, because such
+    # a vertex contributes no row and CG never writes its entry. Seeding from zeros would leave it
+    # at the origin. The speed is the smaller half of why this exists.
+    p = points[v]
+    out_sol_x[i] = wp.float64(p[0])
+    out_sol_y[i] = wp.float64(p[1])
+    out_sol_z[i] = wp.float64(p[2])
+
+
+@wp.kernel
+def dirichlet_system_values(
+    offsets: wp.array[wp.int32],
+    incident: wp.array[wp.int32],
+    unique_edges: wp.array2d[wp.int32],
+    weights: wp.array[wp.float32],
+    unit: wp.int32,
+    free_mask: wp.array[wp.bool],
+    free_map: wp.array[wp.int32],
+    pattern_offsets: wp.array[wp.int32],
+    points: wp.array[wp.vec3],
+    stabilizer: wp.float64,
+    out_values: wp.array[wp.float64],
+    out_rhs_x: wp.array[wp.float64],
+    out_rhs_y: wp.array[wp.float64],
+    out_rhs_z: wp.array[wp.float64],
+    out_sol_x: wp.array[wp.float64],
+    out_sol_y: wp.array[wp.float64],
+    out_sol_z: wp.array[wp.float64],
+) -> None:
+    # SPD umbrella system ``A = D - W`` over the free vertices, sharp boundary, written into the
+    # free-free pattern: ``-w`` off the diagonal, ``stabilizer + sum w`` on it, and the fixed
+    # one-ring neighbours folded into the right-hand side, plus the optional stabilizer's pull.
+    # The solve's initial guess too (``gather_free_positions``).
+    v = wp.int32(wp.tid())
+    ri = selected_row(free_mask, free_map, v)
+    if ri < 0:
+        return
+    gather_free_positions(points, v, ri, out_sol_x, out_sol_y, out_sol_z)
+    sum_w = stabilizer
+    rhs = stabilizer * to_vec3d(points[v])
+    slot = pattern_offsets[ri]
+    diagonal = wp.int32(-1)
+    for k in range(offsets[v], offsets[v + 1]):
+        e = incident[k]
+        j = incident_neighbor(unique_edges, e, v)
+        w = edge_weight(weights, e, unit)
+        sum_w += w
+        if free_mask[j]:
+            entry, slot, diagonal = place_free_entry(v, j, slot, diagonal)
+            out_values[entry] = -w
         else:
             rhs += w * to_vec3d(points[j])
-    out_rows[base] = ri
-    out_cols[base] = ri
-    out_vals[base] = sum_w
+    out_values[close_free_row(slot, diagonal)] = sum_w
     out_rhs_x[ri] = rhs[0]
     out_rhs_y[ri] = rhs[1]
     out_rhs_z[ri] = rhs[2]
 
 
 @wp.kernel
-def laplacian_ls_triplets(
+def least_squares_rows(
     offsets: wp.array[wp.int32],
-    columns: wp.array[wp.int32],
-    values: wp.array[wp.float64],
+    incident: wp.array[wp.int32],
+    unique_edges: wp.array2d[wp.int32],
+    weights: wp.array[wp.float32],
+    unit: wp.int32,
     free_mask: wp.array[wp.bool],
-    row_mask: wp.array[wp.bool],
-    free_map: wp.array[wp.int32],
-    row_map: wp.array[wp.int32],
     points: wp.array[wp.vec3],
-    out_rows: wp.array[wp.int32],
-    out_cols: wp.array[wp.int32],
-    out_vals: wp.array[wp.float64],
-    out_square_rows: wp.array[wp.int32],
-    out_square_vals: wp.array[wp.float64],
-    out_weight_sums: wp.array[wp.float64],
-    out_rhs_x: wp.array[wp.float64],
-    out_rhs_y: wp.array[wp.float64],
-    out_rhs_z: wp.array[wp.float64],
+    out_row_sums: wp.array[wp.float64],
+    out_rhs: wp.array[wp.vec3d],
+    out_free_degree: wp.array[wp.int32],
 ) -> None:
-    # Least-squares umbrella rows over R = free plus the first fixed ring. The row is
-    # ``p_v = sum_d (w_vd / sumW) p_d``; free neighbours stay in M, fixed ones move to the
-    # right-hand side, and the normal equations ``(M^T M) x = M^T b`` are assembled by the caller.
-    #
-    # Two partitions at once, both read through ``selected_row``: ``row_mask`` / ``row_map`` says
-    # which vertices carry a row, ``free_mask`` / ``free_map`` which carry an unknown.
-    #
-    # The *free* rows of M, taken alone, are the square block ``M_ff = D^-1 L_ff`` of the Dirichlet
-    # umbrella system, and they are what preconditions the normal equations (see
-    # ``linalg.squared_laplacian_preconditioner``). They are the same entries in the same slots, so
-    # rather than a second emission this writes, beside M's row index, the free row's own index
-    # into ``out_square_rows`` and the symmetric ``L_ff`` value into ``out_square_vals`` -- the
-    # umbrella coefficient times ``sumW``, i.e. ``-w_vd`` off the diagonal and ``sumW`` on it --
-    # plus ``sumW`` itself into ``out_weight_sums``. A fixed ring row writes none of the three, so
-    # its slots keep the caller's out-of-range padding.
+    # One least-squares umbrella row per vertex of R = the free vertices plus their first fixed
+    # ring: ``p_v = sum_d (w_vd / sumW) p_d``, whose free neighbours are unknowns and whose fixed
+    # ones move to the right-hand side ``b_v`` (``-p_v`` too, for a fixed row). A row is *valid*
+    # when ``v`` is in R and ``sumW != 0``, and ``out_row_sums`` carries that as its value: ``sumW``
+    # for a valid row, ``0`` otherwise, so every later reader asks one question of one number.
+    # ``out_rhs`` is written for valid rows only, and ``out_free_degree`` (``free_degree``) for all.
+    # M itself is never stored: its entry ``(v, j)`` is ``-w_vj / sumW_v`` (``1`` on a free row's
+    # own column), which the normal-equations kernels below recompute from the same two numbers.
     v = wp.int32(wp.tid())
-    r = selected_row(row_mask, row_map, v)
-    if r < 0:
-        return
     start = offsets[v]
     end = offsets[v + 1]
+    in_region = free_mask[v]
+    count = wp.where(in_region, wp.int32(1), wp.int32(0))
     sum_w = wp.float64(0.0)
     for k in range(start, end):
-        sum_w += values[k]
-    if sum_w == wp.float64(0.0):
+        e = incident[k]
+        sum_w += edge_weight(weights, e, unit)
+        if free_mask[incident_neighbor(unique_edges, e, v)]:
+            in_region = True
+            count += 1
+    out_free_degree[v] = count
+    if not in_region or sum_w == wp.float64(0.0):
+        out_row_sums[v] = wp.float64(0.0)
         return
-    base = start + v
-    free_column = selected_row(free_mask, free_map, v)
+    out_row_sums[v] = sum_w
     rhs = wp.vec3d(wp.float64(0.0), wp.float64(0.0), wp.float64(0.0))
-    if free_column < 0:
+    if not free_mask[v]:
         rhs = -to_vec3d(points[v])
     for k in range(start, end):
-        j = columns[k]
-        coeff = -values[k] / sum_w
-        cj = selected_row(free_mask, free_map, j)
-        if cj >= 0:
-            slot = base + 1 + (k - start)
-            out_rows[slot] = r
-            out_cols[slot] = cj
-            out_vals[slot] = coeff
-            if free_column >= 0:
-                out_square_rows[slot] = free_column
-                out_square_vals[slot] = -values[k]
-        else:
+        e = incident[k]
+        j = incident_neighbor(unique_edges, e, v)
+        if not free_mask[j]:
+            coeff = -edge_weight(weights, e, unit) / sum_w
             rhs -= coeff * to_vec3d(points[j])
-    if free_column >= 0:
-        out_rows[base] = r
-        out_cols[base] = free_column
-        out_vals[base] = wp.float64(1.0)
-        out_square_rows[base] = free_column
-        out_square_vals[base] = sum_w
-        out_weight_sums[free_column] = sum_w
-    out_rhs_x[r] = rhs[0]
-    out_rhs_y[r] = rhs[1]
-    out_rhs_z[r] = rhs[2]
+    out_rhs[v] = rhs
+
+
+@wp.func
+def least_squares_entry(
+    row_sums: wp.array[wp.float64], v: wp.int32, j: wp.int32, w: wp.float64
+) -> wp.float64:
+    # Entry ``(v, j)`` of M on a valid row ``v``: ``1`` on ``v``'s own column, ``-w_vj / sumW_v``
+    # on a free neighbour's. ``w`` is ignored on the diagonal.
+    if v == j:
+        return wp.float64(1.0)
+    return -w / row_sums[v]
+
+
+@wp.func
+def gather_valid_row(
+    row_sums: wp.array[wp.float64],
+    rhs: wp.array[wp.vec3d],
+    free_degrees: wp.array[wp.int32],
+    v: wp.int32,
+    m: wp.float64,
+    ax: wp.float64,
+    ay: wp.float64,
+    az: wp.float64,
+    count: wp.int32,
+) -> tuple[wp.float64, wp.float64, wp.float64, wp.int32]:
+    # One row ``v`` of M's contribution to column ``i`` of the normal equations, ``m = M_vi``:
+    # ``m b_v`` into ``M^T b`` and ``v``'s free columns into the product count. An invalid row
+    # contributes nothing.
+    if row_sums[v] != wp.float64(0.0):
+        b = rhs[v]
+        ax += m * b[0]
+        ay += m * b[1]
+        az += m * b[2]
+        count += free_degrees[v]
+    return ax, ay, az, count
+
+
+@wp.func
+def write_factor_pair(
+    valid_i: wp.bool,
+    lij: wp.float64,
+    scale_i: wp.float64,
+    row_sums: wp.array[wp.float64],
+    j: wp.int32,
+    slot: wp.int32,
+    out_factor: wp.array[wp.float64],
+    out_factor_t: wp.array[wp.float64],
+    out_factor_narrow: wp.array[wp.float32],
+    out_factor_t_narrow: wp.array[wp.float32],
+) -> wp.float64:
+    # Entry ``slot`` = ``(i, j)`` of ``B = D^-1 L_ff`` and of ``B^T`` (``normal_equations_setup``),
+    # given ``L_ij = L_ji``; returns ``|L_ij|`` for the Gershgorin sum, ``0`` on an invalid row.
+    sum_j = row_sums[j]
+    factor = wp.where(valid_i, lij * scale_i, wp.float64(0.0))
+    factor_t = wp.where(sum_j != wp.float64(0.0), lij * inverse_or_one(sum_j), wp.float64(0.0))
+    out_factor[slot] = factor
+    out_factor_t[slot] = factor_t
+    out_factor_narrow[slot] = wp.float32(factor)
+    out_factor_t_narrow[slot] = wp.float32(factor_t)
+    return wp.where(valid_i, wp.abs(lij), wp.float64(0.0))
 
 
 @wp.kernel
-def gather_free_positions(
+def normal_equations_setup(
+    offsets: wp.array[wp.int32],
+    incident: wp.array[wp.int32],
+    unique_edges: wp.array2d[wp.int32],
+    weights: wp.array[wp.float32],
+    unit: wp.int32,
     free_mask: wp.array[wp.bool],
     free_map: wp.array[wp.int32],
+    row_sums: wp.array[wp.float64],
+    rhs: wp.array[wp.vec3d],
+    free_degrees: wp.array[wp.int32],
+    pattern_offsets: wp.array[wp.int32],
     points: wp.array[wp.vec3],
+    out_term_counts: wp.array[wp.int32],
+    out_atb_x: wp.array[wp.float64],
+    out_atb_y: wp.array[wp.float64],
+    out_atb_z: wp.array[wp.float64],
+    out_factor: wp.array[wp.float64],
+    out_factor_t: wp.array[wp.float64],
+    out_factor_narrow: wp.array[wp.float32],
+    out_factor_t_narrow: wp.array[wp.float32],
+    out_ratios: wp.array[wp.float64],
     out_sol_x: wp.array[wp.float64],
     out_sol_y: wp.array[wp.float64],
     out_sol_z: wp.array[wp.float64],
 ) -> None:
-    # The inverse of ``scatter_free_solution``. Both region solves ask CG for the free vertices'
-    # *new* positions, whose best available initial guess is their current ones -- and for a vertex
-    # no face refers to it is the only one, because such a vertex contributes no row and CG never
-    # writes its entry. Seeding from zeros leaves it at the origin; ``smoothing._free_positions``
-    # carries the counts. The speed is the smaller half of why this exists.
-    v = wp.int32(wp.tid())
-    i = selected_row(free_mask, free_map, v)
-    if i >= 0:
-        p = points[v]
-        out_sol_x[i] = wp.float64(p[0])
-        out_sol_y[i] = wp.float64(p[1])
-        out_sol_z[i] = wp.float64(p[2])
+    # Everything of the normal equations ``(M^T M) x = M^T b`` one free unknown ``i`` owns, from
+    # the rows ``least_squares_rows`` wrote. The rows of M touching column ``i`` are ``i``'s own and
+    # its neighbours', ``V_i = {i} + N(i)``, of which the valid ones count, walked in ascending
+    # order -- the order ``M^T``'s row ``i`` stores them in, so ``M^T b`` accumulates as a CSR row
+    # dot over ``M^T`` would. Three things come out:
+    #
+    # - ``M^T b``'s row ``i``;
+    # - the number of (row, column) products ``M^T M``'s row ``i`` gathers, ``sum |C_v|`` over the
+    #   valid ``v`` in ``V_i``, with ``C_v`` row ``v``'s free columns (``free_degrees``) -- the
+    #   term segment ``normal_equations_rows`` builds the row in;
+    # - row ``i`` of the preconditioner's factor ``B = D^-1 L_ff`` and of its transpose in the
+    #   free-free pattern, in ``float64`` and ``float32`` (what the one-block solve applies), and
+    #   the row's Gershgorin quantity ``sum_j |L_ij| / D_i``. ``L_ff`` is the free rows'
+    #   Laplacian -- ``sumW`` on the diagonal, ``-w`` off it -- and ``D`` its diagonal, ``1`` on
+    #   an invalid row, whose factor row is zero. ``B^T``'s entry ``(i, j)`` is ``L_ji / D_j``:
+    #   the pattern is symmetric, so the transpose shares it, and where row ``j`` is invalid the
+    #   entry is a structural zero. The arithmetic is ``linalg.SquaredLaplacianPreconditioner``'s
+    #   own -- ``L * (1/D)`` through ``inverse_or_one``, the absolute values summed in column
+    #   order.
+    #
+    # And the solve's initial guess (``gather_free_positions``).
+    i = wp.int32(wp.tid())
+    ri = selected_row(free_mask, free_map, i)
+    if ri < 0:
+        return
+    gather_free_positions(points, i, ri, out_sol_x, out_sol_y, out_sol_z)
+    start = offsets[i]
+    end = offsets[i + 1]
+    sum_i = row_sums[i]
+    valid_i = sum_i != wp.float64(0.0)
+    scale_i = inverse_or_one(wp.where(valid_i, sum_i, wp.float64(1.0)))
+    one = wp.float64(1.0)
+    ax = wp.float64(0.0)
+    ay = wp.float64(0.0)
+    az = wp.float64(0.0)
+    terms = wp.int32(0)
+    total = wp.float64(0.0)
+    slot = pattern_offsets[ri]
+    diagonal = wp.int32(-1)
+    own_pending = wp.bool(True)
+    for k in range(start, end):
+        e = incident[k]
+        v = incident_neighbor(unique_edges, e, i)
+        w = edge_weight(weights, e, unit)
+        if own_pending and v > i:
+            own_pending = False
+            ax, ay, az, terms = gather_valid_row(
+                row_sums, rhs, free_degrees, i, one, ax, ay, az, terms
+            )
+        ax, ay, az, terms = gather_valid_row(
+            row_sums,
+            rhs,
+            free_degrees,
+            v,
+            least_squares_entry(row_sums, v, i, w),
+            ax,
+            ay,
+            az,
+            terms,
+        )
+        if free_mask[v]:
+            before = diagonal
+            entry, slot, diagonal = place_free_entry(i, v, slot, diagonal)
+            if diagonal != before:
+                total += write_factor_pair(
+                    valid_i,
+                    sum_i,
+                    scale_i,
+                    row_sums,
+                    i,
+                    diagonal,
+                    out_factor,
+                    out_factor_t,
+                    out_factor_narrow,
+                    out_factor_t_narrow,
+                )
+            total += write_factor_pair(
+                valid_i,
+                -w,
+                scale_i,
+                row_sums,
+                v,
+                entry,
+                out_factor,
+                out_factor_t,
+                out_factor_narrow,
+                out_factor_t_narrow,
+            )
+    if own_pending:
+        ax, ay, az, terms = gather_valid_row(row_sums, rhs, free_degrees, i, one, ax, ay, az, terms)
+    if diagonal < 0:
+        total += write_factor_pair(
+            valid_i,
+            sum_i,
+            scale_i,
+            row_sums,
+            i,
+            slot,
+            out_factor,
+            out_factor_t,
+            out_factor_narrow,
+            out_factor_t_narrow,
+        )
+    out_term_counts[ri] = terms
+    out_atb_x[ri] = ax
+    out_atb_y[ri] = ay
+    out_atb_z[ri] = az
+    out_ratios[ri] = wp.where(valid_i, total / sum_i, wp.float64(0.0))
+
+
+@wp.func
+def accumulate_term(
+    column: wp.int32,
+    m_vi: wp.float64,
+    m_vu: wp.float64,
+    start: wp.int32,
+    width: wp.int32,
+    out_columns: wp.array[wp.int32],
+    out_values: wp.array[wp.float64],
+) -> wp.int32:
+    # Add the term ``M_vi M_vu`` of ``(M^T M)_iu`` into the row's sorted list of distinct columns
+    # ``out_columns[start : start + width]`` -- found by bisection, or inserted in order with the
+    # tail shifted up one -- and return the list's new width. A column's value starts from its first
+    # term's product and takes each later one as a multiply-add, in arrival order.
+    lo = wp.int32(0)
+    hi = width
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if out_columns[start + mid] < column:
+            lo = mid + 1
+        else:
+            hi = mid
+    slot = start + lo
+    if lo < width and out_columns[slot] == column:
+        out_values[slot] = out_values[slot] + m_vi * m_vu
+        return width
+    for t in range(start + width, slot, -1):
+        out_columns[t] = out_columns[t - 1]
+        out_values[t] = out_values[t - 1]
+    out_columns[slot] = column
+    out_values[slot] = m_vi * m_vu
+    return width + 1
+
+
+@wp.func
+def accumulate_row_terms(
+    offsets: wp.array[wp.int32],
+    incident: wp.array[wp.int32],
+    unique_edges: wp.array2d[wp.int32],
+    weights: wp.array[wp.float32],
+    unit: wp.int32,
+    free_mask: wp.array[wp.bool],
+    free_map: wp.array[wp.int32],
+    row_sums: wp.array[wp.float64],
+    v: wp.int32,
+    m_vi: wp.float64,
+    start: wp.int32,
+    width: wp.int32,
+    out_columns: wp.array[wp.int32],
+    out_values: wp.array[wp.float64],
+) -> wp.int32:
+    # Row ``v`` of M's terms of ``M^T M``'s row ``i``, ``m_vi = M_vi``: one per free column ``u``
+    # of the row, ``M_vu`` being ``1`` on ``v``'s own column and ``-w_vu / sumW_v`` elsewhere --
+    # the value ``least_squares_rows``' row stands for. An invalid row has no terms.
+    sum_v = row_sums[v]
+    if sum_v == wp.float64(0.0):
+        return width
+    if free_mask[v]:
+        width = accumulate_term(
+            free_map[v], m_vi, wp.float64(1.0), start, width, out_columns, out_values
+        )
+    for q in range(offsets[v], offsets[v + 1]):
+        e = incident[q]
+        u = incident_neighbor(unique_edges, e, v)
+        if free_mask[u]:
+            width = accumulate_term(
+                free_map[u],
+                m_vi,
+                -edge_weight(weights, e, unit) / sum_v,
+                start,
+                width,
+                out_columns,
+                out_values,
+            )
+    return width
+
+
+@wp.kernel
+def normal_equations_rows(
+    offsets: wp.array[wp.int32],
+    incident: wp.array[wp.int32],
+    unique_edges: wp.array2d[wp.int32],
+    weights: wp.array[wp.float32],
+    unit: wp.int32,
+    free_mask: wp.array[wp.bool],
+    free_map: wp.array[wp.int32],
+    row_sums: wp.array[wp.float64],
+    term_offsets: wp.array[wp.int32],
+    out_columns: wp.array[wp.int32],
+    out_values: wp.array[wp.float64],
+    out_widths: wp.array[wp.int32],
+) -> None:
+    # Row ``i`` of ``M^T M``, sorted, in the head of ``i``'s term segment (sized for every term,
+    # which bounds the distinct columns), and its length. The terms ``M_vi M_vu`` -- one per free
+    # column ``u`` of each valid row ``v`` of ``V_i`` -- are taken in ascending ``v``, so each
+    # entry is summed along ``M^T``'s row from its first product, the two factors unrounded into a
+    # multiply-add: ``warp.sparse.bsr_mm``'s arithmetic, which it performs in that order for most
+    # entries and in its triplet sort's order for the rest, so the two agree to the last bit on most
+    # entries and within one rounding on the others. That is ``bsr_mm``'s expansion of the product,
+    # per row, rather than one global sort of every term. ``normal_equations_values`` compacts the
+    # rows into the CSR.
+    i = wp.int32(wp.tid())
+    ri = selected_row(free_mask, free_map, i)
+    if ri < 0:
+        return
+    start = term_offsets[ri]
+    width = wp.int32(0)
+    own_pending = wp.bool(True)
+    for k in range(offsets[i], offsets[i + 1]):
+        e = incident[k]
+        v = incident_neighbor(unique_edges, e, i)
+        if own_pending and v > i:
+            own_pending = False
+            width = accumulate_row_terms(
+                offsets,
+                incident,
+                unique_edges,
+                weights,
+                unit,
+                free_mask,
+                free_map,
+                row_sums,
+                i,
+                wp.float64(1.0),
+                start,
+                width,
+                out_columns,
+                out_values,
+            )
+        width = accumulate_row_terms(
+            offsets,
+            incident,
+            unique_edges,
+            weights,
+            unit,
+            free_mask,
+            free_map,
+            row_sums,
+            v,
+            least_squares_entry(row_sums, v, i, edge_weight(weights, e, unit)),
+            start,
+            width,
+            out_columns,
+            out_values,
+        )
+    if own_pending:
+        width = accumulate_row_terms(
+            offsets,
+            incident,
+            unique_edges,
+            weights,
+            unit,
+            free_mask,
+            free_map,
+            row_sums,
+            i,
+            wp.float64(1.0),
+            start,
+            width,
+            out_columns,
+            out_values,
+        )
+    out_widths[ri] = width
+
+
+@wp.kernel
+def normal_equations_values(
+    free_mask: wp.array[wp.bool],
+    free_map: wp.array[wp.int32],
+    term_offsets: wp.array[wp.int32],
+    row_columns: wp.array[wp.int32],
+    row_values: wp.array[wp.float64],
+    system_offsets: wp.array[wp.int32],
+    out_columns: wp.array[wp.int32],
+    out_values: wp.array[wp.float64],
+) -> None:
+    # Row ``i`` of ``M^T M`` moved from the head of its term segment into the compact CSR.
+    i = wp.int32(wp.tid())
+    ri = selected_row(free_mask, free_map, i)
+    if ri < 0:
+        return
+    source = term_offsets[ri]
+    start = system_offsets[ri]
+    for s in range(system_offsets[ri + 1] - start):
+        out_columns[start + s] = row_columns[source + s]
+        out_values[start + s] = row_values[source + s]
 
 
 @wp.kernel
 def scatter_free_solution(
     free_mask: wp.array[wp.bool],
     free_map: wp.array[wp.int32],
+    points: wp.array[wp.vec3],
     sol_x: wp.array[wp.float64],
     sol_y: wp.array[wp.float64],
     sol_z: wp.array[wp.float64],
     out_points: wp.array[wp.vec3],
 ) -> None:
-    # Write the reduced solve's answer back over the free vertices; a pinned one keeps the position
-    # it arrived with. The inverse of ``gather_free_positions``, which seeds the same solve.
+    # The solved positions: the reduced solve's answer over the free vertices, and the position it
+    # arrived with for a pinned one. Every vertex is written, so the result needs no copy of
+    # ``points`` first. The inverse of ``gather_free_positions``, which seeds the same solve.
     v = wp.int32(wp.tid())
     i = selected_row(free_mask, free_map, v)
     if i >= 0:
         out_points[v] = wp.vec3(wp.float32(sol_x[i]), wp.float32(sol_y[i]), wp.float32(sol_z[i]))
+    else:
+        out_points[v] = points[v]
 
 
 @wp.kernel

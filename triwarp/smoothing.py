@@ -60,7 +60,7 @@ import triwarp as tw
 import triwarp.linalg as twl
 import triwarp.typing as twt
 from triwarp import laplacian
-from triwarp._device import require_same_device
+from triwarp._device import read_scalar, require_same_device
 from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import reduce as kernel_reduce
@@ -68,7 +68,6 @@ from triwarp.kernels import scatter as kernel_scatter
 from triwarp.kernels import selection as kernel_selection
 from triwarp.kernels import smoothing as kernel_smoothing
 from triwarp.kernels import triangles as kernel_triangles
-from triwarp.kernels.algorithms import multigrid as kernel_mg
 from triwarp.triangles import face_normals_and_areas
 from triwarp.vertices import mean_vertex_normals
 
@@ -1941,7 +1940,10 @@ def refine_and_smooth_region(
 
     # Both solves run over one region of one connectivity, so it is derived once for the pair.
     region = _region_topology(vertices, faces, free, edges)
+    # The vertex -> edge incidence is the connectivity's alone, so a second region reuses it.
+    incidence = None
     if region is not None:
+        incidence = (region.incidence_offsets, region.incident_edges)
         vertices = _solve_region_fixed_rim(vertices, faces, free, region, 0.0)
         if smooth_boundary:
             vertices = _solve_region_smooth(vertices, faces, free, region, edge_weights)
@@ -1961,7 +1963,7 @@ def refine_and_smooth_region(
             # ``bd_mask`` is still this mesh's: the solves above moved vertices, not connectivity.
             free2 = wp.empty(n, dtype=wp.bool, device=device)
             wp.map(kernel_array.mask_and_not, incident, bd_mask, out=free2)
-            region = _region_topology(vertices, faces, free2, edges)
+            region = _region_topology(vertices, faces, free2, edges, incidence)
             if region is not None:
                 vertices = _solve_region_fixed_rim(vertices, faces, free2, region, 0.0)
                 vertices = _solve_region_smooth(vertices, faces, free2, region, edge_weights)
@@ -2008,15 +2010,25 @@ class _RegionTopology(NamedTuple):
 
     Neither depends on the positions, so a caller running both solves over one region -- as
     [`refine_and_smooth_region`][triwarp.smoothing.refine_and_smooth_region] does, one after the
-    other -- builds it once: the free vertices' compact ranks (a scan and a readback) and the
-    unique edge table the weight matrix is assembled over (a sort). The cotangent *weights* are
-    recomputed per solve, since the first solve moves the vertices they are measured on.
+    other -- builds it once: the free vertices' compact ranks (a scan and a readback), the unique
+    edge table the weights are accumulated over, each vertex's incident unique edges, and the
+    free-free sparsity both systems' square blocks share. The cotangent *weights* are recomputed per
+    solve, since the first solve moves the vertices they are measured on.
     """
 
     free_map: wp.array[wp.int32]
     n_free: int
     unique_edges: twt.Array2dInt32
     inverse: wp.array[wp.int32]
+    incidence_offsets: wp.array[wp.int32]
+    """Length ``n + 1`` offsets of each vertex's run of ``incident_edges``."""
+    incident_edges: wp.array[wp.int32]
+    """Ascending edge ids per vertex, which is ascending neighbour order (``kernels/smoothing``)."""
+    pattern_offsets: wp.array[wp.int32]
+    """Length ``n_free + 1`` row offsets of the free-free pattern: diagonal plus free neighbours."""
+    pattern_columns: wp.array[wp.int32]
+    """The pattern's sorted columns, ``pattern_capacity`` long; the tail past the rows is unused."""
+    pattern_capacity: int
 
 
 def _region_topology(
@@ -2024,12 +2036,15 @@ def _region_topology(
     faces: wp.array[wp.int32],
     free_mask: wp.array[wp.bool],
     edges: tuple[twt.Array2dInt32, wp.array[wp.int32]] | None = None,
+    incidence: tuple[wp.array[wp.int32], wp.array[wp.int32]] | None = None,
 ) -> _RegionTopology | None:
     """
     Derive the region both solves share, or ``None`` when there is nothing to solve.
 
-    ``edges`` is the connectivity's ``edges_unique`` grouping when the caller already has it.
+    ``edges`` is the connectivity's ``edges_unique`` grouping when the caller already has it, and
+    ``incidence`` a previous region's ``(incidence_offsets, incident_edges)`` over the same one.
     """
+    device = vertices.device
     n = int(vertices.shape[0])
     if int(faces.shape[0]) == 0 or n == 0:
         return None
@@ -2039,7 +2054,72 @@ def _region_topology(
     unique_edges, inverse = (
         edges if edges is not None else tw.edges.edges_unique(faces, n_vertices=n, validate=False)
     )
-    return _RegionTopology(free_map, n_free, unique_edges, inverse)
+    m = int(unique_edges.shape[0])
+    if incidence is None:
+        # A counting sort with no global sort in it -- degrees, a scan, a ranked fill -- and one
+        # per-row sort, which puts each row in neighbour order (see ``kernels/smoothing``). The
+        # offsets are scanned in place and the total, ``2 m`` less any self-loops, is never read.
+        incidence_offsets = wp.zeros(n + 1, dtype=wp.int32, device=device)
+        counts = twt.as_dense(incidence_offsets[1:])
+        ranks = twt.empty_2d((m, 2), wp.int32, device=device)
+        wp.launch(
+            kernel_smoothing.incident_edge_counts,
+            dim=m,
+            inputs=[unique_edges],
+            outputs=[counts, ranks],
+            device=device,
+        )
+        wp.utils.array_scan(counts, counts, inclusive=True)
+        incident_edges = wp.empty(2 * m, dtype=wp.int32, device=device)
+        wp.launch(
+            kernel_smoothing.scatter_incident_edges,
+            dim=m,
+            inputs=[unique_edges, incidence_offsets, ranks],
+            outputs=[incident_edges],
+            device=device,
+        )
+        wp.launch(
+            kernel_array.sort_segments,
+            dim=n,
+            inputs=[incidence_offsets, incident_edges],
+            device=device,
+        )
+    else:
+        incidence_offsets, incident_edges = incidence
+    # The free-free pattern, sized without a readback: a free row holds its diagonal and at most
+    # its degree of neighbours, so ``n_free + 2 m`` bounds the whole. Every reader walks rows
+    # through the offsets, so the unused tail is never touched.
+    pattern_offsets = wp.zeros(n_free + 1, dtype=wp.int32, device=device)
+    pattern_counts = twt.as_dense(pattern_offsets[1:])
+    pattern_inputs = [incidence_offsets, incident_edges, unique_edges, free_mask, free_map]
+    wp.launch(
+        kernel_smoothing.free_pattern_counts,
+        dim=n,
+        inputs=pattern_inputs,
+        outputs=[pattern_counts],
+        device=device,
+    )
+    wp.utils.array_scan(pattern_counts, pattern_counts, inclusive=True)
+    capacity = n_free + 2 * m
+    pattern_columns = wp.empty(capacity, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_smoothing.free_pattern_columns,
+        dim=n,
+        inputs=[*pattern_inputs, pattern_offsets],
+        outputs=[pattern_columns],
+        device=device,
+    )
+    return _RegionTopology(
+        free_map,
+        n_free,
+        unique_edges,
+        inverse,
+        incidence_offsets,
+        incident_edges,
+        pattern_offsets,
+        pattern_columns,
+        capacity,
+    )
 
 
 def _solve_region_fixed_rim(
@@ -2052,46 +2132,39 @@ def _solve_region_fixed_rim(
     """Solve [`smooth_region_fixed_rim`][triwarp.smoothing.smooth_region_fixed_rim] on a region."""
     device = vertices.device
     n = int(vertices.shape[0])
-    out = wp.clone(vertices)
     free_map, n_free = region.free_map, region.n_free
-    weight_matrix = _edge_weight_matrix(vertices, faces, "unit", region)
-    nnz = int(weight_matrix.nnz)
-    size = nnz + n
-    # ``dirichlet_system_triplets`` emits conditionally, so most slots stay unwritten. Padding must
-    # be a *hole*, not a value: a ``(0, 0, 0.0)`` triplet is a harmless structural zero, but every
-    # one of them accumulates onto entry ``(0, 0)`` and ``bsr_from_triplets``' accumulation atomic
-    # serializes them. An out-of-range index is dropped instead -- ``n_free`` is one past the last
-    # row and column of the ``(n_free, n_free)`` system.
-    out_rows = wp.full(size, n_free, dtype=wp.int32, device=device)
-    out_cols = wp.full(size, n_free, dtype=wp.int32, device=device)
-    out_vals = wp.zeros(size, dtype=wp.float64, device=device)
+    weights, unit = _edge_weights(vertices, faces, "unit", region)
+    values = wp.empty(region.pattern_capacity, dtype=wp.float64, device=device)
     # One contiguous (3, n_free) right-hand side: its rows are contiguous 1-D views, so the
-    # assembly kernel writes them directly and the three columns solve in one batched CG.
-    rhs = wp.zeros((3, n_free), dtype=wp.float64, device=device)
+    # assembly kernel writes them directly and the three columns solve in one batched CG. Every
+    # free row writes all three of its components.
+    rhs = wp.empty((3, n_free), dtype=wp.float64, device=device)
+    # The initial guess, written by the assembly kernel: every free vertex's current position.
+    # [`solve_spd_columns`][triwarp.linalg.solve_spd_columns] starts from its ``solution``, and
+    # seeding it is a **correctness** requirement before it is a warm start: a vertex no face refers
+    # to contributes no row, so CG never writes its entry and it keeps whatever the seed held --
+    # from zeros it would be silently moved to the origin. Seeded from the current positions it
+    # stays put, the only defensible answer for an unknown the system does not constrain.
+    sol = wp.empty((3, n_free), dtype=wp.float64, device=device)
     wp.launch(
-        kernel_smoothing.dirichlet_system_triplets,
+        kernel_smoothing.dirichlet_system_values,
         dim=n,
         inputs=[
-            weight_matrix.offsets,
-            weight_matrix.columns,
-            weight_matrix.values,
+            region.incidence_offsets,
+            region.incident_edges,
+            region.unique_edges,
+            weights,
+            wp.int32(unit),
             free_mask,
             free_map,
+            region.pattern_offsets,
             vertices,
             wp.float64(stabilizer),
-            out_rows,
-            out_cols,
-            out_vals,
-            rhs[0],
-            rhs[1],
-            rhs[2],
         ],
+        outputs=[values, rhs[0], rhs[1], rhs[2], sol[0], sol[1], sol[2]],
         device=device,
     )
-    system = wps.bsr_from_triplets(
-        n_free, n_free, out_rows, out_cols, out_vals, prune_numerical_zeros=False
-    )
-    sol = _free_positions(vertices, free_mask, free_map, n_free)
+    system = _csr_matrix(n_free, region.pattern_offsets, region.pattern_columns, values)
     twl.solve_spd_columns(
         system,
         twt.as_array2d(rhs, wp.float64),
@@ -2099,10 +2172,12 @@ def _solve_region_fixed_rim(
         tol=twl.CG_TOLERANCE,
         maxiter=10 * n_free,
     )
+    out = wp.empty(n, dtype=wp.vec3, device=device)
     wp.launch(
         kernel_smoothing.scatter_free_solution,
         dim=n,
-        inputs=[free_mask, free_map, sol[0], sol[1], sol[2], out],
+        inputs=[free_mask, free_map, vertices, sol[0], sol[1], sol[2]],
+        outputs=[out],
         device=device,
     )
     return out
@@ -2118,103 +2193,109 @@ def _solve_region_smooth(
     """Solve [`smooth_region`][triwarp.smoothing.smooth_region] on a derived region."""
     device = vertices.device
     n = int(vertices.shape[0])
-    out = wp.clone(vertices)
     free_map, n_free = region.free_map, region.n_free
-    row_mask = tw.selection.expand_vertex_mask(faces, free_mask, 1)
-    row_map, n_rows = tw.array.mask_to_compact_ranks(row_mask)
-    weight_matrix = _edge_weight_matrix(vertices, faces, edge_weights, region)
-    nnz = int(weight_matrix.nnz)
-    size = nnz + n
-    # ``laplacian_ls_triplets`` emits conditionally, so most slots stay unwritten. Padding must be a
-    # *hole*, not a value: a ``(0, 0, 0.0)`` triplet is a harmless structural zero, but every one of
-    # them accumulates onto entry ``(0, 0)`` and ``bsr_from_triplets``' accumulation atomic
-    # serializes them. Both arrays are filled one past their own extent, so the padding is out of
-    # range as the *row* index of ``M`` (``rows``) and of ``M^T`` (``cols``) alike.
-    rows = wp.full(size, n_rows, dtype=wp.int32, device=device)
-    cols = wp.full(size, n_free, dtype=wp.int32, device=device)
-    vals = wp.zeros(size, dtype=wp.float64, device=device)
-    # The free rows' square block ``L_ff`` rides in the same slots, so ``cols`` serves both builds
-    # and the same out-of-range padding drops its unwritten slots. A free vertex no face refers to
-    # gets no row at all, and a weight of one leaves it inert in the preconditioner.
-    square_rows = wp.full(size, n_free, dtype=wp.int32, device=device)
-    square_vals = wp.zeros(size, dtype=wp.float64, device=device)
-    weight_sums = wp.full(n_free, 1.0, dtype=wp.float64, device=device)
-    # One ``(3, n_rows)`` right-hand side, so ``M^T b`` below is one batched mat-vec. Every row has
-    # exactly one vertex, which writes all three of its components, so nothing needs zeroing.
-    rhs = wp.empty((3, n_rows), dtype=wp.float64, device=device)
+    weights, unit = _edge_weights(vertices, faces, edge_weights, region)
+    walk = [
+        region.incidence_offsets,
+        region.incident_edges,
+        region.unique_edges,
+        weights,
+        wp.int32(unit),
+    ]
+    # The least-squares rows of M, one per vertex of R = the free vertices plus their first fixed
+    # ring, kept as the two numbers every entry is recomputed from: the row's weight sum (``0``
+    # for a vertex with no row) and its right-hand side. M, its transpose and the product ``M^T M``
+    # are never built as matrices of their own -- ``normal_equations_*`` assemble the product's CSR
+    # directly from the rows, and ``M^T b`` with it.
+    row_sums = wp.empty(n, dtype=wp.float64, device=device)
+    row_rhs = wp.empty(n, dtype=wp.vec3d, device=device)
+    free_degrees = wp.empty(n, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_smoothing.laplacian_ls_triplets,
+        kernel_smoothing.least_squares_rows,
+        dim=n,
+        inputs=[*walk, free_mask, vertices],
+        outputs=[row_sums, row_rhs, free_degrees],
+        device=device,
+    )
+    capacity = region.pattern_capacity
+    term_offsets = wp.zeros(n_free + 1, dtype=wp.int32, device=device)
+    term_counts = twt.as_dense(term_offsets[1:])
+    # One contiguous (3, n_free) right-hand side, so the three columns batch; every free row
+    # writes all three components.
+    atb = wp.empty((3, n_free), dtype=wp.float64, device=device)
+    factor = wp.empty(capacity, dtype=wp.float64, device=device)
+    factor_t = wp.empty(capacity, dtype=wp.float64, device=device)
+    factor_narrow = wp.empty(capacity, dtype=wp.float32, device=device)
+    factor_t_narrow = wp.empty(capacity, dtype=wp.float32, device=device)
+    ratios = wp.empty(n_free, dtype=wp.float64, device=device)
+    # The initial guess, seeded as ``_solve_region_fixed_rim``'s is and for the same reason.
+    sol = wp.empty((3, n_free), dtype=wp.float64, device=device)
+    wp.launch(
+        kernel_smoothing.normal_equations_setup,
         dim=n,
         inputs=[
-            weight_matrix.offsets,
-            weight_matrix.columns,
-            weight_matrix.values,
+            *walk,
             free_mask,
-            row_mask,
             free_map,
-            row_map,
+            row_sums,
+            row_rhs,
+            free_degrees,
+            region.pattern_offsets,
             vertices,
-            rows,
-            cols,
-            vals,
-            square_rows,
-            square_vals,
-            weight_sums,
-            rhs[0],
-            rhs[1],
-            rhs[2],
+        ],
+        outputs=[
+            term_counts,
+            atb[0],
+            atb[1],
+            atb[2],
+            factor,
+            factor_t,
+            factor_narrow,
+            factor_t_narrow,
+            ratios,
+            sol[0],
+            sol[1],
+            sol[2],
         ],
         device=device,
     )
-    # M is (n_rows x n_free) and A = M^T M is SPD.
-    #
-    # ``m_matrix``'s ``nnz`` is a padded *capacity*, not an exact count: ``bsr_from_triplets``
-    # leaves the field at the triplet count it was handed, which is the ``size`` above --
-    # overwhelmingly padding here, since the emit is conditional and the tail is deliberately out
-    # of range. That is harmless to ``bsr_mm`` and ``bsr_transposed``, which treat the field as a
-    # bound rather than as a count, but nothing downstream may be sized off it (section 3.7).
-    #
-    # ``bsr_transposed`` is exact on an operand of this shape and says in one call what a second
-    # ``bsr_from_triplets`` over the same triplets with the index arrays swapped, plus three
-    # ``wp.clone``s to feed it, says in five lines.
-    #
-    # **Not a speed change, and this is here so it is not re-proposed as one.** Interleaved against
-    # the swapped-triplet build it is a small win on the step itself and a fraction of a percent of
-    # the whole call, a share that *falls* as the mesh grows and is therefore a decline by section
-    # 9's rule. What it buys is one concept fewer and three fewer buffers; the assembled system is
-    # bit-identical.
-    m_matrix = wps.bsr_from_triplets(n_rows, n_free, rows, cols, vals, prune_numerical_zeros=False)
-    mt_matrix = wps.bsr_transposed(m_matrix)
-    system = wps.bsr_mm(mt_matrix, m_matrix)
-    # A^T b straight into the rows of one contiguous buffer, so the three columns batch -- and are
-    # formed by one launch over all three rather than a ``bsr_mv`` per column. The kernel reads the
-    # row bounds off ``offsets`` alone, so ``mt_matrix``'s stale ``nnz`` is never consulted, and it
-    # writes every slot, so the buffer needs no zeroing.
-    atb = wp.empty((3, n_free), dtype=wp.float64, device=device)
+    wp.utils.array_scan(term_counts, term_counts, inclusive=True)
+    # The one readback of the assembly: how many terms the product gathers, which sizes the term
+    # buffer and bounds the product's entry count, so its CSR is allocated without a second one.
+    n_terms = max(int(read_scalar(term_offsets, n_free)), 1)
+    row_columns = wp.empty(n_terms, dtype=wp.int32, device=device)
+    row_values = wp.empty(n_terms, dtype=wp.float64, device=device)
+    system_offsets = wp.zeros(n_free + 1, dtype=wp.int32, device=device)
+    system_counts = twt.as_dense(system_offsets[1:])
     wp.launch(
-        kernel_mg.csr_matvec,
-        dim=3 * n_free,
-        inputs=[
-            wp.int32(n_free),
-            wp.int32(n_rows),
-            wp.int32(n_free),
-            wp.int32(0),
-            wp.float64(1.0),
-            mt_matrix.offsets,
-            mt_matrix.columns,
-            mt_matrix.values,
-            rhs.flatten(),
-        ],
-        outputs=[atb.flatten()],
+        kernel_smoothing.normal_equations_rows,
+        dim=n,
+        inputs=[*walk, free_mask, free_map, row_sums, term_offsets],
+        outputs=[row_columns, row_values, system_counts],
         device=device,
     )
-    sol = _free_positions(vertices, free_mask, free_map, n_free)
+    wp.utils.array_scan(system_counts, system_counts, inclusive=True)
+    columns = wp.empty(n_terms, dtype=wp.int32, device=device)
+    values = wp.empty(n_terms, dtype=wp.float64, device=device)
+    wp.launch(
+        kernel_smoothing.normal_equations_values,
+        dim=n,
+        inputs=[free_mask, free_map, term_offsets, row_columns, row_values, system_offsets],
+        outputs=[columns, values],
+        device=device,
+    )
+    system = _csr_matrix(n_free, system_offsets, columns, values)
     # The normal equations here are the worst-conditioned system this package solves: squared,
     # fourth order, so neither Jacobi nor a hierarchy built on ``M^T M`` itself gets near the
     # iteration count of the Laplacian underneath it. The free rows of ``M`` are ``D^-1 L_ff``, and
-    # preconditioning with the inverse of their square is what brings it back down.
-    square = wps.bsr_from_triplets(
-        n_free, n_free, square_rows, cols, square_vals, prune_numerical_zeros=False
+    # preconditioning with the inverse of their square is what brings it back down. That factor,
+    # its transpose and their ``float32`` copies were written by ``normal_equations_setup``.
+    pattern = (region.pattern_offsets, region.pattern_columns)
+    preconditioner = twl.SquaredLaplacianPreconditioner.from_factors(
+        _csr_matrix(n_free, *pattern, factor),
+        _csr_matrix(n_free, *pattern, factor_t),
+        ratios,
+        (factor_narrow, factor_t_narrow),
     )
     twl.solve_spd_columns(
         system,
@@ -2222,78 +2303,62 @@ def _solve_region_smooth(
         twt.as_array2d(sol, wp.float64),
         tol=twl.CG_TOLERANCE,
         maxiter=10 * n_free,
-        preconditioner=twl.squared_laplacian_preconditioner(square, weight_sums),
+        preconditioner=preconditioner,
     )
+    out = wp.empty(n, dtype=wp.vec3, device=device)
     wp.launch(
         kernel_smoothing.scatter_free_solution,
         dim=n,
-        inputs=[free_mask, free_map, sol[0], sol[1], sol[2], out],
+        inputs=[free_mask, free_map, vertices, sol[0], sol[1], sol[2]],
+        outputs=[out],
         device=device,
     )
     return out
 
 
-def _free_positions(
-    vertices: wp.array[wp.vec3],
-    free_mask: wp.array[wp.bool],
-    free_map: wp.array[wp.int32],
-    n_free: int,
-) -> wp.array[wp.float64]:
+def _csr_matrix(
+    n: int, offsets: wp.array[wp.int32], columns: wp.array[wp.int32], values: wp.array[wp.float64]
+) -> wps.BsrMatrix[wp.float64]:
     """
-    Gather the free vertices' current positions as a ``(3, n_free)`` float64 initial guess.
+    Wrap a square ``float64`` CSR assembled here as a ``BsrMatrix``.
 
-    Both region solves ask conjugate gradient for the free vertices' *new* positions, and
-    [`solve_spd_columns`][triwarp.linalg.solve_spd_columns] takes its ``solution`` argument as the
-    initial guess, so this is what the solver starts from.
-
-    It is a **correctness** requirement before it is a warm start. A vertex no face refers to
-    contributes no row to either system, so CG never writes its entry and it keeps whatever the
-    seed held: from ``wp.zeros`` such a vertex would be silently moved to the origin. Seeded from
-    the current positions it stays put, which is the only defensible answer for an unknown the
-    system does not constrain.
+    ``columns`` and ``values`` may run past the last row; the stored-entry count is their length,
+    a capacity, and every reader walks rows through ``offsets``.
     """
-    device = vertices.device
-    guess = wp.empty((3, n_free), dtype=wp.float64, device=device)
-    wp.launch(
-        kernel_smoothing.gather_free_positions,
-        dim=int(vertices.shape[0]),
-        inputs=[free_mask, free_map, vertices, guess[0], guess[1], guess[2]],
-        device=device,
-    )
-    return guess
+    matrix = wps.bsr_zeros(n, n, wp.float64, device=values.device)
+    matrix.offsets = offsets
+    matrix.columns = columns
+    matrix.values = values
+    matrix.notify_nnz_changed(nnz=int(values.shape[0]))
+    return matrix
 
 
-def _edge_weight_matrix(
+def _edge_weights(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     edge_weights: str,
     region: _RegionTopology,
-) -> wps.BsrMatrix[wp.float64]:
-    """Symmetric ``(n, n)`` float64 edge-weight matrix (zero diagonal); unit or clamped cotan."""
-    device = vertices.device
-    n = int(vertices.shape[0])
-    unique_edges, inverse = region.unique_edges, region.inverse
-    m = int(unique_edges.shape[0])
+) -> tuple[wp.array[wp.float32] | None, int]:
+    """
+    Per-unique-edge weights for a region solve, and whether they are all one.
+
+    Unit weights need no array: the row walks read ``1`` instead
+    (``kernels/smoothing.edge_weight``). The cotangent weights are summed per edge and clamped as
+    they are read.
+    """
     if edge_weights == "unit":
-        weights = wp.full(m, 1.0, dtype=wp.float32, device=device)
-    elif edge_weights == "cotan":
-        weights = wp.zeros(m, dtype=wp.float32, device=device)
-        wp.launch(
-            kernel_smoothing.edge_cotan_add,
-            dim=int(faces.shape[0]) // 3,
-            inputs=[vertices, faces, inverse, weights],
-            device=device,
-        )
-    else:
+        return None, 1
+    if edge_weights != "cotan":
         raise ValueError(f"edge_weights must be 'unit' or 'cotan', got {edge_weights!r}")
-    rows, cols, vals = tw.array.triplet_buffers(2 * m, wp.float64, device)
+    device = vertices.device
+    weights = wp.zeros(int(region.unique_edges.shape[0]), dtype=wp.float32, device=device)
     wp.launch(
-        kernel_smoothing.symmetric_weight_triplets,
-        dim=m,
-        inputs=[unique_edges, weights, rows, cols, vals],
+        kernel_smoothing.edge_cotan_add,
+        dim=int(faces.shape[0]) // 3,
+        inputs=[vertices, faces, region.inverse, weights],
         device=device,
     )
-    return wps.bsr_from_triplets(n, n, rows, cols, vals, prune_numerical_zeros=False)
+    return weights, 0
 
 
 def smooth_region_boundary(

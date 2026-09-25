@@ -491,12 +491,10 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     # ``parents`` is the union-find forest, pre-hooked in place from the identity the caller built
     # and then handed to ``ecl_hook_edges`` -- the same buffer before and after, not an answer.
     ("algorithms.connected_components", "ecl_init_parent_edges"): frozenset({"parents"}),
-    ("polyline", "clip_selected"): frozenset({"active", "left", "right"}),
     # ``state`` is the ``wp.capture_while`` loop's own [rounds run, condition] pair, read and
     # incremented across launches -- the ``rdp_begin_round`` / ``rdp_split_spans`` case below,
     # under the same name.
     ("polyline", "ear_loop_continue"): frozenset({"state"}),
-    ("polyline", "init_ring"): frozenset({"active", "left", "right"}),
     # Round, pass 1 of 4 of the level-synchronous Ramer-Douglas-Peucker split: only arms the
     # per-span accumulators (``out_span_max`` / ``out_span_argmax``) and advances the loop's own
     # [rounds run, condition] pair -- the same ``state`` buffer ``rdp_split_spans`` and
@@ -507,7 +505,7 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     # ``state`` is the ``wp.capture_while`` loop's own [levels run, condition] pair, which is the
     # ``ear_loop_continue`` case in the same module. Neither is an input and neither is the answer
     # -- that is ``out_keep``.
-    ("polyline", "rdp_split_spans"): frozenset({"span_lo", "span_hi", "state"}),
+    ("polyline", "rdp_split_spans"): frozenset({"state"}),
     # The Poisson-disk elimination round's carried state: the deletions clear ``alive`` and take
     # their contributions off ``weights`` in the same pass, both rewritten in place every round.
     ("sample", "apply_deletions"): frozenset({"alive", "weights"}),

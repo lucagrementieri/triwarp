@@ -321,6 +321,11 @@ def test_query_nearest_bvh_k1(bench_case: BenchCase) -> None:
     """
     ``k=1`` BVH k-NN — the exact call ICP and the Chamfer family make.
 
+    At ``k = 1`` with no prebuilt ``accelerator`` this is not a radius search but one
+    closest-point descent over [`mesh_from_points`][triwarp.neighbors.mesh_from_points], so the
+    row times that tree's build plus the query, and needs neither the bounding box nor the density
+    estimate the deepening search reads back.
+
     meshlib's ``PointsProjector`` is the only batched form it has that takes a *query* cloud, and
     it answers ``k=1`` only -- which is why meshlib appears in this group and not in the ``k7`` or
     ``k64`` ones (``tests/test_neighbors.py`` records that as a ``benchmarked=False`` claim). It is

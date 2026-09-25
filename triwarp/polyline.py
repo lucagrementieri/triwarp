@@ -91,6 +91,27 @@ def is_closed(polyline: wp.array[wp.vec3]) -> bool:
     return bool(int(read_scalar(_endpoints_coincide_flag(polyline), 0)) != 0)
 
 
+def _endpoints_coincide_flag(polyline: wp.array[wp.vec3]) -> wp.array[wp.int32]:
+    """
+    One-element device flag, ``1`` when the first and last points coincide.
+
+    [`is_closed`][triwarp.polyline.is_closed]'s device half. The kernels that take the closure
+    decision on the device instead evaluate the same predicate themselves, so none of them pays
+    this launch. One launch rather than ``allclose`` over two one-element slices: that spelling is
+    a ``wp.map`` into a mask plus a whole reduction over it, to compare six floats. Needs at least
+    two points.
+    """
+    flag = wp.empty(1, dtype=wp.int32, device=polyline.device)
+    wp.launch(
+        kernel_polyline.endpoints_coincide,
+        dim=1,
+        inputs=[polyline, wp.float32(ALLCLOSE_RTOL), wp.float32(ALLCLOSE_ATOL)],
+        outputs=[flag],
+        device=polyline.device,
+    )
+    return flag
+
+
 def polyline_open(polyline: wp.array[wp.vec3]) -> wp.array[wp.vec3]:
     """
     Open a polyline by dropping the last point when it duplicates the first.
@@ -138,7 +159,7 @@ def polyline_close(polyline: wp.array[wp.vec3]) -> wp.array[wp.vec3]:
     n = int(polyline.shape[0])
     if n < 2 or is_closed(polyline):
         return polyline
-    return tw.array.concatenate([polyline, polyline[0:1]])
+    return _append_first_point(polyline)
 
 
 def polyline_length(polyline: wp.array[wp.vec3], *, closed: bool = False) -> float:
@@ -273,18 +294,17 @@ def polyline_normal(polyline: wp.array[wp.vec3]) -> wp.vec3:
     # duplicates its first has only ``n - 1`` of them.
     if n < 3:
         raise ValueError("polyline_normal requires at least three points")
-    # Whether the loop is already closed is decided on the device: the kernel reads the flag and
-    # sums over the closing edge by wrapping its index, so nothing is copied to close the loop and
-    # nothing is read back to decide whether to. Only a three-point input needs the answer on the
-    # host, to tell a triangle from a closed two-point loop.
-    is_loop = _endpoints_coincide_flag(polyline)
-    if n == 3 and int(read_scalar(is_loop, 0)) != 0:
+    # Whether the loop is already closed is decided on the device: the kernel evaluates the closure
+    # predicate itself and sums over the closing edge by wrapping its index, so nothing is copied
+    # to close the loop and nothing is read back to decide whether to. Only a three-point input
+    # needs the answer on the host, to tell a triangle from a closed two-point loop.
+    if n == 3 and is_closed(polyline):
         raise ValueError("polyline_normal requires at least three points")
     out_normal = wp.zeros(1, dtype=wp.vec3, device=device)
     wp.launch_tiled(
         kernel_polyline.accumulate_newell_normal,
         dim=kernel_reduce.blocks_1d(n),
-        inputs=[polyline, is_loop, out_normal],
+        inputs=[polyline, wp.float32(ALLCLOSE_RTOL), wp.float32(ALLCLOSE_ATOL), out_normal],
         block_dim=TILE_1D,
         device=device,
     )
@@ -429,13 +449,14 @@ def polyline_smooth_upsample(
     """
     # An *explicitly* closed input (last point already equal to the first) is detected the same
     # way ``polyline_angles`` detects one, per the module docstring -- so a caller does not have
-    # to pass ``closed=True`` for a ring ``boundary_loops`` already returned. ``polyline_close`` is
-    # idempotent on an already-closed input, so calling it unconditionally here costs nothing.
-    treat_as_closed = closed or is_closed(polyline)
-    if treat_as_closed:
+    # to pass ``closed=True`` for a ring ``boundary_loops`` already returned.
+    already_closed = is_closed(polyline)
+    treat_as_closed = closed or already_closed
+    if treat_as_closed and not already_closed and int(polyline.shape[0]) >= 2:
         # Every segment including the seam becomes interior, so neighbour tangents wrap cyclically
-        # and the duplicated closing point is dropped -- a clean cyclic ring.
-        polyline = polyline_close(polyline)
+        # and the duplicated closing point is dropped -- a clean cyclic ring. This is
+        # ``polyline_close`` on the closure answer already in hand, so it is asked only once.
+        polyline = _append_first_point(polyline)
     gather = kernel_polyline.smooth_upsample_gather
     return _upsample(polyline, step_size, gather, [wp.int32(treat_as_closed)])
 
@@ -476,6 +497,20 @@ def _upsample(
         device=device,
     )
     return out_points
+
+
+def _append_first_point(polyline: wp.array[wp.vec3]) -> wp.array[wp.vec3]:
+    """
+    Return the polyline with its first point appended: two copies into one allocation.
+
+    What [`array.concatenate`][triwarp.array.concatenate] of the polyline and its first point
+    returns, without the segment table that function builds for an arbitrary list.
+    """
+    n = int(polyline.shape[0])
+    closed = wp.empty(n + 1, dtype=wp.vec3, device=polyline.device)
+    wp.copy(closed, polyline, count=n)
+    wp.copy(closed, polyline, dest_offset=n, count=1)
+    return closed
 
 
 def cumulative_arc_length(polyline: wp.array[wp.vec3]) -> wp.array[wp.float32]:
@@ -619,7 +654,7 @@ def polyline_simplify(
 
     Drops interior vertices whose perpendicular distance to the chord spanning a kept sub-range is
     at most ``tol``; the first and last vertices are always retained. The recursion is evaluated
-    **level-synchronously** rather than depth-first -- one round of four ``dim=n`` launches per
+    **level-synchronously** rather than depth-first -- one round of every point in parallel per
     level of the split tree, so the cost is the tree's *depth* (about ``log2(n)`` on a mesh
     boundary loop) rather than one thread's walk of the whole tree. The accepted set is identical
     either way, since breadth-first and depth-first evaluation of the same recursion accept the
@@ -648,10 +683,13 @@ def polyline_simplify(
 
     Notes
     -----
-    The round loop runs **on device**, driven by ``wp.capture_while`` exactly as
-    [`polyline_triangulate`][triwarp.polyline.polyline_triangulate]'s ear rounds are, so however
-    many levels the split tree has, the loop itself costs one graph launch and no readback. The one
-    host synchronisation in the call is the compaction that follows it, where
+    The round loop runs **on device** with no readback. Up to a few thousand points on CUDA, and at
+    every size on the CPU device, it runs as a single block whose lanes share the points, with a
+    block barrier between the steps of a round; a longer polyline on CUDA drives the four launches
+    with ``wp.capture_while`` exactly as
+    [`polyline_triangulate`][triwarp.polyline.polyline_triangulate]'s ear rounds are driven. Both
+    forms run the same per-point steps and accept the same points. The one host synchronisation in
+    the call is the compaction that follows the loop, where
     [`flatnonzero`][triwarp.array.flatnonzero] reads back the kept count in order to size
     ``indices``.
 
@@ -661,14 +699,6 @@ def polyline_simplify(
     its points, which is also the input the recursion does the most work on. A spiral's depth tracks
     its *turn count* rather than ``n``, while a power curve, a geometric staircase and a decaying
     sawtooth are all shallower than a boundary loop.
-
-    This is deliberately **one algorithm on both devices, with no serial fallback and no host-driven
-    loop for small inputs**: the fixed cost of graph capture, the keep-mask compaction and the round
-    loop itself all scale with the tree depth rather than with ``n``, so a size-gated fallback would
-    add a second implementation (and the test that its accepted set agrees with this one's) without
-    a reliable win. On the CPU backend a ``dim=n`` launch runs as a single lane, so each round costs
-    ``O(n)`` sequential work rather than the host's ``O(n log n)`` recursive total -- the device is
-    the target, so this is recorded rather than branched on.
 
     See Also
     --------
@@ -682,16 +712,37 @@ def polyline_simplify(
     span_lo = wp.empty(n, dtype=wp.int32, device=device)
     span_hi = wp.empty(n, dtype=wp.int32, device=device)
     keep_mask = wp.empty(n, dtype=wp.bool, device=device)
+    if n > 2 and (not wp.get_device(device).is_cuda or n <= kernel_polyline.RDP_ONE_BLOCK_MAX):
+        # The whole round loop as one block (``kernels/polyline.rdp_simplify_block``): at this size
+        # a round is too little work to fill the device, and the launch form's cost is the
+        # conditional graph it records on every call.
+        span_max = wp.empty(n, dtype=wp.float32, device=device)
+        span_argmax = wp.empty(n, dtype=wp.int32, device=device)
+        squared_distances = wp.empty(n, dtype=wp.float32, device=device)
+        wp.launch_tiled(
+            kernel_polyline.rdp_simplify_block,
+            dim=[1],
+            inputs=[polyline, wp.float32(tol * tol)],
+            outputs=[span_lo, span_hi, span_max, span_argmax, squared_distances, keep_mask],
+            block_dim=kernel_polyline.RDP_BLOCK_DIM,
+            device=device,
+        )
+        indices = tw.array.flatnonzero(keep_mask)
+        return tw.array.gather(polyline, indices), indices
+    # state = [levels run, loop condition], seeded by ``rdp_seed_spans`` and then written on device
+    # so the round loop needs no readback -- ``polyline_triangulate``'s ear rounds are driven the
+    # same way.
+    state = wp.empty(kernel_array.LOOP_STATE_SIZE, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_polyline.rdp_seed_spans, dim=n, inputs=[span_lo, span_hi, keep_mask], device=device
+        kernel_polyline.rdp_seed_spans,
+        dim=n,
+        inputs=[span_lo, span_hi, keep_mask, state],
+        device=device,
     )
     if n > 2:  # fewer than three points have no interior to drop, and no thread 0 to clear `state`
         span_max = wp.empty(n, dtype=wp.float32, device=device)
         span_argmax = wp.empty(n, dtype=wp.int32, device=device)
         squared_distances = wp.empty(n, dtype=wp.float32, device=device)
-        # state = [levels run, loop condition], both written on device so the round loop needs no
-        # readback -- ``polyline_triangulate``'s ear rounds are driven the same way.
-        state = wp.array([0, 1], dtype=wp.int32, device=device)  # see array.LOOP_ROUND
         squared_tolerance = wp.float32(tol * tol)
 
         def split_round() -> None:
@@ -875,19 +926,35 @@ def polyline_radius(
             "polyline_radius requires at least three points when 'center' or 'normal' is not "
             "supplied explicitly"
         )
-    if center is None:
-        center = polyline_centroid(polyline)
-    if normal is None:
-        normal = polyline_normal(polyline)
-
+    # The default centre and normal are ``polyline_centroid``'s and ``polyline_normal``'s, built by
+    # one accumulation pass and consumed where the distances are, so neither crosses to the host.
+    # Only a three-point input needs a readback first: ``polyline_normal`` rejects a closed one.
+    if normal is None and n_segments == 2 and is_closed(polyline):
+        raise ValueError("polyline_normal requires at least three points")
+    frame = None
+    if center is None or normal is None:
+        frame = wp.zeros(kernel_polyline.RADIUS_FRAME_SIZE, dtype=wp.float32, device=device)
+        wp.launch_tiled(
+            kernel_polyline.accumulate_radius_frame,
+            dim=kernel_reduce.blocks_1d(n_segments + 1),
+            inputs=[polyline, wp.float32(ALLCLOSE_RTOL), wp.float32(ALLCLOSE_ATOL), frame],
+            block_dim=TILE_1D,
+            device=device,
+        )
     distances = twt.empty_1d(n_segments, wp.float32, device=device)
-    wp.map(
-        kernel_polyline.radius_segment_distances,
-        polyline[:-1],
-        polyline[1:],
-        center,
-        normal,
-        out=distances,
+    wp.launch(
+        kernel_polyline.radius_distances,
+        dim=n_segments,
+        inputs=[
+            polyline,
+            frame,
+            wp.vec3() if center is None else center,
+            wp.vec3() if normal is None else normal,
+            wp.int32(1 if center is None else 0),
+            wp.int32(1 if normal is None else 0),
+        ],
+        outputs=[distances],
+        device=device,
     )
     if reduction == "min":
         return float(tw.reduce.min(distances))
@@ -929,7 +996,7 @@ def polyline_angles(polyline: wp.array[wp.vec3], *, closed: bool = False) -> wp.
     if n < 2:
         return wp.zeros(n, dtype=wp.float32, device=device)
 
-    # One launch writes every angle in its final slot, reading the closure flag on the device: no
+    # One launch writes every angle in its final slot, deciding the closure on the device: no
     # readback decides the wrap-around, and ``closed=True`` reaches the closing segment by wrapping
     # the index rather than through a ``polyline_close`` copy. See
     # ``kernels/polyline.vertex_turning_angles``.
@@ -937,31 +1004,16 @@ def polyline_angles(polyline: wp.array[wp.vec3], *, closed: bool = False) -> wp.
     wp.launch(
         kernel_polyline.vertex_turning_angles,
         dim=n,
-        inputs=[polyline, wp.int32(1 if closed else 0), _endpoints_coincide_flag(polyline)],
+        inputs=[
+            polyline,
+            wp.int32(1 if closed else 0),
+            wp.float32(ALLCLOSE_RTOL),
+            wp.float32(ALLCLOSE_ATOL),
+        ],
         outputs=[angles],
         device=device,
     )
     return angles
-
-
-def _endpoints_coincide_flag(polyline: wp.array[wp.vec3]) -> wp.array[wp.int32]:
-    """
-    One-element device flag, ``1`` when the first and last points coincide.
-
-    Shared by [`is_closed`][triwarp.polyline.is_closed], which reads it back, and by the kernels
-    that take the closure decision on the device instead, so none of them pays the readback. One
-    launch rather than ``allclose`` over two one-element slices: that spelling is a ``wp.map`` into
-    a mask plus a whole reduction over it, to compare six floats. Needs at least two points.
-    """
-    flag = wp.empty(1, dtype=wp.int32, device=polyline.device)
-    wp.launch(
-        kernel_polyline.endpoints_coincide,
-        dim=1,
-        inputs=[polyline, wp.float32(ALLCLOSE_RTOL), wp.float32(ALLCLOSE_ATOL)],
-        outputs=[flag],
-        device=polyline.device,
-    )
-    return flag
 
 
 def polyline_triangulate(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
@@ -981,18 +1033,17 @@ def polyline_triangulate(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
     respect to the loop's turning direction; the exact set of triangles may differ from a sequential
     ear clip, but every triangulation of a simple polygon has ``n - 2`` faces.
 
-    Every launch in the round loop is ``dim=n``, so the cost is set by the **round count**, and the
-    round count by how many ears the independent-set rule can retire at once. Competing ears are
-    ranked by a bijective hash of their ring index rather than by the index itself, which is what
-    keeps that logarithmic: under the raw index an alternating star lets the ear at ``i - 2``
-    suppress the ear at ``i`` for every ``i``, so one ear is clipped per round and the loop runs its
-    full ``n``-round cap.
+    The cost is set by the **round count**, and the round count by how many ears the
+    independent-set rule can retire at once. Competing ears are ranked by a bijective hash of their
+    ring index rather than by the index itself, which is what keeps that logarithmic: under the raw
+    index an alternating star lets the ear at ``i - 2`` suppress the ear at ``i`` for every ``i``,
+    so one ear is clipped per round and the loop runs its full ``n``-round cap.
 
     Parameters
     ----------
     polyline
-        ``(n,)`` polyline vertices as ``wp.vec3``. A duplicated closing point is dropped via
-        [`polyline_open`][triwarp.polyline.polyline_open].
+        ``(n,)`` polyline vertices as ``wp.vec3``. A duplicated closing point is dropped, with the
+        predicate [`polyline_open`][triwarp.polyline.polyline_open] applies.
 
     Returns
     -------
@@ -1003,49 +1054,36 @@ def polyline_triangulate(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
 
     Notes
     -----
-    The round loop runs **on device**, driven by ``wp.capture_while`` over a device-side condition
-    exactly as the level loops elsewhere in this package drive theirs, so the whole clip costs one
-    graph launch and one readback (the final face count) rather than a readback per round.
+    The whole clip runs **on device**. A short ring is clipped by a single block that runs every
+    round itself; a long one, whose rounds fill the device, by a round loop driven by
+    ``wp.capture_while`` over a device-side condition. On the CPU device the single-block form is
+    used at every length. Two readbacks are left in the whole function, both structural: one
+    carrying the ring length (whether the last point repeats the first), the loop's orientation and
+    its reflex count, which together decide every launch dimension and the convex fan fast path; and
+    the face count, which sizes the returned slice. The plane frame is accumulated and consumed on
+    the device and never crosses to the host.
 
-    **The prologue is fused.** The plane frame
-    ([`polyline_normal`][triwarp.polyline.polyline_normal], its internal
-    [`polyline_close`][triwarp.polyline.polyline_close] closure test, and
-    [`polyline_centroid`][triwarp.polyline.polyline_centroid]) is built as one accumulation pass,
-    one single-thread finalize and one projection, living in device memory and never crossing to the
-    host. Three readbacks are left in the whole function, every one of them structural:
-    ``polyline_open``'s [`is_closed`][triwarp.polyline.is_closed], which decides ``n`` and therefore
-    every launch dimension; the reflex count that selects the convex fan fast path, which is the
-    last one a convex loop pays; and the face count above, which sizes the returned slice.
-
-    When conditional graph nodes are unavailable (CPU, or a CUDA driver below 12.4)
-    ``wp.capture_while`` executes the same loop directly with one pinned 4-byte readback per round.
-    The CPU fallback and the captured CUDA loop produce the same triangulation up to row order, and
-    that row order was never stable on CUDA either -- ``clip_selected`` appends through an atomic.
+    Every path produces the same triangulation up to row order, and that row order is not stable on
+    CUDA -- faces are appended through an atomic counter.
 
     See Also
     --------
     [`polyline_normal`][triwarp.polyline.polyline_normal]
     [`polyline_close`][triwarp.polyline.polyline_close]
     """
-    polyline = polyline_open(polyline)
     device = polyline.device
     n = int(polyline.shape[0])
     if n < 3:
         return twt.empty_2d((0, 3), wp.int32, device=device)
 
-    # The plane frame is built and consumed entirely on device: one accumulation pass, then a
-    # projection whose threads each derive the frame from the accumulated sums. The three
-    # host-scope reductions this replaces (``polyline_normal``, its internal ``polyline_close``
-    # closure test, and ``polyline_centroid``) each ended in a readback because the next one
-    # consumed its result, and that prologue was flat in ``n`` -- the whole of this function's
-    # fixed cost at small loops.
-    normal = wp.zeros(1, dtype=wp.vec3, device=device)
-    weighted_midpoint = wp.zeros(1, dtype=wp.vec3, device=device)
-    total_length = wp.zeros(1, dtype=wp.float32, device=device)
+    # The plane frame is built and consumed entirely on device: one accumulation pass, which also
+    # decides whether the last point repeats the first, then a projection whose threads each derive
+    # the frame from the accumulated sums.
+    sums = wp.zeros(kernel_polyline.RING_SUMS_SIZE, dtype=wp.float32, device=device)
     wp.launch_tiled(
         kernel_polyline.accumulate_loop_frame,
         dim=kernel_reduce.blocks_1d(n),
-        inputs=[polyline, normal, weighted_midpoint, total_length],
+        inputs=[polyline, wp.float32(ALLCLOSE_RTOL), wp.float32(ALLCLOSE_ATOL), sums],
         block_dim=TILE_1D,
         device=device,
     )
@@ -1053,74 +1091,11 @@ def polyline_triangulate(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
     wp.launch(
         kernel_polyline.project_polyline_to_plane,
         dim=n,
-        inputs=[polyline, normal, weighted_midpoint, total_length, points2d],
+        inputs=[polyline, sums, points2d],
         device=device,
     )
-
-    # ``[turning angle, reflex count, reflex count once mirrored]``, from one pass. Orientation is
-    # fixed up on device (``orient_ccw`` reads the accumulated angle itself), and the reflex count
-    # of the oriented loop is whichever of the two it leaves behind, so this one read is the only
-    # readback before the convex fast path returns.
-    turns = wp.zeros(3, dtype=wp.float32, device=device)
-    wp.launch_tiled(
-        kernel_polyline.accumulate_turning_angle,
-        dim=kernel_reduce.blocks_1d(n),
-        inputs=[points2d, turns],
-        block_dim=TILE_1D,
-        device=device,
-    )
-    wp.launch(kernel_polyline.orient_ccw, dim=n, inputs=[points2d, turns], device=device)
-
-    out_faces = twt.empty_2d((n - 2, 3), wp.int32, device=device)
-    out_count = wp.zeros(1, dtype=wp.int32, device=device)
-
-    turning, reflex, reflex_mirrored = turns.numpy()
-    # The comparison ``orient_ccw`` makes, on the value it read.
-    if (reflex if turning >= 0.0 else reflex_mirrored) == 0.0:
-        wp.launch(kernel_polyline.fan_triangulate, dim=n - 2, inputs=[out_faces], device=device)
-        return twt.as_array2d(out_faces, wp.int32)
-
-    left = wp.empty(n, dtype=wp.int32, device=device)
-    right = wp.empty(n, dtype=wp.int32, device=device)
-    active = wp.empty(n, dtype=wp.int32, device=device)
-    is_ear = wp.empty(n, dtype=wp.int32, device=device)
-    selected = wp.empty(n, dtype=wp.int32, device=device)
-    wp.launch(kernel_polyline.init_ring, dim=n, inputs=[left, right, active], device=device)
-
-    # state = [rounds run, loop condition], both written by ``ear_loop_continue``.
-    state = wp.array([0, 1], dtype=wp.int32, device=device)  # see array.LOOP_ROUND
-
-    def clip_round() -> None:
-        wp.launch(
-            kernel_polyline.compute_ears,
-            dim=n,
-            inputs=[points2d, left, right, active, is_ear],
-            device=device,
-        )
-        wp.launch(
-            kernel_polyline.select_independent,
-            dim=n,
-            inputs=[is_ear, left, right, selected],
-            device=device,
-        )
-        wp.launch(
-            kernel_polyline.clip_selected,
-            dim=n,
-            inputs=[selected, left, right, active, out_faces, out_count],
-            device=device,
-        )
-        wp.launch(
-            kernel_polyline.ear_loop_continue,
-            dim=1,
-            inputs=[out_count, wp.int32(n - 2), wp.int32(n), state],
-            device=device,
-        )
-
-    condition = state[kernel_array.LOOP_CONDITION_VIEW]
-    run_device_loop(device, condition, clip_round)
-
-    count = int(read_scalar(out_count, 0))
-    return twt.as_array2d(out_faces[0:count], wp.int32)
+    _, faces = _triangulate_ring(points2d, sums, detect_closing=False)
+    return faces
 
 
 def triangulate_polygon(polygon: wp.array[wp.vec2]) -> tuple[wp.array[wp.vec2], wp.array[wp.int32]]:
@@ -1167,9 +1142,120 @@ def triangulate_polygon(polygon: wp.array[wp.vec2]) -> tuple[wp.array[wp.vec2], 
     if n < 3:
         return polygon, wp.empty(0, dtype=wp.int32, device=device)
 
-    lifted = wp.empty(n, dtype=wp.vec3, device=device)
-    wp.map(kernel_array.lift_vec2, polygon, wp.float32(0.0), out=lifted)
-    opened = polyline_open(lifted)
-    faces = polyline_triangulate(opened).reshape((-1,))
-    # polyline_open only ever drops a repeated final point, so the matching 2D ring is a prefix.
-    return polygon[: int(opened.shape[0])].contiguous(), faces
+    sums = wp.zeros(kernel_polyline.RING_SUMS_SIZE, dtype=wp.float32, device=device)
+    n_ring, faces = _triangulate_ring(polygon, sums, detect_closing=True)
+    # The ring is the input minus any repeated closing point, i.e. a prefix of it.
+    return polygon[:n_ring].contiguous(), faces.reshape((-1,))
+
+
+def _triangulate_ring(
+    points2d: wp.array[wp.vec2], sums: wp.array[wp.float32], *, detect_closing: bool
+) -> tuple[int, twt.Array2dInt32]:
+    """
+    Ear-clip a 2D ring, from the turning angle onwards: ``(ring length, (m, 3) faces)``.
+
+    ``points2d`` holds the ring plus, possibly, a repeated closing point. With
+    ``detect_closing=False`` the caller's prologue has already written the closing flag into
+    ``sums``; otherwise the turning-angle pass decides it. Either way the one readback of ``sums``
+    carries the ring length, the orientation and the reflex count together. ``points2d`` is only
+    mutated -- mirrored in place for a clockwise ring -- when ``detect_closing=False``, i.e. when it
+    is a buffer of the caller's own; a caller's input ring is cloned first.
+    """
+    device = points2d.device
+    n = int(points2d.shape[0])
+    wp.launch_tiled(
+        kernel_polyline.accumulate_turning_angle,
+        dim=kernel_reduce.blocks_1d(n),
+        inputs=[
+            points2d,
+            wp.int32(1 if detect_closing else 0),
+            wp.float32(ALLCLOSE_RTOL),
+            wp.float32(ALLCLOSE_ATOL),
+            sums,
+        ],
+        block_dim=TILE_1D,
+        device=device,
+    )
+    # The only readback before the convex fast path returns: ring length, turning angle and the
+    # reflex count of the oriented loop, all decided on device.
+    sums_np = sums.numpy()
+    turning = float(sums_np[int(kernel_polyline.RING_TURNING)])
+    reflex = float(sums_np[int(kernel_polyline.RING_TURNING) + 1])
+    reflex_mirrored = float(sums_np[int(kernel_polyline.RING_TURNING) + 2])
+    n_ring = n - int(sums_np[int(kernel_polyline.RING_CLOSING)])
+    if n_ring < 3:
+        return n_ring, twt.empty_2d((0, 3), wp.int32, device=device)
+
+    out_faces = twt.empty_2d((n_ring - 2, 3), wp.int32, device=device)
+    # A clockwise ring is mirrored before the ear tests, and its reflex count is the mirror's.
+    clockwise = turning < 0.0
+    if (reflex_mirrored if clockwise else reflex) == 0.0:
+        # The fan's faces are index triples, so a convex ring needs no orientation fix-up at all.
+        wp.launch(
+            kernel_polyline.fan_triangulate, dim=n_ring - 2, inputs=[out_faces], device=device
+        )
+        return n_ring, twt.as_array2d(out_faces, wp.int32)
+
+    if clockwise:
+        if detect_closing:
+            points2d = wp.clone(points2d)
+        wp.launch(kernel_polyline.orient_ccw, dim=n_ring, inputs=[points2d], device=device)
+
+    # One block runs every round (see ``ear_clip_block``): no graph to record, one launch. On the
+    # CPU device a launch grid is a serial loop either way, so the block form does the same walk
+    # without a launch and a readback per round, and it is taken at every size.
+    if n_ring <= kernel_polyline.EAR_ONE_BLOCK_MAX or not wp.get_device(device).is_cuda:
+        ring = twt.empty_2d((5, n_ring), wp.int32, device=device)
+        count_wp = wp.empty(1, dtype=wp.int32, device=device)
+        wp.launch_tiled(
+            kernel_polyline.ear_clip_block,
+            dim=1,
+            inputs=[points2d, out_faces, ring, count_wp],
+            block_dim=kernel_polyline.EAR_BLOCK_DIM,
+            device=device,
+        )
+        count = int(read_scalar(count_wp, 0))
+        return n_ring, twt.as_array2d(out_faces[0:count], wp.int32)
+
+    left = wp.empty(n_ring, dtype=wp.int32, device=device)
+    right = wp.empty(n_ring, dtype=wp.int32, device=device)
+    active = wp.empty(n_ring, dtype=wp.int32, device=device)
+    is_ear = wp.empty(n_ring, dtype=wp.int32, device=device)
+    selected = wp.empty(n_ring, dtype=wp.int32, device=device)
+    # [rounds run, loop condition, face count], seeded by ``init_ring``.
+    state = wp.empty(kernel_polyline.EAR_STATE_SIZE, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_polyline.init_ring, dim=n_ring, inputs=[left, right, active, state], device=device
+    )
+
+    def clip_round() -> None:
+        wp.launch(
+            kernel_polyline.compute_ears,
+            dim=n_ring,
+            inputs=[points2d, left, right, active, is_ear],
+            device=device,
+        )
+        wp.launch(
+            kernel_polyline.select_independent,
+            dim=n_ring,
+            inputs=[is_ear, left, right, selected],
+            device=device,
+        )
+        wp.launch(
+            kernel_polyline.clip_selected,
+            dim=n_ring,
+            inputs=[selected, left, right, active, out_faces, state],
+            device=device,
+        )
+        wp.launch(
+            kernel_polyline.ear_loop_continue,
+            dim=1,
+            inputs=[wp.int32(n_ring - 2), wp.int32(n_ring), state],
+            device=device,
+        )
+
+    condition = state[kernel_array.LOOP_CONDITION_VIEW]
+    run_device_loop(device, condition, clip_round)
+
+    count = int(read_scalar(state, int(kernel_polyline.EAR_COUNT)))
+    return n_ring, twt.as_array2d(out_faces[0:count], wp.int32)

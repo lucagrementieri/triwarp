@@ -26,16 +26,13 @@ within a class the kernels differ only in the per-segment expression:
 sizes (query points x segments).
 
 ``triangulate_polygon`` is the module's worked example of a cost that is not where it looks. It
-delegates to a **parallel** multi-round ear clipper: every launch is ``dim=n`` and a round clips a
-whole *independent set* of ears. What is serial is the **round count** — a round costs four launches
-whatever it clips — and the round loop runs on the device (``wp.capture_while``), worth up to 2x.
-
-Read the residual against its attribution rather than against the round loop, which is no longer the
-cost: at a small ring the clip is a tenth of the call and **most of the rest is the prologue** —
-``polyline_open``'s ``is_closed``, ``polyline_normal`` and ``polyline_centroid``, three reductions
-each ending in a readback because their result is a Python-scope ``wp.vec3``, plus the reflex-count
-readback. That share is *flat in n*, so it is the whole gap to trimesh at a small ring and none of
-it at a large one.
+delegates to a **parallel** multi-round ear clipper: a round clips a whole *independent set* of
+ears, so what is serial is the **round count**. Up to ``EAR_ONE_BLOCK_MAX`` corners the whole round
+loop is **one block** that runs every round itself, which trades the recording and replay of a
+conditional graph -- flat in ``n``, and most of a small ring's call -- for three block barriers a
+round; past it a round is four ``dim=n`` launches in a ``wp.capture_while`` loop. The 2D ring is
+clipped as given: there is no plane fit, and the ring length, orientation and reflex count arrive
+in one readback, so a small ring's residual is that readback, the face count and one launch.
 
 The round *count* is what this group caught first: ranking competing ear candidates by raw ring
 index lets ear ``i - 2`` suppress ear ``i`` on an alternating star, so exactly **one** ear is
@@ -673,14 +670,11 @@ def test_triangulate_polygon(bench_lib: BenchLibrary, ring_size: int) -> None:
 
     ``creation.extrude_polygon`` hands the triangulator a convex ring, which takes the single-fan
     fast path and never reaches the ear loop (its row is in [`test_creation.py`](test_creation.py)).
-    A star ring forces it. Each round is fully parallel (four ``dim=n`` launches) and the round loop
-    itself runs on device, so what this group measures is **how many rounds the independent-set rule
-    needs**: a few dozen either way, against a count proportional to the ring size before the
-    ranking hash.
-
-    At a small ring that is no longer the dominant term -- the clip is a tenth of the call and the
-    flat plane-fitting prologue is most of the rest -- so read the small point as a floor row and
-    the large one as a rounds ratio. No open3d counterpart.
+    A star ring forces it. Both points take the single-block ear loop, whose cost is **how many
+    rounds the independent-set rule needs** times three block barriers plus each round's ear tests:
+    a few dozen rounds either way, against a count proportional to the ring size before the ranking
+    hash. The small point is close to the floor of one launch and two readbacks. No open3d
+    counterpart.
     """
     if bench_lib.kind == "triwarp":
         ring_wp = _star_wp(ring_size, str(bench_lib.device))

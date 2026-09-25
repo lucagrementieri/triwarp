@@ -380,6 +380,34 @@ def seed_source_scalars(
     wp.atomic_add(out_weighted, v, values[s])
 
 
+@wp.kernel
+def seed_transport_sources(
+    sources: wp.array[wp.int32],
+    vectors: wp.array[wp.vec2],
+    out_field: wp.array[wp.vec2d],
+    out_indicator: wp.array[wp.float64],
+    out_magnitude: wp.array[wp.float64],
+) -> None:
+    # ``transport_tangent_vectors``' three right-hand sides from one pass over the sources: the
+    # widened vector, where the sources are, and the length each carries -- the vector heat seed and
+    # ``seed_source_scalars``' pair, which a caller of both used to write in four launches.
+    s = wp.int32(wp.tid())
+    v = sources[s]
+    vector = to_vec2d(vectors[s])
+    wp.atomic_add(out_field, v, vector)
+    wp.atomic_add(out_indicator, v, wp.float64(1.0))
+    wp.atomic_add(out_magnitude, v, wp.length(vector))
+
+
+@wp.kernel
+def seed_log_map_source(
+    source: wp.int32, out_field: wp.array[wp.vec2d], out_indicator: wp.array[wp.float64]
+) -> None:
+    # ``log_map``'s two right-hand sides: the source's reference direction and its heat indicator.
+    out_field[source] = wp.vec2d(wp.float64(1.0), wp.float64(0.0))
+    out_indicator[source] = wp.float64(1.0)
+
+
 @wp.func
 def divide_nonzero(numerator: wp.float64, denominator: wp.float64) -> wp.float64:
     # ``extend_scalar``'s ratio of the diffused values to the diffused indicator, zero only where

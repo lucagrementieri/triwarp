@@ -49,10 +49,8 @@ import triwarp.linalg as twl
 import triwarp.typing as twt
 from triwarp._device import require_same_device
 from triwarp.constants import TILE_1D
-from triwarp.kernels import array as kernel_array
 from triwarp.kernels import heat as kernel_heat
 from triwarp.kernels import reduce as kernel_reduce
-from triwarp.kernels import scatter as kernel_scatter
 from triwarp.laplacian import (
     connection_laplacian,
     cotmatrix,
@@ -362,16 +360,7 @@ def heat_geodesic(
 
     if operators is None:
         operators = heat_operators(vertices, faces, t, use_robust=use_robust)
-    (
-        heat_system,
-        heat_preconditioner,
-        _laplacian,
-        poisson_system,
-        poisson_preconditioner,
-        cot_entries,
-        normals,
-        areas,
-    ) = operators
+    heat_system, heat_preconditioner = operators[0], operators[1]
 
     # Heat solve: (M - t L) u = u0, with u0 the source indicator, run until every vertex's heat has
     # converged relative to its own size (``_diffuse``) -- not to a residual tolerance, which the
@@ -391,50 +380,7 @@ def heat_geodesic(
 
     heat = wp.zeros(n_vertices, dtype=wp.float64, device=device)
     _diffuse(heat_system, u0, heat, heat_preconditioner)
-
-    # Integrated divergence b = div(X) of the unit field X = -grad(u)/|grad(u)|, then a Poisson
-    # solve L phi = b, i.e. (-L) phi = -b with the positive semi-definite operator. One launch: the
-    # field is formed and integrated per face, so it never occupies an (n_faces,) buffer. The kernel
-    # integrates ``-X`` and so accumulates ``-b`` directly: the divergence is linear in the field
-    # and negation is exact, so this is the negated sum without a pass to negate it.
-    neg_divergence = wp.zeros(n_vertices, dtype=wp.float64, device=device)
-    wp.launch(
-        kernel_heat.unit_gradient_divergence,
-        dim=n_faces,
-        inputs=[vertices, faces, normals, areas, heat, cot_entries, neg_divergence],
-        device=device,
-    )
-
-    phi = wp.zeros(n_vertices, dtype=wp.float64, device=device)
-    twl.solve_spd(
-        poisson_system,
-        neg_divergence,
-        phi,
-        tol=_CG_TOLERANCE,
-        preconditioner=poisson_preconditioner,
-    )
-
-    # Shift so the field's mean over the sources is zero, and orient it positive -- the
-    # ``igl::heat_geodesics_solve`` convention, which makes a single source's distance exactly
-    # zero. Both means from one reduction launch, applied by a second that reads them on the
-    # device, so nothing is read back.
-    n_sources = int(sources.shape[0])
-    sums = wp.zeros(2, dtype=wp.float64, device=device)
-    wp.launch_tiled(
-        kernel_heat.source_and_global_sums,
-        dim=[kernel_reduce.blocks_1d(max(n_vertices, n_sources))],
-        inputs=[phi, sources],
-        outputs=[sums],
-        block_dim=TILE_1D,
-        device=device,
-    )
-    wp.launch(
-        kernel_heat.shift_and_orient,
-        dim=n_vertices,
-        inputs=[sums, wp.int32(n_sources), wp.int32(1), phi],
-        device=device,
-    )
-    return phi
+    return _distance_from_heat(vertices, faces, sources, operators, heat)
 
 
 def _diffuse(
@@ -1125,19 +1071,27 @@ def transport_tangent_vectors(
 
     if operators is None:
         operators = vector_heat_operators(vertices, faces, t)
-    vector_system, scalar, _, vector_preconditioner = operators
+    vector_system, scalar, _, _ = operators
 
-    # Widened once: the seed and the per-source magnitudes both read the float64 vectors.
-    vectors_d = _as_vec2d(vectors)
-    direction = _diffuse_from_sources(
-        vector_system, sources, vectors_d, n_vertices, device, preconditioner=vector_preconditioner
+    # The vector field and the magnitudes' two-column extension do not interact and settle at the
+    # same round, so they diffuse as one solve over the block-diagonal stack
+    # ``[vector system; heat system; heat system]`` (``_stacked_fields``): one settle loop in the
+    # launches of one, where two back to back paid for two. Its Jacobi diagonal and narrowed values
+    # are per row, so they are the two systems' own, and its settle test reads the union, which is
+    # the later of the two stops.
+    stack = twl.block_diag((vector_system, scalar[0], scalar[0]))
+    rhs_field, rhs = _stacked_fields(n_vertices, 2, device)
+    wp.launch(
+        kernel_heat.seed_transport_sources,
+        dim=n_sources,
+        inputs=[sources, vectors],
+        outputs=[rhs_field, rhs[2 * n_vertices : 3 * n_vertices], rhs[3 * n_vertices :]],
+        device=device,
     )
-
-    magnitudes = wp.empty(n_sources, dtype=wp.float64, device=device)
-    wp.map(wp.length, vectors_d, out=magnitudes)
-    diffused_indicator, diffused_magnitudes = _extend(
-        scalar[0], sources, magnitudes, n_vertices, device
-    )
+    direction, diffused = _stacked_fields(n_vertices, 2, device)
+    _diffuse(stack, rhs, diffused, None)
+    diffused_indicator = diffused[2 * n_vertices : 3 * n_vertices]
+    diffused_magnitudes = diffused[3 * n_vertices :]
 
     # One map for the whole tail: the magnitude's extension, the rescale, the narrowing to the
     # field's storage precision and the resolution test all read one vertex's own data, so running
@@ -1226,21 +1180,29 @@ def log_map(
 
     if operators is None:
         operators = vector_heat_operators(vertices, faces, t)
-    vector_system, scalar, frames, vector_preconditioner = operators
+    vector_system, scalar, frames, _ = operators
     basis_x, basis_y, _ = frames
 
-    sources = wp.array([source], dtype=wp.int32, device=device)
-    # The source's own reference direction, transported outwards: this is the "which way was x?"
-    # field the angle is measured against. Raw (unnormalized) magnitude, exactly like
-    # ``transport_tangent_vectors``' own ``direction``; the kernel normalizes it without underflow.
-    reference = wp.array([[1.0, 0.0]], dtype=wp.vec2d, device=device)
-    transported_raw = _diffuse_from_sources(
-        vector_system, sources, reference, n_vertices, device, preconditioner=vector_preconditioner
+    # The source's own reference direction transported outwards -- the "which way was x?" field
+    # the angle is measured against, raw (unnormalized) like ``transport_tangent_vectors``' own
+    # ``direction`` -- and ``heat_geodesic``'s heat, diffused together as one solve over
+    # ``[vector system; heat system]`` for the reason ``transport_tangent_vectors`` gives.
+    sources = wp.full(1, source, dtype=wp.int32, device=device)
+    stack = twl.block_diag((vector_system, scalar[0]))
+    rhs_field, rhs = _stacked_fields(n_vertices, 1, device)
+    wp.launch(
+        kernel_heat.seed_log_map_source,
+        dim=1,
+        inputs=[source],
+        outputs=[rhs_field, rhs[2 * n_vertices :]],
+        device=device,
     )
+    transported_raw, diffused = _stacked_fields(n_vertices, 1, device)
+    _diffuse(stack, rhs, diffused, None)
 
     # Radial direction: the unit gradient of the distance field, averaged onto vertices and
     # expressed in each vertex's frame.
-    distance = heat_geodesic(vertices, faces, sources, operators=scalar)
+    distance = _distance_from_heat(vertices, faces, sources, scalar, diffused[2 * n_vertices :])
     normals, areas = scalar[6], scalar[7]
     n_faces = int(faces.shape[0]) // 3
     vertex_gradient = wp.zeros(n_vertices, dtype=wp.vec3, device=device)
@@ -1260,6 +1222,84 @@ def log_map(
         device=device,
     )
     return logarithm
+
+
+def _distance_from_heat(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    sources: wp.array[wp.int32],
+    operators: HeatOperators,
+    heat: wp.array[wp.float64],
+) -> wp.array[wp.float64]:
+    """
+    ``heat_geodesic`` from the diffused heat on: the divergence, the Poisson solve and the shift.
+
+    Split out so ``log_map`` can diffuse the heat inside a stacked solve of its own.
+    """
+    device = vertices.device
+    n_vertices = int(vertices.shape[0])
+    n_faces = int(faces.shape[0]) // 3
+    _, _, _, poisson_system, poisson_preconditioner, cot_entries, normals, areas = operators
+
+    # Integrated divergence b = div(X) of the unit field X = -grad(u)/|grad(u)|, then a Poisson
+    # solve L phi = b, i.e. (-L) phi = -b with the positive semi-definite operator. One launch: the
+    # field is formed and integrated per face, so it never occupies an (n_faces,) buffer. The kernel
+    # integrates ``-X`` and so accumulates ``-b`` directly: the divergence is linear in the field
+    # and negation is exact, so this is the negated sum without a pass to negate it.
+    neg_divergence = wp.zeros(n_vertices, dtype=wp.float64, device=device)
+    wp.launch(
+        kernel_heat.unit_gradient_divergence,
+        dim=n_faces,
+        inputs=[vertices, faces, normals, areas, heat, cot_entries, neg_divergence],
+        device=device,
+    )
+
+    phi = wp.zeros(n_vertices, dtype=wp.float64, device=device)
+    twl.solve_spd(
+        poisson_system,
+        neg_divergence,
+        phi,
+        tol=_CG_TOLERANCE,
+        preconditioner=poisson_preconditioner,
+    )
+
+    # Shift so the field's mean over the sources is zero, and orient it positive -- the
+    # ``igl::heat_geodesics_solve`` convention, which makes a single source's distance exactly
+    # zero. Both means from one reduction launch, applied by a second that reads them on the
+    # device, so nothing is read back.
+    n_sources = int(sources.shape[0])
+    sums = wp.zeros(2, dtype=wp.float64, device=device)
+    wp.launch_tiled(
+        kernel_heat.source_and_global_sums,
+        dim=[kernel_reduce.blocks_1d(max(n_vertices, n_sources))],
+        inputs=[phi, sources],
+        outputs=[sums],
+        block_dim=TILE_1D,
+        device=device,
+    )
+    wp.launch(
+        kernel_heat.shift_and_orient,
+        dim=n_vertices,
+        inputs=[sums, wp.int32(n_sources), wp.int32(1), phi],
+        device=device,
+    )
+    return phi
+
+
+def _stacked_fields(
+    n_vertices: int, n_scalars: int, device: wp.DeviceLike
+) -> tuple[wp.array[wp.vec2d], wp.array[wp.float64]]:
+    """
+    Allocate a zeroed vector laid out as ``block_diag``'s stack of a vector and scalar systems.
+
+    The ``(n_vertices,)`` ``wp.vec2d`` field comes first, as its interleaved ``float64`` rows, then
+    ``n_scalars`` scalar fields one after another. Returns the field and the whole stack as one
+    flat ``float64`` vector over the same memory.
+    """
+    rows = (2 + n_scalars) * n_vertices
+    storage = wp.zeros((rows + 1) // 2, dtype=wp.vec2d, device=device)
+    flat = storage.view(wp.float64).flatten()
+    return twt.as_dense(storage[:n_vertices]), twt.as_dense(flat[:rows])
 
 
 def tangent_to_world(
@@ -1298,26 +1338,6 @@ def tangent_to_world(
     world = wp.empty(int(tangent.shape[0]), dtype=wp.vec3, device=tangent.device)
     wp.map(kernel_heat.tangent_to_world, tangent, basis_x, basis_y, out=world)
     return world
-
-
-def _diffuse_from_sources(
-    system: wps.BsrMatrix[wp.float64],
-    sources: wp.array[wp.int32],
-    vectors: wp.array[wp.vec2d],
-    n_vertices: int,
-    device: wp.DeviceLike,
-    *,
-    preconditioner: wpl.LinearOperator | None = None,
-) -> wp.array[wp.vec2d]:
-    """Seed a tangent field at the source vertices, then diffuse it."""
-    field = wp.zeros(n_vertices, dtype=wp.vec2d, device=device)
-    wp.launch(
-        kernel_scatter.SCATTER_ADD[wp.vec2d],
-        dim=int(sources.shape[0]),
-        inputs=[vectors, sources, field],
-        device=device,
-    )
-    return diffuse_tangent_field(system, field, preconditioner=preconditioner)
 
 
 def diffuse_tangent_field(
@@ -1371,10 +1391,3 @@ def diffuse_tangent_field(
         return diffused
     _diffuse(system, source, diffused, preconditioner)
     return diffused
-
-
-def _as_vec2d(vectors: wp.array[wp.vec2]) -> wp.array[wp.vec2d]:
-    """Widen a tangent field to float64, the precision the diffusion solves run in."""
-    widened = wp.empty(int(vectors.shape[0]), dtype=wp.vec2d, device=vectors.device)
-    wp.map(kernel_array.to_vec2d, vectors, out=widened)
-    return widened

@@ -1440,6 +1440,39 @@ def test_simplify_two_points_kept(device: str) -> None:
     assert np.array_equal(indices_wp.numpy(), np.array([0, 1], dtype=np.int32))
 
 
+@pytest.mark.parametrize("cap", [0, 10**9])
+@pytest.mark.parametrize("shape", ["spiral", "walk"])
+def test_simplify_block_and_round_loop_match_reference(
+    device: str, shape: str, cap: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Class A, against the recursive NumPy port, through both forms of the round loop.
+
+    Up to ``RDP_ONE_BLOCK_MAX`` points on CUDA -- and at every length on the CPU device -- the whole
+    loop runs as one block (``rdp_simplify_block``), longer polylines on CUDA as the captured
+    four-launch round. Every other simplify test here sits below the cap, so it is forced both
+    ways: ``0`` sends a CUDA call through the launches, ``10**9`` through the block. The deep
+    spiral runs dozens of rounds and the random walk is 1 500 points, more than the block's lanes,
+    so a lane walks several points per step and the barriers between the steps are exercised.
+    """
+    monkeypatch.setattr(kernel_polyline, "RDP_ONE_BLOCK_MAX", cap)
+    if shape == "spiral":
+        angle = np.linspace(0.0, 20.0 * 2.0 * np.pi, 512)
+        radius = np.linspace(0.05, 1.0, 512)
+        pts_np = np.stack(
+            [radius * np.cos(angle), radius * np.sin(angle), np.zeros_like(angle)], axis=1
+        )
+        tol = 1e-2 * float(np.ptp(pts_np, axis=0).max())
+    else:
+        pts_np = np.cumsum(np.random.default_rng(5).normal(size=(1500, 3)), axis=0)
+        tol = 0.5
+    _, indices_wp = tw.polyline.polyline_simplify(points_to_warp(pts_np, device), tol)
+    _, indices_np = _simplify_np(pts_np, tol)
+    # Non-vacuous: a real share of the points is dropped and a real share kept.
+    assert 10 < indices_np.shape[0] < pts_np.shape[0] - 100
+    assert np.array_equal(indices_wp.numpy(), indices_np.astype(np.int32))
+
+
 @pytest.mark.parametrize("tol", [0.1, 0.5])
 def test_simplify_closed_matches_reference(device: str, tol: float) -> None:
     pts_np = _random_open_polyline(3, n=30)
@@ -1727,19 +1760,39 @@ def test_triangulate_polygon_covers_same_region_as_trimesh(device: str, n: int) 
     assert np.array_equal(count_wp, count_tm)
 
 
+@pytest.mark.parity("triangulate_polygon", "trimesh")
 def test_triangulate_polygon_near_collinear(device: str) -> None:
-    # A ring whose interior vertices are almost on the line back to the start: every ear test is
-    # decided by a near-zero cross product, so this is where a ranking change could stall.
+    """
+    Class C, against ``trimesh.creation.triangulate_polygon``: the tiled region on a near-flat ring.
+
+    A ring whose interior vertices are almost on the line back to the start, so every ear test is
+    decided by a near-zero cross product -- where a ranking change could stall the clipper, and
+    where the chosen diagonals depend on exactly how the orientation test is evaluated (evaluating
+    it on centred, rotated coordinates picked different ears from the input coordinates). No
+    reference pins the diagonals, so the claim is the one
+    [`test_triangulate_polygon_covers_same_region_as_trimesh`][tests.test_polyline.test_triangulate_polygon_covers_same_region_as_trimesh]
+    makes: a complete ``n - 2``-face tiling whose per-point cover count equals the reference's, so
+    no triangle lies outside the ring and none overlap. Measured agreement 20 000 / 20 000 samples
+    on both devices, cover count never above 1.
+    """
     n = 64
     x_np = np.linspace(0.0, 1.0, n - 1)
     ring_np = np.vstack(
         (np.column_stack((x_np, 1e-7 * np.sin(np.pi * x_np))), np.array([[0.5, -0.25]]))
     )
     vertices_wp, faces_wp = tw.polyline.triangulate_polygon(points_to_warp_uv(ring_np, device))
+    vertices_tm, faces_tm = tm.creation.triangulate_polygon(sg.Polygon(ring_np))
     assert int(vertices_wp.shape[0]) == n
-    # A degenerate ring may yield a partial triangulation, but never more than n - 2 faces and
-    # never a hang: the round cap is the guarantee being checked here.
-    assert 0 < int(faces_wp.shape[0]) // 3 <= n - 2
+    assert int(faces_wp.shape[0]) // 3 == faces_tm.shape[0] == n - 2
+
+    points_np = np.random.default_rng(1).uniform([-0.05, -0.3], [1.05, 0.05], size=(20000, 2))
+    count_wp = _triangle_cover_count(
+        vertices_wp.numpy().astype(np.float64), faces_wp.numpy().reshape(-1, 3), points_np, 1e-12
+    )
+    count_tm = _triangle_cover_count(vertices_tm, faces_tm, points_np, 1e-12)
+    # Non-vacuous: the ring's interior holds a real share of the samples.
+    assert (count_tm == 1).sum() > 1000
+    assert np.array_equal(count_wp, count_tm)
 
 
 def test_triangulate_polygon_drops_repeated_closing_point(device: str) -> None:
@@ -1755,3 +1808,83 @@ def test_triangulate_polygon_too_few_points(device: str) -> None:
     )
     assert int(vertices_wp.shape[0]) == 2
     assert int(faces_wp.shape[0]) == 0
+
+
+def _signed_ring_area(ring_np: np.ndarray) -> float:
+    """Shoelace area of a 2D ring, positive counter-clockwise."""
+    return 0.5 * float(
+        np.dot(ring_np[:, 0], np.roll(ring_np[:, 1], -1))
+        - np.dot(np.roll(ring_np[:, 0], -1), ring_np[:, 1])
+    )
+
+
+def _tiled_area(ring_np: np.ndarray, faces_np: np.ndarray) -> float:
+    triangles_np = ring_np.astype(np.float64)[faces_np.reshape(-1, 3)]
+    edge_a = triangles_np[:, 1] - triangles_np[:, 0]
+    edge_b = triangles_np[:, 2] - triangles_np[:, 0]
+    return 0.5 * float(np.abs(edge_a[:, 0] * edge_b[:, 1] - edge_a[:, 1] * edge_b[:, 0]).sum())
+
+
+def test_triangulate_polygon_leaves_a_clockwise_input_unchanged(device: str) -> None:
+    """
+    Not a library comparison: a clockwise ring is mirrored before the ear tests, the input is not.
+
+    ``triangulate_polygon`` clips the caller's own buffer rather than a projected copy of it, so
+    the in-place mirror a clockwise ring needs must land on a copy. Pins that the input and the
+    returned ring both still hold the caller's points, and that the faces tile the polygon.
+    """
+    ring_np = _star_ring_wp(64)[::-1].copy()
+    assert _signed_ring_area(ring_np) < 0.0  # the fixture really is clockwise
+    ring_wp = points_to_warp_uv(ring_np, device)
+    before_np = ring_wp.numpy().copy()
+    vertices_wp, faces_wp = tw.polyline.triangulate_polygon(ring_wp)
+    assert np.array_equal(ring_wp.numpy(), before_np)
+    assert np.array_equal(vertices_wp.numpy(), before_np)
+    assert int(faces_wp.shape[0]) // 3 == 62
+    assert np.isclose(_tiled_area(before_np, faces_wp.numpy()), -_signed_ring_area(ring_np))
+
+
+@pytest.mark.parametrize("n", [64, 1500])
+@pytest.mark.parametrize("clockwise", [False, True])
+def test_triangulate_polygon_single_block_matches_round_loop(
+    device: str, n: int, clockwise: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Triwarp against triwarp: the single-block ear loop against the captured round loop.
+
+    A ring up to ``EAR_ONE_BLOCK_MAX`` corners is clipped on CUDA by one block that runs every
+    round itself, a longer one by the four-launch round loop; the trimesh cover test carries the
+    oracle for the first at its sizes, and nothing else reaches the second below the cap. Forcing
+    the cap both ways must give the same triangle set (row order is atomic-append order on CUDA)
+    on a random star, which has ears at every scale. On the CPU device the single block is taken
+    at every length, so both arms are that path and the ``n - 2`` / area asserts carry the test.
+    """
+    rng = np.random.default_rng(n)
+    angle_np = np.sort(rng.uniform(0.0, 2.0 * np.pi, n))
+    radius_np = rng.uniform(0.2, 1.0, n)
+    ring_np = np.column_stack((radius_np * np.cos(angle_np), radius_np * np.sin(angle_np)))
+    if clockwise:
+        ring_np = ring_np[::-1].copy()
+    ring_wp = points_to_warp_uv(ring_np, device)
+    rows = {}
+    for cap in (0, 10**9):
+        monkeypatch.setattr(kernel_polyline, "EAR_ONE_BLOCK_MAX", cap)
+        _, faces_wp = tw.polyline.triangulate_polygon(ring_wp)
+        faces_np = faces_wp.numpy().reshape(-1, 3)
+        rows[cap] = faces_np[np.lexsort(faces_np.T[::-1])]
+    assert rows[0].shape == (n - 2, 3)
+    assert np.array_equal(rows[0], rows[10**9])
+    assert np.isclose(_tiled_area(ring_np, rows[0]), abs(_signed_ring_area(ring_np)), rtol=1e-5)
+
+
+def test_polyline_radius_closed_three_points_raises(device: str) -> None:
+    """A three-point closed loop has no plane, so the default normal rejects it."""
+    pts_np = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+    with pytest.raises(ValueError, match="polyline_normal requires at least three points"):
+        tw.polyline.polyline_radius(points_to_warp(pts_np, device))
+    # An explicit normal needs no plane fit, so the same input measures: the centroid is the
+    # segment's midpoint, which lies on it.
+    radius = tw.polyline.polyline_radius(
+        points_to_warp(pts_np, device), "max", normal=wp.vec3(0, 0, 1)
+    )
+    assert np.isclose(radius, 0.0, atol=1e-6)

@@ -829,11 +829,11 @@ Measured on `_build_implicit_system` with a `cotmatrix` operator, that is a resu
 magnitude off the correct one. **This is what the long-standing "`bsr_mm` is nondeterministic on
 CUDA" claim really was** — `bsr_mm` is sound; do not reintroduce that explanation.
 
-Two corollaries. A matrix built by *duplicate-free* triplets (`laplacian.laplacian`,
-`smoothing._edge_weight_matrix`) has `nnz == nnz_sync()`, which is why the default paths never showed
-this — so a probe on the default operator proves nothing, and the check belongs on a
-`cotmatrix`-shaped input. And where a triplet writer legitimately leaves slots unwritten (a
-conditional emit, as in `dirichlet_system_triplets` / `laplacian_ls_triplets`), `wp.zeros` rather
+Two corollaries. A matrix built by *duplicate-free* triplets (`laplacian.laplacian`) has
+`nnz == nnz_sync()`, which is why the default paths never showed this — so a probe on the default
+operator proves nothing, and the check belongs on a `cotmatrix`-shaped input. And where a triplet
+writer legitimately leaves slots unwritten (a conditional emit, as the region solves' writers were
+before §16.19 assembled them directly), `wp.zeros` rather
 than `triplet_buffers` is correct **for correctness** — but it is a **cost** defect: see §12.7, where
 unwritten `(0, 0, 0.0)` triplets measured **31.8x**.
 
@@ -6481,3 +6481,92 @@ work around the solves.
   launch hides behind. **Measure it at a fixed iteration count** (`threshold=-inf`): at
   `threshold=0.0` the plateau's last-bit jitter stopped the arms after 12-20 iterations at random and
   read as a 0.67x regression.
+
+### 16.19 Benchmark round 18 (2026-09-25)
+
+Items from `plans/benchmark-round-11.md` (round 18), each against a detached `192406c` worktree
+(`/tmp/tw18base`, §15.6), byte-identity on the CPU oracle unless stated. Clocks were taken on a box
+shared by four concurrent reviewers (min over alternating processes); probes are
+`plans/benchmark-round-18-data/probes/r18_*`.
+
+- **R18-1: independent diffusions stack into one settle solve** (`linalg.block_diag`, public,
+  cached per set of operators so the stack's state replays; `kernels/linalg.stack_block_diagonal`
+  reads each block's count off its own last offset, never `nnz`). `transport_tangent_vectors`
+  solves `[vector; heat; heat]`, `log_map` `[vector; heat]` (`heat._distance_from_heat` is the
+  Poisson half), one seed launch each. Hoisted operators: transport 1.6-1.9x, `log_map` 1.1-1.5x.
+  **A single CG over a block-diagonal stack is not two independent CGs**: `alpha` / `beta` span
+  every block (the `_BatchedCg` docstring's "CG on the block system"), so the iterates differ at a
+  given round and agree only once settled -- 1e-7 on the saddle and spheres, while on
+  `saddle_graded`, which never settles, `log_map`'s distance error against `igl.exact_geodesic`
+  moved 9.4 -> 9.7 % mean at the *same* 336 rounds. Stack only systems that settle together.
+- **R18-2: a fresh operator of a seen shape takes a pooled state** (`linalg._cached_solver(...,
+  pooled=True)`, `_BatchedCg.refresh`, `kernels/linalg.refresh_pooled_operator`). The pooled state
+  owns a copy of its operator; one launch copies the next operator in and re-derives the narrowed
+  values, the Jacobi diagonal and the Chebyshev ratios (refit on the device), so the recorded graph
+  replays. **Refreshed on every use**, not only when the operator changes: an owning state cannot
+  see in-place rewrites (`smooth_region_boundary`'s later passes rewrite their band values) and two
+  live operators of one shape may alternate. The first operator of a shape keeps an aliasing state,
+  so a hoisted operator pays no copy. Only immediate-use callers pool -- `_AdaptiveCg`
+  keeps its states across calls and must not. Fresh-operator calls: `heat_geodesic` 1.62x, transport
+  1.6-1.9x, `log_map` 1.3-1.6x, **zero `ScopedCapture`s per call** (was 2-3).
+  `test_pooled_solver_state_follows_each_operator` bites a no-op refresh and a skipped refit
+  (the refit is a rate, so only the step comparison sees it).
+- **R18-3: k = 1 nearest through a `wp.Mesh` of collapsed triangles** (public
+  `neighbors.mesh_from_points`): `query_nearest(k=1, backend="bvh")` without an accelerator, both
+  ICPs' cloud targets and the Chamfer/Hausdorff cloud searches. Distances byte-identical to the BVH
+  walk; `bvh_leaf_size=1` is 1.4-1.7x Warp's default for this mesh. **Load-bearing Warp detail:
+  `mesh.h`'s sliver cull `|n| / sum|e|^2 < 1e-6` reads NaN on a collapsed triangle, which compares
+  false, so it is tested rather than culled** -- `test_mesh_from_points_answers_the_nearest_point`
+  fails if a release changes that. `query_nearest_bvh_k1[dragon]` 2.22 -> 0.89 ms; Chamfer on the
+  shifted fixture 2.2-3.1x, but **a coincident dragon pair is 0.81-0.98x** (the tree build costs
+  more than the grid's walk).
+- **R18-6: point-to-plane ICP's pinned loop runs on the device** (`point_to_plane_round`, three
+  launches a round under `_device.run_device_loop`, recorded once per call; iteration 0 on the host
+  for the MAD scale). A cloud call 34 -> 10 launches, 12 -> 2 readbacks; 1.4-5.6x with R18-3. A call
+  that is weightless at its seed still records a loop of zero rounds: 0.81x, failure path only.
+  Point-to-point `icp`'s ten readbacks are the open lead.
+- **R18-4: `remove_degree3_vertices` without `vertex_one_rings`**. An interior degree-3 vertex is
+  three faces whose opposite edges close a directed 3-cycle, and the cycle *is* the replacement;
+  a telescoping `x - y` sum over the opposite edges is an exact "closed link" flag (0 for any
+  closed link, non-zero for one boundary fan, also mod 2^32). Selection and emit fuse, one readback
+  a pass: 1.43-2.15x. Pinched input is now accepted (never a candidate) rather than raising from the
+  ring build. `remove_unreferenced_vertices` in one mark, scan and compaction: 1.29-1.55x.
+  - **REFUTED -- a hash-only validate for `halfedge_twins`** (directed-edge uniqueness through
+    `hashed_occurrence_counts`): 1.26x on bunny, **0.59x on dragon** -- random atomics into a
+    2^23-slot table lose to the radix sort (`r18_twin_validate.txt`).
+  - Taken instead: `_pair_halfedges` and the two edge-manifold predicates write their keys with
+    `adjacency.face_edge_keys` rather than `faces_to_edges` + `hash_indices_rows` -- the fused
+    kernel existed and three callers did not use it. `halfedge_twins` 1.13-1.16x byte-identical;
+    `is_edge_manifold` / `edge_manifold_mask` 1.04-1.10x.
+- **R18-5: the region normal equations assemble directly** (`smoothing`, no `bsr_*` call left in
+  either region solve; `SquaredLaplacianPreconditioner.from_factors`). One incidence build per
+  region pair; the fixed-rim values and `M^T M` are written over region-own patterns. A
+  fixed-rim + smooth pair 38 -> 23 launches, 113 -> 57 allocations, 6 -> 3 readbacks;
+  `tangle_torus_small` pair 6.99 -> 4.54 ms, `holes_many` smooth 2.88x. Iteration counts unchanged
+  on all 14 captured systems. **`bsr_mm` sums most product entries along the row and the rest in
+  its triplet sort's order, which is not stable on CPU, so it is reproducible only to one rounding
+  per entry** -- 54 of 1 000 `M^T M` rows differ by one rounding, nothing else moves. A face
+  repeating a vertex no longer contributes a self-loop to the unit weights (0.019 on that input).
+  Declined: matrix-free `M^T M` in the one-block solve (ceiling under 0.3 ms).
+- **R18-7: `triangulate_polygon` clips the 2D ring directly**, one prologue readback, and **a
+  single-block ear loop** (`ear_clip_block`, 1 024 lanes, `block_sum` barriers) up to
+  `EAR_ONE_BLOCK_MAX = 1024` on CUDA and at every size on CPU: 3.4x at 64 corners, 1.66x at 1 024;
+  a loss past the cap (0.39x at 4 096). Removing its two step barriers **hangs** on CUDA. The
+  near-collinear ring's faces changed (the orientation test now reads input coordinates rather than
+  centred-and-rotated ones -- §12.4's sign-test hazard); both are valid, and the new one covers
+  exactly trimesh's region (20 000 / 20 000 samples, both devices), which
+  `test_triangulate_polygon_near_collinear` now asserts. No reference pins the diagonals.
+  `polyline_radius` one fused pass, 3 -> 1 readbacks, 2.47x. **A per-thread closure predicate beats
+  a `dim=1` flag launch on CUDA and loses at 20 000 points on CPU** (0.87x, accepted per §9).
+  - The one-block crossover (~1 024 items) is §16.17's CG crossover again: a graph recorded per call
+    is most of a small round loop, and one block of barriers undercuts it until the work outgrows
+    one SM.
+  - **Taken: a one-block RDP for `polyline_simplify`** (`rdp_simplify_block`, the four round
+    steps as shared `@wp.func`s the launch form also calls). Keep masks byte-identical on both
+    devices; CUDA 2.0-2.3x to 1 024 points, 1.28-1.30x at 4 096, 0.86-0.96x at 8 192, so
+    `RDP_ONE_BLOCK_MAX = 4096` -- past the ear loop's 1 024, since an RDP round is four streaming
+    passes rather than an O(ring) test per corner. CPU 1.5-5.4x at every size. Deleting one step
+    barrier fails `test_simplify_block_and_round_loop_match_reference` on the 1 500-point walk.
+  - The ear loop's init and clip writes became `init_ring_slot` / `clip_ear`, which drops check 13's
+    `init_ring` / `clip_selected` allowlist entries and `rdp_split_spans`' `span_lo` / `span_hi`
+    (§4.5: the extraction wins over the syntactic check).

@@ -8,6 +8,7 @@ from triwarp.kernels.array import (
     map_probe_single,
     pack_edge_key,
     pack_ranked_key,
+    scanned_count,
     update_argmin_pair,
 )
 from triwarp.kernels.halfedge import halfedge_destination, halfedge_next, next_boundary_halfedge
@@ -20,6 +21,38 @@ from triwarp.kernels.triangles import (
     triangle_quality,
     write_corner_triple,
 )
+
+
+@wp.kernel
+def mark_referenced(faces: wp.array[wp.int32], out_flags: wp.array[wp.int32]) -> None:
+    # A ``1`` flag at every vertex a face names, in the ``int32`` the scan below reads, so no mask
+    # has to be converted first. Out-of-range entries -- the ``-1`` sentinels ``repair`` preserves
+    # through a remap -- are dropped rather than written off the end (CLAUDE.md section 12.1).
+    # Every writer stores ``1``, so racing threads agree.
+    index = faces[wp.int32(wp.tid())]
+    if index >= 0 and index < out_flags.shape[0]:
+        out_flags[index] = 1
+
+
+@wp.kernel
+def compact_referenced(
+    vertices: wp.array[wp.vec3],
+    inclusive: wp.array[wp.int32],
+    out_remap: wp.array[wp.int32],
+    out_vertices: wp.array[wp.vec3],
+    out_inverse: wp.array[wp.int32],
+) -> None:
+    # The old-to-new map, the compacted positions and the new-to-old map from the in-place scan of
+    # the referenced flags, in one pass: ``flatnonzero``, the ``-1`` fill, the index scatter and the
+    # position gather ``remove_unreferenced_vertices`` otherwise runs one launch each.
+    v = wp.int32(wp.tid())
+    slot, referenced = scanned_count(inclusive, v)
+    if referenced == 0:
+        out_remap[v] = -1
+        return
+    out_remap[v] = slot
+    out_vertices[slot] = vertices[v]
+    out_inverse[slot] = v
 
 
 @wp.func
@@ -309,9 +342,10 @@ def corner_merge_links(
 
 @wp.func
 def is_interior_degree3(ring_start: wp.int32, ring_end: wp.int32, on_boundary: wp.bool) -> wp.bool:
-    # An interior vertex with exactly three incident faces. Its ring size *is* the face count, so a
-    # boundary vertex with three faces has four neighbours and is excluded by the flag rather than
-    # by the count.
+    # An interior vertex with exactly three incident faces, read off a one-ring CSR. Its ring size
+    # *is* the face count, so a boundary vertex with three faces has four neighbours and is excluded
+    # by the flag rather than by the count. ``interior_degree3_rim`` is the same test from the three
+    # faces alone.
     return not on_boundary and ring_end - ring_start == 3
 
 
@@ -327,9 +361,10 @@ def wins_degree3_conflict(
     # index wins, which makes the choice deterministic and independent of launch order -- the same
     # rule the Delaunay flip pass uses to resolve competing edges.
     #
-    # Shared by the two kernels below rather than written twice: ``remove_degree3_vertices`` wants
-    # the selection on its own, ``flatten_degree3_vertices`` wants it fused with the move it
-    # implies, and this is the rule both are deciding.
+    # The ring form of the rule ``emit_degree3_replacement`` decides from its three-face tables,
+    # for ``flatten_degree3_vertices``, whose ``rings=`` argument hands it a one-ring CSR. The two
+    # are one rule over two representations of the same fan: a candidate's neighbours are its ring
+    # destinations here and its rim there, the same three vertices.
     if not candidate[v]:
         return False
     for slot in range(ring_offsets[v], ring_offsets[v + 1]):
@@ -340,104 +375,145 @@ def wins_degree3_conflict(
 
 
 @wp.kernel
-def select_independent_degree3(
+def degree3_fan_tables(
     faces: wp.array[wp.int32],
-    ring_offsets: wp.array[wp.int32],
-    ring_halfedges: wp.array[wp.int32],
-    candidate: wp.array[wp.bool],
-    out_selected: wp.array[wp.bool],
-    out_count: wp.array[wp.int32],
+    out_counts: wp.array[wp.int32],
+    out_link_sums: wp.array[wp.int32],
+    out_fans: wp.array2d[wp.int32],
 ) -> None:
-    # ``out_count`` is the size of the selection, which the caller needs to size the replacement
-    # face buffer and to decide whether the pass did anything. Counting it here is one *conditional*
-    # atomic per selected vertex -- contention scales with the (rare) selections, not with the
-    # launch -- against the whole-array cast, reduction and readback the caller would otherwise run
-    # to recover a number this kernel already knows.
-    v = wp.int32(wp.tid())
-    if not wins_degree3_conflict(faces, ring_offsets, ring_halfedges, candidate, v):
-        return
-    out_selected[v] = True
-    wp.atomic_add(out_count, 0, 1)
+    # One pass over the halfedges gathers everything ``remove_degree3_vertices`` asks of a vertex,
+    # in place of a whole one-ring CSR: its corner count (its face count), its first three outgoing
+    # halfedges in arrival order, and a telescoping sum over its link.
+    #
+    # The link sum adds ``x - y`` for the edge ``x -> y`` opposite each outgoing halfedge. Around an
+    # interior vertex those edges form a closed cycle, so every link vertex is added once and
+    # subtracted once and the sum is exactly zero; around a boundary fan they form one chain from
+    # ``x_first`` to ``y_last``, two distinct vertices, so it is not -- modulo 2^32 too, because the
+    # telescoped value lies strictly inside ``(-2^31, 2^31)``. Zero is therefore a sound "may be
+    # interior" flag, which is all ``emit_degree3_replacement``'s next-pass signal needs from it.
+    #
+    # The table's row is arrival-ordered, so only its *contents* are meaningful;
+    # ``interior_degree3_rim`` canonicalizes it.
+    h = wp.int32(wp.tid())
+    v = faces[h]
+    x = halfedge_destination(faces, h)
+    y = halfedge_destination(faces, halfedge_next(h))
+    slot = wp.atomic_add(out_counts, v, 1)
+    if slot < 3:
+        out_fans[v, slot] = h
+    wp.atomic_add(out_link_sums, v, x - y)
 
 
 @wp.func
-def becomes_interior_degree3(
-    faces: wp.array[wp.int32],
-    ring_offsets: wp.array[wp.int32],
-    ring_halfedges: wp.array[wp.int32],
-    is_boundary: wp.array[wp.bool],
-    selected: wp.array[wp.bool],
-    r: wp.int32,
-) -> wp.bool:
-    # Whether rim vertex ``r`` is an interior degree-3 vertex once this pass's fans are replaced.
-    # Each selected neighbour takes two of ``r``'s faces and gives back one, so its face count falls
-    # by exactly the number of selected vertices in its ring (the fans are disjoint, so no face is
-    # counted twice). Its boundary flag cannot change: the rim edges keep two faces each and the
-    # spokes, which were interior, disappear. So this is ``is_interior_degree3`` evaluated on the
-    # next pass's rings, read off this pass's.
-    if is_boundary[r]:
-        return False
-    begin = ring_offsets[r]
-    end = ring_offsets[r + 1]
-    n_selected = wp.int32(0)
-    for slot in range(begin, end):
-        if selected[halfedge_destination(faces, ring_halfedges[slot])]:
-            n_selected += 1
-    return is_interior_degree3(begin + n_selected, end, False)
+def interior_degree3_rim(
+    faces: wp.array[wp.int32], counts: wp.array[wp.int32], fans: wp.array2d[wp.int32], v: wp.int32
+) -> wp.vec3i:
+    # The replacement triangle of ``v`` when it is an interior vertex with exactly three faces, and
+    # ``(-1, -1, -1)`` otherwise. Everything is local to the three faces: an interior degree-3
+    # vertex's three opposite edges form one directed 3-cycle ``a -> b -> c -> a``, and that cycle
+    # in order *is* the triangle over its rim, wound the way the fan was. A boundary fan's opposite
+    # edges form an open chain and fail the test, so no boundary flag is needed.
+    #
+    # The cycle starts at the lowest-indexed of the three halfedges, which is where
+    # ``vertex_one_rings`` starts an interior ring -- so ``(a, b, c)`` is the ring's destinations
+    # in ring order, and the replacement is the one the ring walk wrote.
+    none = wp.vec3i(-1, -1, -1)
+    if counts[v] != 3:
+        return none
+    h0 = wp.min(wp.min(fans[v, 0], fans[v, 1]), fans[v, 2])
+    a = halfedge_destination(faces, h0)
+    b = halfedge_destination(faces, halfedge_next(h0))
+    c = wp.int32(-1)
+    for k in range(3):
+        h = fans[v, k]
+        if halfedge_destination(faces, h) == b:
+            c = halfedge_destination(faces, halfedge_next(h))
+    if a == v or b == v or c == v or c == a or c == b or a == b:
+        return none
+    # Each of the three cycle edges must be matched by exactly one halfedge's opposite edge.
+    matched = wp.int32(0)
+    for k in range(3):
+        h = fans[v, k]
+        x = halfedge_destination(faces, h)
+        y = halfedge_destination(faces, halfedge_next(h))
+        if x == a and y == b:
+            matched |= 1
+        elif x == b and y == c:
+            matched |= 2
+        elif x == c and y == a:
+            matched |= 4
+    if matched != 7:
+        return none
+    return wp.vec3i(a, b, c)
 
 
 @wp.kernel
 def emit_degree3_replacement(
     faces: wp.array[wp.int32],
-    ring_offsets: wp.array[wp.int32],
-    ring_halfedges: wp.array[wp.int32],
-    is_boundary: wp.array[wp.bool],
-    selected: wp.array[wp.bool],
+    fans: wp.array2d[wp.int32],
+    counts: wp.array[wp.int32],
+    link_sums: wp.array[wp.int32],
     cursor: wp.array[wp.int32],
-    out_keep: wp.array[wp.bool],
+    out_lost: wp.array[wp.int32],
+    out_kept: wp.array[wp.int32],
     out_new_faces: wp.array2d[wp.int32],
     out_next_candidates: wp.array[wp.int32],
 ) -> None:
-    # The three faces around a selected vertex become one: its link is a triangle already, since the
-    # ring is counter-clockwise and has exactly three entries. Winding follows the ring, so the
-    # replacement points the same way the fan did.
+    # Selection and replacement in one pass. Two adjacent candidates share faces, so only one of
+    # them can be removed in a pass: the lowest index wins, which makes the choice deterministic and
+    # independent of launch order -- the same rule the Delaunay flip pass uses to resolve competing
+    # edges. Nothing here needs another thread's *selection*, only its candidacy, which is
+    # recomputed from the read-only tables, so no selection mask is written or read back.
     #
-    # ``out_keep`` arrives all ``True`` and each fan face is cleared here, so it is the kept-face
-    # mask itself rather than a dropped-face mask the caller would have to negate in a second pass.
+    # ``cursor`` hands out the replacement row and, read after the launch, is the selection size.
     #
-    # ``out_next_candidates`` counts the rim vertices this pass turns into candidates. Only a rim
-    # vertex's face count changes, so it is zero exactly when the next pass would find nothing, and
-    # the caller skips that pass instead of rebuilding the rings to learn it. A rim vertex shared by
-    # several fans is counted once per fan; only zero versus non-zero is read.
+    # ``out_kept`` arrives all ``1`` and each fan face is cleared here, so it is the kept-face flag
+    # the caller scans in place into its ranks, with no mask to convert first.
+    #
+    # ``out_next_candidates`` counts the rim vertices this pass may turn into candidates. Each
+    # selected fan takes two of a rim vertex's faces and gives back one, so a rim vertex's count
+    # falls by one per selected fan; a candidate needs it to land on exactly 3 with a closed link.
+    # ``out_lost`` tallies the decrements, and the decrement that lands on 3 counts it -- a later
+    # one taking it lower is not seen, so the signal is conservative (at worst one extra detection
+    # pass that finds nothing) but never misses a candidate. Only zero versus non-zero is read.
     v = wp.int32(wp.tid())
-    if not selected[v]:
+    rim = interior_degree3_rim(faces, counts, fans, v)
+    if rim[0] < 0:
         return
-    begin = ring_offsets[v]
+    for k in range(3):
+        neighbour = rim[k]
+        if neighbour < v and interior_degree3_rim(faces, counts, fans, neighbour)[0] >= 0:
+            return
     slot = wp.atomic_add(cursor, 0, 1)
     for k in range(3):
-        rim = halfedge_destination(faces, ring_halfedges[begin + k])
-        out_keep[ring_halfedges[begin + k] // 3] = False
-        out_new_faces[slot, k] = rim
-        if becomes_interior_degree3(
-            faces, ring_offsets, ring_halfedges, is_boundary, selected, rim
-        ):
+        r = rim[k]
+        out_kept[fans[v, k] // 3] = 0
+        out_new_faces[slot, k] = r
+        lost = wp.atomic_add(out_lost, r, 1)
+        if link_sums[r] == 0 and counts[r] - lost == 4:
             wp.atomic_add(out_next_candidates, 0, 1)
 
 
 @wp.kernel
 def compact_kept_faces(
     faces: wp.array[wp.int32],
-    keep: wp.array[wp.bool],
     inclusive_ranks: wp.array[wp.int32],
+    new_faces: wp.array2d[wp.int32],
+    n_kept: wp.int32,
+    n_new: wp.int32,
     out_faces: wp.array[wp.int32],
 ) -> None:
     # Face ``f`` of the kept set to row ``inclusive_ranks[f] - 1`` of ``out_faces``, keeping their
-    # order -- ``flatnonzero`` plus a row gather in one pass, with the row count the caller already
-    # knows instead of one read back from the scan's tail.
+    # order, and replacement row ``f`` after them -- ``flatnonzero``, a row gather and the tail copy
+    # in one pass, with the row counts the caller already knows. ``inclusive_ranks`` is the in-place
+    # scan of 0/1 kept flags, so a face is kept exactly where its rank steps up.
     f = wp.int32(wp.tid())
-    if not keep[f]:
+    if f < n_new:
+        for k in range(3):
+            out_faces[3 * (n_kept + f) + k] = new_faces[f, k]
+    row, kept = scanned_count(inclusive_ranks, f)
+    if kept == 0:
         return
-    row = inclusive_ranks[f] - 1
     for k in range(3):
         out_faces[3 * row + k] = faces[3 * f + k]
 

@@ -3245,6 +3245,57 @@ def test_remove_degree3_vertices_is_idempotent_and_area_preserving(device: str) 
         tw.repair.remove_degree3_vertices(vertices_wp, faces_wp, max_iter=-1)
 
 
+def test_remove_degree3_vertices_reads_only_closed_fans(device: str) -> None:
+    """
+    Not a library comparison: the candidate test on the inputs where a face count of three lies.
+
+    A candidate is found from its three faces alone -- their opposite edges must close into one
+    directed 3-cycle -- so the cases that test has to reject are the ones where a vertex has three
+    faces and is *not* an interior valence-3 vertex: a boundary fan of three (four neighbours, an
+    open chain of opposite edges), and a pinched vertex joining two closed icosahedra, which is
+    accepted as input and must remove nothing. The tetrahedron is the other side: every vertex is a
+    candidate and each is adjacent to the rest, so the lowest index wins alone and its fan becomes
+    the face opposite it with the winding reversed -- a two-face closed pillow over the other three
+    vertices. And a mesh with an edge on three faces raises, from the input validation.
+    """
+    fan_vertices_np = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [-1, 0, 0], [0, -1, 0]], float)
+    fan_faces_np = np.array([[0, 1, 2], [0, 2, 3], [0, 3, 4]])
+    vertices_wp, faces_wp = numpy_to_warp(fan_vertices_np, fan_faces_np.ravel(), device)
+    assert tw.repair.remove_degree3_vertices(vertices_wp, faces_wp, return_count=True)[2] == 0
+
+    icosahedron_tm = tm.creation.icosahedron()
+    offset = len(icosahedron_tm.vertices)
+    mirrored_np = 2.0 * icosahedron_tm.vertices[0] - icosahedron_tm.vertices
+    second_np = icosahedron_tm.faces + offset
+    second_np[second_np == offset] = 0  # share vertex 0: a pinch
+    vertices_wp, faces_wp = numpy_to_warp(
+        np.concatenate([icosahedron_tm.vertices, mirrored_np]),
+        np.concatenate([icosahedron_tm.faces, second_np]).ravel(),
+        device,
+    )
+    out_vertices_wp, out_faces_wp, removed = tw.repair.remove_degree3_vertices(
+        vertices_wp, faces_wp, return_count=True
+    )
+    assert removed == 0
+    assert int(out_faces_wp.shape[0]) == 2 * 3 * len(icosahedron_tm.faces)
+    assert out_vertices_wp is vertices_wp  # nothing removed: the input buffers come back
+
+    tetrahedron_np = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], float)
+    tetrahedron_faces_np = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]])
+    vertices_wp, faces_wp = numpy_to_warp(tetrahedron_np, tetrahedron_faces_np.ravel(), device)
+    out_vertices_wp, out_faces_wp, removed = tw.repair.remove_degree3_vertices(
+        vertices_wp, faces_wp, return_count=True
+    )
+    assert removed == 1
+    assert np.allclose(out_vertices_wp.numpy(), tetrahedron_np[1:], rtol=1e-5, atol=1e-5)
+    assert np.array_equal(out_faces_wp.numpy(), [0, 1, 2, 1, 0, 2])
+
+    fin_faces_np = np.array([[0, 1, 2], [0, 1, 3], [0, 1, 4]])
+    vertices_wp, faces_wp = numpy_to_warp(fan_vertices_np, fin_faces_np.ravel(), device)
+    with pytest.raises(ValueError, match="edge-manifold"):
+        tw.repair.remove_degree3_vertices(vertices_wp, faces_wp)
+
+
 def _nested_face_splits(
     mesh_tm: tm.Trimesh, face_indices: list[int], depth: int
 ) -> tuple[np.ndarray, np.ndarray]:

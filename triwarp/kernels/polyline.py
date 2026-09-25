@@ -7,6 +7,7 @@ from triwarp.kernels.array import (
     cross2,
     declare_map_signatures,
     is_close_vec3,
+    lift_vec2,
     lowbias32,
     map_probe,
     map_probe_single,
@@ -59,12 +60,24 @@ def segment_midpoint_and_length(start: wp.vec3, end: wp.vec3) -> tuple[wp.vec3, 
     return wp.lerp(start, end, 0.5), wp.length(end - start)
 
 
+@wp.func
+def ring_closing_flag(
+    first: wp.vec3, last: wp.vec3, rtol: wp.float32, atol: wp.float32
+) -> wp.int32:
+    # ``polyline.is_closed``'s predicate (``endpoints_coincide``'s, below), on the device: ``1``
+    # when the last point repeats the first within ``allclose``'s tolerance. Every thread of a
+    # kernel that needs the closure evaluates it on the same two points, so all of them agree, and
+    # the decision costs neither a launch of its own nor a readback.
+    return wp.where(is_close_vec3(first, last, rtol, atol), wp.int32(1), wp.int32(0))
+
+
 @wp.kernel
 def accumulate_newell_normal(
-    polyline: wp.array[wp.vec3], is_loop: wp.array[wp.int32], out_normal: wp.array[wp.vec3]
+    polyline: wp.array[wp.vec3], rtol: wp.float32, atol: wp.float32, out_normal: wp.array[wp.vec3]
 ) -> None:
-    # Newell's method sums cross(V_i, V_{i + 1}) over the edges of a loop. ``is_loop`` is
-    # ``endpoints_coincide``'s flag for this same buffer: a polyline whose last vertex duplicates
+    # Newell's method sums cross(V_i, V_{i + 1}) over the edges of a loop. Every thread evaluates
+    # ``ring_closing_flag`` -- ``is_closed``'s predicate -- on the same two points, so the closure
+    # costs neither a readback nor a launch of its own: a polyline whose last vertex duplicates
     # its first already carries the wrap-around edge as pair ``n - 2`` and sums ``n - 1`` pairs,
     # while an open one gets the closing edge by wrapping the index, as pair ``n - 1``. Reading the
     # flag here rather than on the host is what lets ``polyline_normal`` skip both the closure
@@ -84,7 +97,7 @@ def accumulate_newell_normal(
     # ``reduce.ITEMS_PER_BLOCK_1D``, read by ``blocks_1d`` at the launch and by ``tile_chunk`` here.
     chunk, lane = wp.tid()
     n = polyline.shape[0]
-    n_pairs = n - is_loop[0]
+    n_pairs = n - ring_closing_flag(polyline[0], polyline[n - 1], rtol, atol)
     offset, count = block_chunk_1d(n_pairs, chunk)
     if count <= 0:
         return
@@ -101,15 +114,17 @@ def accumulate_newell_normal(
 def vertex_turning_angles(
     polyline: wp.array[wp.vec3],
     wrap_open: wp.int32,
-    is_loop: wp.array[wp.int32],
+    rtol: wp.float32,
+    atol: wp.float32,
     out_angles: wp.array[wp.float32],
 ) -> None:
     # One angle per vertex, written in its final slot: the angle between the segment arriving at
     # vertex ``j`` and the one leaving it, with segment ``k`` running from ``polyline[k]`` to
     # ``polyline[(k + 1) % n]``.
     #
-    # ``is_loop`` is ``endpoints_coincide``'s flag for this buffer, read on the device so no
-    # closure readback sits between the flag and this launch. A loop has ``n - 1`` segments and its
+    # Whether the ends coincide is ``ring_closing_flag`` -- ``is_closed``'s predicate -- evaluated
+    # by every thread on the same two points, so neither a closure readback nor a launch of its own
+    # sits in front of this one. A loop has ``n - 1`` segments and its
     # two ends are one vertex, so both take the angle between the last segment and the first; an
     # open polyline's ends have no angle and get 0. ``wrap_open`` is the caller's ``closed=True``
     # on a polyline whose ends do *not* coincide: the closing segment is reached by wrapping the
@@ -117,7 +132,7 @@ def vertex_turning_angles(
     # same kernel would compute over a ``polyline_close`` copy, without making the copy.
     j = wp.int32(wp.tid())
     n = polyline.shape[0]
-    loop = is_loop[0] != 0
+    loop = ring_closing_flag(polyline[0], polyline[n - 1], rtol, atol) != 0
     n_segments = n - 1
     if wrap_open != 0 and not loop:
         n_segments = n
@@ -436,9 +451,13 @@ def rdp_chord_squared_distance(
     return line_squared_distance(polyline[i], start, end, seg_sq_len)
 
 
-@wp.kernel
-def rdp_seed_spans(
-    out_span_lo: wp.array[wp.int32], out_span_hi: wp.array[wp.int32], out_keep: wp.array[wp.bool]
+@wp.func
+def rdp_seed_point(
+    span_lo: wp.array[wp.int32],
+    span_hi: wp.array[wp.int32],
+    keep: wp.array[wp.bool],
+    i: wp.int32,
+    n: wp.int32,
 ) -> None:
     # Ramer-Douglas-Peucker, level-synchronous: one round per level of the recursion tree instead
     # of one thread walking the whole tree. Round 0 puts every interior point in the single span
@@ -447,16 +466,43 @@ def rdp_seed_spans(
     # A span is identified by its **left endpoint**, and that is the whole reason there is no span
     # list to build or compact: the open spans at any level partition the polyline, so their left
     # endpoints are distinct and index a plain ``(n,)`` accumulator directly.
-    i = wp.int32(wp.tid())
-    n = out_span_lo.shape[0]
+    #
+    # Each per-point step of a round is one ``@wp.func`` here, shared by the four-launch round
+    # (``rdp_seed_spans`` ... ``rdp_split_spans``) and the one-block loop (``rdp_simplify_block``).
     if i == 0 or i == n - 1:
-        out_span_lo[i] = RDP_SETTLED
-        out_span_hi[i] = RDP_SETTLED
-        out_keep[i] = True
+        span_lo[i] = RDP_SETTLED
+        span_hi[i] = RDP_SETTLED
+        keep[i] = True
     else:
-        out_span_lo[i] = 0
-        out_span_hi[i] = n - 1
-        out_keep[i] = False
+        span_lo[i] = 0
+        span_hi[i] = n - 1
+        keep[i] = False
+
+
+@wp.kernel
+def rdp_seed_spans(
+    out_span_lo: wp.array[wp.int32],
+    out_span_hi: wp.array[wp.int32],
+    out_keep: wp.array[wp.bool],
+    out_state: wp.array[wp.int32],
+) -> None:
+    # Round 0 (``rdp_seed_point``). Thread 0 also seeds the round loop's ``state`` -- ``[levels
+    # run, loop condition]`` -- so the loop needs no host upload of its own.
+    i = wp.int32(wp.tid())
+    if i == 0:
+        out_state[LOOP_ROUND] = wp.int32(0)
+        out_state[LOOP_CONDITION] = wp.int32(1)
+    rdp_seed_point(out_span_lo, out_span_hi, out_keep, i, out_span_lo.shape[0])
+
+
+@wp.func
+def rdp_arm_span(
+    span_max: wp.array[wp.float32], span_argmax: wp.array[wp.int32], i: wp.int32
+) -> None:
+    # Arm span slot ``i``'s accumulators: no maximum yet, and an argmax past every valid index, so
+    # ``atomic_min`` always wins.
+    span_max[i] = -1.0
+    span_argmax[i] = span_max.shape[0]
 
 
 @wp.kernel
@@ -477,8 +523,26 @@ def rdp_begin_round(
     if i == 0:
         state[LOOP_ROUND] = state[LOOP_ROUND] + 1
         state[LOOP_CONDITION] = 0
-    out_span_max[i] = -1.0
-    out_span_argmax[i] = out_span_max.shape[0]  # past every valid index, so atomic_min always wins
+    rdp_arm_span(out_span_max, out_span_argmax, i)
+
+
+@wp.func
+def rdp_measure_point(
+    polyline: wp.array[wp.vec3],
+    span_lo: wp.array[wp.int32],
+    span_hi: wp.array[wp.int32],
+    squared_distances: wp.array[wp.float32],
+    span_max: wp.array[wp.float32],
+    i: wp.int32,
+) -> None:
+    # Every unsettled point measures itself against its span's chord and max-reduces into the
+    # span's slot. One thread per *point* rather than per span, so a round costs the same whatever
+    # shape the level has -- which is what makes the depth, and not the span sizes, the cost model.
+    lo = span_lo[i]
+    if lo >= 0:
+        squared_distance = rdp_chord_squared_distance(polyline, i, lo, span_hi[i])
+        squared_distances[i] = squared_distance
+        wp.atomic_max(span_max, lo, squared_distance)
 
 
 @wp.kernel
@@ -489,16 +553,30 @@ def rdp_span_max(
     out_squared_distances: wp.array[wp.float32],
     out_span_max: wp.array[wp.float32],
 ) -> None:
-    # Round, pass 2 of 4: every unsettled point measures itself against its span's chord and
-    # max-reduces into the span's slot. One thread per *point* rather than per span, so a round
-    # costs the same whatever shape the level has -- which is what makes the depth, and not the
-    # span sizes, the cost model.
+    # Round, pass 2 of 4 (``rdp_measure_point``).
     i = wp.int32(wp.tid())
+    rdp_measure_point(polyline, span_lo, span_hi, out_squared_distances, out_span_max, i)
+
+
+@wp.func
+def rdp_claim_argmax(
+    span_lo: wp.array[wp.int32],
+    squared_distances: wp.array[wp.float32],
+    span_max: wp.array[wp.float32],
+    span_argmax: wp.array[wp.int32],
+    i: wp.int32,
+) -> None:
+    # Recover *which* point won. Reducing the index with ``atomic_min`` over every point holding
+    # the span's maximum keeps the lowest such index, which is exactly what the strict '>' argmax
+    # of the recursive form kept (Eigen maxCoeff, and libigl's tie convention).
+    #
+    # A packed ``(bits, ~index)`` int64 key would fold this into the measuring step --
+    # ``wp.atomic_max`` on ``wp.int64`` works on both devices -- and is not used, because the float
+    # comparison here is against a value this same expression produced, so it is exact without
+    # reinterpreting bits.
     lo = span_lo[i]
-    if lo >= 0:
-        squared_distance = rdp_chord_squared_distance(polyline, i, lo, span_hi[i])
-        out_squared_distances[i] = squared_distance
-        wp.atomic_max(out_span_max, lo, squared_distance)
+    if lo >= 0 and squared_distances[i] >= span_max[lo]:
+        wp.atomic_min(span_argmax, lo, i)
 
 
 @wp.kernel
@@ -508,17 +586,57 @@ def rdp_span_argmax(
     span_max: wp.array[wp.float32],
     out_span_argmax: wp.array[wp.int32],
 ) -> None:
-    # Round, pass 3 of 4: recover *which* point won. Reducing the index with ``atomic_min`` over
-    # every point holding the span's maximum keeps the lowest such index, which is exactly what the
-    # strict '>' argmax of the recursive form kept (Eigen maxCoeff, and libigl's tie convention).
-    #
-    # A packed ``(bits, ~index)`` int64 key would fold this into pass 2 -- ``wp.atomic_max`` on
-    # ``wp.int64`` works on both devices -- and is not used, because the float comparison here is
-    # against a value this same expression produced, so it is exact without reinterpreting bits.
+    # Round, pass 3 of 4 (``rdp_claim_argmax``).
     i = wp.int32(wp.tid())
+    rdp_claim_argmax(span_lo, squared_distances, span_max, out_span_argmax, i)
+
+
+@wp.func
+def rdp_split_point(
+    squared_tolerance: wp.float32,
+    span_max: wp.array[wp.float32],
+    span_argmax: wp.array[wp.int32],
+    span_lo: wp.array[wp.int32],
+    span_hi: wp.array[wp.int32],
+    keep: wp.array[wp.bool],
+    i: wp.int32,
+) -> wp.int32:
+    # Split or settle point ``i``, returning ``1`` when it survives into the next level.
+    # ``span_lo`` / ``span_hi`` are the point's span and are rewritten in place to its child span.
+    #
+    # The keep set is identical to the recursive form's by construction: there, everything starts
+    # kept and a span within tolerance drops its interior; here, nothing starts kept and every
+    # split point is kept. Both leave exactly the endpoints and the split points, because the
+    # terminal spans partition the polyline. The loop terminates because a child span is strictly
+    # narrower than its parent and a span two wide holds a single point, which settles either way.
     lo = span_lo[i]
-    if lo >= 0 and squared_distances[i] >= span_max[lo]:
-        wp.atomic_min(out_span_argmax, lo, i)
+    if lo < 0:
+        return wp.int32(0)
+    hi = span_hi[i]
+    split = span_argmax[lo]
+    # ``split <= lo or split >= hi`` catches an unresolved argmax -- ``split`` still at the sentinel
+    # ``rdp_arm_span`` armed -- and settling the span turns what would be a read past the end of
+    # the polyline on the next round into a dropped interior.
+    #
+    # It is **defensive and measured to be unreachable**, which is worth saying because the obvious
+    # reason to expect otherwise is wrong: a non-finite coordinate does *not* produce it, because
+    # ``wp.atomic_max`` does not propagate ``NaN`` (verified on both devices). So either some point
+    # wrote a real maximum, and that same point then satisfies the ``>=`` in ``rdp_claim_argmax``
+    # and resolves the index; or every interior distance was ``NaN``, the accumulator keeps the
+    # ``-1.0`` it was armed with, and the tolerance test above settles the span first. Every
+    # non-finite shape probed gives byte-identical answers with the two comparisons deleted.
+    if span_max[lo] <= squared_tolerance or split <= lo or split >= hi:
+        span_lo[i] = RDP_SETTLED  # the whole span is within tolerance, so its interior drops
+        return wp.int32(0)
+    if i == split:
+        keep[i] = True
+        span_lo[i] = RDP_SETTLED
+        return wp.int32(0)
+    if i < split:
+        span_hi[i] = split  # ``lo < i < split``, so the child span is never degenerate
+    else:
+        span_lo[i] = split
+    return wp.int32(1)
 
 
 @wp.kernel
@@ -531,46 +649,75 @@ def rdp_split_spans(
     state: wp.array[wp.int32],
     out_keep: wp.array[wp.bool],
 ) -> None:
-    # Round, pass 4 of 4: split or settle. ``span_lo`` / ``span_hi`` are the point's span and are
-    # rewritten in place to its child span, so they are neither an input nor the answer; ``state``
-    # is the round loop's own condition, raised whenever a point survives into the next level.
-    #
-    # The keep set is identical to the recursive form's by construction: there, everything starts
-    # kept and a span within tolerance drops its interior; here, nothing starts kept and every
-    # split point is kept. Both leave exactly the endpoints and the split points, because the
-    # terminal spans partition the polyline. The loop terminates because a child span is strictly
-    # narrower than its parent and a span two wide holds a single point, which settles either way.
+    # Round, pass 4 of 4 (``rdp_split_point``). ``span_lo`` / ``span_hi`` are neither an input nor
+    # the answer; ``state`` is the round loop's own condition, raised whenever a point survives
+    # into the next level.
     i = wp.int32(wp.tid())
-    lo = span_lo[i]
-    if lo < 0:
-        return
-    hi = span_hi[i]
-    split = span_argmax[lo]
-    # ``split <= lo or split >= hi`` catches an unresolved argmax -- ``split`` still at the sentinel
-    # ``rdp_begin_round`` armed -- and settling the span turns what would be a read past the end of
-    # the polyline on the next round into a dropped interior.
-    #
-    # It is **defensive and measured to be unreachable**, which is worth saying because the obvious
-    # reason to expect otherwise is wrong: a non-finite coordinate does *not* produce it, because
-    # ``wp.atomic_max`` does not propagate ``NaN`` (verified on both devices). So either some point
-    # wrote a real maximum, and that same point then satisfies the ``>=`` in ``rdp_span_argmax``
-    # and resolves the index; or every interior distance was ``NaN``, the accumulator keeps the
-    # ``-1.0`` it was armed with, and the tolerance test above settles the span first. Every
-    # non-finite shape probed gives byte-identical answers with the two comparisons deleted.
-    if span_max[lo] <= squared_tolerance or split <= lo or split >= hi:
-        span_lo[i] = RDP_SETTLED  # the whole span is within tolerance, so its interior drops
-        return
-    if i == split:
-        out_keep[i] = True
-        span_lo[i] = RDP_SETTLED
-        return
-    if i < split:
-        span_hi[i] = split  # ``lo < i < split``, so the child span is never degenerate
-    else:
-        span_lo[i] = split
-    # A plain store, not an atomic: one address, one value, nothing to serialize (the rule is
-    # on ``array.LOOP_CONDITION``, which also says why the array must be zero-initialized).
-    state[LOOP_CONDITION] = 1
+    if rdp_split_point(squared_tolerance, span_max, span_argmax, span_lo, span_hi, out_keep, i):
+        # A plain store, not an atomic: one address, one value, nothing to serialize (the rule is
+        # on ``array.LOOP_CONDITION``, which also says why the array must be zero-initialized).
+        state[LOOP_CONDITION] = 1
+
+
+# Polylines up to this many points are simplified by ``rdp_simplify_block`` -- the whole round loop
+# as one block -- rather than by the captured four-launch round, on CUDA; the CPU device takes the
+# block form at every size, where a launch grid is a serial loop anyway (1.5-5.4x from 64 to 8 192
+# points, keep masks byte-identical). Measured on CUDA over a spiral and a random walk: 2.0-2.3x to
+# 1 024 points, 1.6-1.7x at 2 048, 1.28-1.30x at 4 096, and 0.86-0.96x at 8 192, where each lane
+# walks eight points a step and the device-wide form wins again. Past ``ear_clip_block``'s 1 024
+# because a round here is four streaming passes, not an O(ring) ear test per corner.
+RDP_ONE_BLOCK_MAX = 4096
+RDP_BLOCK_DIM = 1024
+
+
+@wp.kernel(enable_backward=False)
+def rdp_simplify_block(
+    polyline: wp.array[wp.vec3],
+    squared_tolerance: wp.float32,
+    out_span_lo: wp.array[wp.int32],
+    out_span_hi: wp.array[wp.int32],
+    out_span_max: wp.array[wp.float32],
+    out_span_argmax: wp.array[wp.int32],
+    out_squared_distances: wp.array[wp.float32],
+    out_keep: wp.array[wp.bool],
+) -> None:
+    # ``rdp_seed_spans`` plus every round of ``rdp_begin_round`` -> ``rdp_span_max`` ->
+    # ``rdp_span_argmax`` -> ``rdp_split_spans``, as one block whose lanes stride the polyline by
+    # ``wp.block_dim()`` -- the same per-point steps, so on the CPU device, where a block is one
+    # lane, it is the same serial walk the launches make and the keep mask is byte-identical. The
+    # block barriers are ``block_sum`` calls (Warp exposes no other): one after each step, the
+    # last of which also counts the survivors, so the loop condition is block-uniform. What it
+    # removes is the conditional graph the launch form records on every call, which at a thousand
+    # points is most of the call; ``ear_clip_block`` is the same trade.
+    _block, lane = wp.tid()
+    n = polyline.shape[0]
+    for i in range(lane, n, wp.block_dim()):
+        rdp_seed_point(out_span_lo, out_span_hi, out_keep, i, n)
+    open_points = block_sum(wp.int32(1))
+    while open_points > 0:
+        for i in range(lane, n, wp.block_dim()):
+            rdp_arm_span(out_span_max, out_span_argmax, i)
+        block_sum(wp.int32(0))
+        for i in range(lane, n, wp.block_dim()):
+            rdp_measure_point(
+                polyline, out_span_lo, out_span_hi, out_squared_distances, out_span_max, i
+            )
+        block_sum(wp.int32(0))
+        for i in range(lane, n, wp.block_dim()):
+            rdp_claim_argmax(out_span_lo, out_squared_distances, out_span_max, out_span_argmax, i)
+        block_sum(wp.int32(0))
+        survivors = wp.int32(0)
+        for i in range(lane, n, wp.block_dim()):
+            survivors += rdp_split_point(
+                squared_tolerance,
+                out_span_max,
+                out_span_argmax,
+                out_span_lo,
+                out_span_hi,
+                out_keep,
+                i,
+            )
+        open_points = block_sum(survivors)
 
 
 @wp.kernel
@@ -621,6 +768,84 @@ def radius_segment_distances(
     a = project_point_to_plane(start, center, unit_normal)
     b = project_point_to_plane(end, center, unit_normal)
     return wp.length(closest_point_on_segment(a, b, center) - center)
+
+
+# Slot layout of ``accumulate_radius_frame``'s buffer: ``polyline_weighted_midpoint_sums``' four
+# sums, then ``accumulate_newell_normal``'s vector.
+RADIUS_FRAME_LENGTH = wp.constant(wp.int32(3))
+RADIUS_FRAME_NORMAL = wp.constant(wp.int32(4))
+RADIUS_FRAME_SIZE = 7
+
+
+@wp.kernel
+def accumulate_radius_frame(
+    polyline: wp.array[wp.vec3], rtol: wp.float32, atol: wp.float32, out_frame: wp.array[wp.float32]
+) -> None:
+    # ``polyline_radius``'s default plane in one pass: the length-weighted midpoint sums
+    # ``polyline_centroid`` takes over the ``n - 1`` open segments, and Newell's sum
+    # ``polyline_normal`` takes over the loop -- ``n - 1`` pairs when the last point repeats the
+    # first (``ring_closing_flag``, decided here rather than by a launch of its own), ``n`` with the
+    # index wrapped otherwise. The two ranges share their chunks and their lane stride, so each
+    # lane accumulates every term in the order the two separate kernels did, and one
+    # ``block_sum`` over the packed seven is componentwise the two block sums: the sums are the
+    # ones those kernels produce, bit for bit. Neither result crosses to the host.
+    chunk, lane = wp.tid()
+    n = polyline.shape[0]
+    n_segments = n - 1
+    n_pairs = n - ring_closing_flag(polyline[0], polyline[n - 1], rtol, atol)
+    offset, count = block_chunk_1d(wp.max(n_segments, n_pairs), chunk)
+    if count <= 0:
+        return
+    weighted = wp.vec3(0.0, 0.0, 0.0)
+    total = wp.float32(0.0)
+    normal = wp.vec3(0.0, 0.0, 0.0)
+    for k in range(lane, count, wp.block_dim()):
+        i = offset + k
+        start = polyline[i]
+        if i < n_segments:
+            midpoint, length = segment_midpoint_and_length(start, polyline[i + 1])
+            weighted += midpoint * length
+            total += length
+        if i < n_pairs:
+            normal += wp.cross(start, polyline[wrap_index(i + 1, n)])
+    commit_block_sum(
+        lane,
+        wp.vector(weighted[0], weighted[1], weighted[2], total, normal[0], normal[1], normal[2]),
+        out_frame,
+        0,
+    )
+
+
+@wp.kernel
+def radius_distances(
+    polyline: wp.array[wp.vec3],
+    frame: wp.array[wp.float32],
+    center: wp.vec3,
+    normal: wp.vec3,
+    frame_center: wp.int32,
+    frame_normal: wp.int32,
+    out_distances: wp.array[wp.float32],
+) -> None:
+    # dim == n - 1. ``radius_segment_distances`` per segment, with the centre and the normal each
+    # taken either from the caller or, where it left them to default, from
+    # ``accumulate_radius_frame``'s sums: the centroid is the sums' quotient and the normal the
+    # normalized Newell vector, the values ``polyline_centroid`` / ``polyline_normal`` return.
+    i = wp.int32(wp.tid())
+    plane_center = center
+    if frame_center != 0:
+        plane_center = wp.vec3(frame[0], frame[1], frame[2]) / frame[RADIUS_FRAME_LENGTH]
+    plane_normal = normal
+    if frame_normal != 0:
+        plane_normal = wp.normalize(
+            wp.vec3(
+                frame[RADIUS_FRAME_NORMAL],
+                frame[RADIUS_FRAME_NORMAL + 1],
+                frame[RADIUS_FRAME_NORMAL + 2],
+            )
+        )
+    out_distances[i] = radius_segment_distances(
+        polyline[i], polyline[i + 1], plane_center, plane_normal
+    )
 
 
 # --- polygon triangulation (parallel ear clipping); port of libigl ear_clipping.cpp ---
@@ -685,28 +910,42 @@ def project_to_plane_2d(point: wp.vec3, center: wp.vec3, u: wp.vec3, v: wp.vec3)
     return wp.vec2(wp.dot(d, u), wp.dot(d, v))
 
 
+# Slot layout of the one float32 buffer ``polyline_triangulate`` / ``triangulate_polygon`` read
+# back once: the plane frame's seven sums (``accumulate_loop_frame``), then the ring's turning
+# angle and two reflex counts (``accumulate_turning_angle``), then the closing flag -- ``1.0`` when
+# the input's last point repeats its first and the ring is one point shorter. The flag rides in a
+# float slot so the whole prologue is one readback; a 0/1 value is exact in float32.
+FRAME_NORMAL = wp.constant(wp.int32(0))
+FRAME_WEIGHTED_MIDPOINT = wp.constant(wp.int32(3))
+FRAME_LENGTH = wp.constant(wp.int32(6))
+RING_TURNING = wp.constant(wp.int32(7))
+RING_CLOSING = wp.constant(wp.int32(10))
+RING_SUMS_SIZE = 11
+
+
 @wp.kernel
 def accumulate_loop_frame(
-    polyline: wp.array[wp.vec3],
-    out_normal: wp.array[wp.vec3],
-    out_weighted_midpoint: wp.array[wp.vec3],
-    out_length: wp.array[wp.float32],
+    polyline: wp.array[wp.vec3], rtol: wp.float32, atol: wp.float32, out_sums: wp.array[wp.float32]
 ) -> None:
-    # Over an *open* loop of n distinct vertices. One pass replaces the three separate reductions
-    # ``polyline_triangulate``'s prologue used to run, each of which ended in a host readback
-    # because the next one consumed its Python-scope result.
+    # Over the loop of ``n_ring`` distinct vertices: the input minus a repeated closing point, which
+    # this kernel detects itself (``ring_closing_flag``) and publishes in ``RING_CLOSING`` for the
+    # caller's one readback, so the ring length never costs a readback of its own.
     #
-    # Newell's normal is cyclic -- element i takes the edge (i, (i + 1) % n), so the wrap-around
-    # edge is element n - 1 and no closing vertex has to be appended first. The length-weighted
-    # centroid deliberately is *not* cyclic: it runs over the n - 1 open segments, which is what
-    # ``polyline_centroid`` (``closed=False``) computes and what this function has always used.
+    # Newell's normal is cyclic -- element i takes the edge (i, (i + 1) % n_ring), so the
+    # wrap-around edge is element n_ring - 1 and no closing vertex has to be appended first. The
+    # length-weighted centroid deliberately is *not* cyclic: it runs over the n_ring - 1 open
+    # segments, which is what ``polyline_centroid`` (``closed=False``) computes and what this
+    # function has always used.
     #
     # Lane-strided single-slot reduction -- see ``accumulate_newell_normal`` for the shape and why
-    # no device branch is needed. This is the largest of the three wins, because it carried *three*
-    # unconditional atomics per element and so three times the contention.
+    # no device branch is needed.
     chunk, lane = wp.tid()
     n = polyline.shape[0]
-    offset, count = block_chunk_1d(n, chunk)
+    closing = ring_closing_flag(polyline[0], polyline[n - 1], rtol, atol)
+    n_ring = n - closing
+    if chunk == 0 and lane == 0:
+        out_sums[RING_CLOSING] = wp.float32(closing)
+    offset, count = block_chunk_1d(n_ring, chunk)
     if count <= 0:
         return
     normal = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
@@ -715,39 +954,40 @@ def accumulate_loop_frame(
     for k in range(lane, count, wp.block_dim()):
         i = offset + k
         start = polyline[i]
-        normal += wp.cross(start, polyline[wrap_index(i + 1, n)])
-        if i + 1 < n:
+        normal += wp.cross(start, polyline[wrap_index(i + 1, n_ring)])
+        if i + 1 < n_ring:
             midpoint, length = segment_midpoint_and_length(start, polyline[i + 1])
             weighted += midpoint * length
             length_total += length
-    # All seven sums in one block reduction.
-    block = block_sum(
+    # All seven sums in one block reduction, into ``FRAME_NORMAL`` .. ``FRAME_LENGTH``.
+    commit_block_sum(
+        lane,
         wp.vector(
             normal[0], normal[1], normal[2], weighted[0], weighted[1], weighted[2], length_total
-        )
+        ),
+        out_sums,
+        FRAME_NORMAL,
     )
-    if lane == 0:
-        wp.atomic_add(out_normal, 0, wp.vec3(block[0], block[1], block[2]))
-        wp.atomic_add(out_weighted_midpoint, 0, wp.vec3(block[3], block[4], block[5]))
-        wp.atomic_add(out_length, 0, block[6])
 
 
 @wp.kernel
 def project_polyline_to_plane(
-    polyline: wp.array[wp.vec3],
-    normal: wp.array[wp.vec3],
-    weighted_midpoint: wp.array[wp.vec3],
-    total_length: wp.array[wp.float32],
-    out_points2d: wp.array[wp.vec2],
+    polyline: wp.array[wp.vec3], sums: wp.array[wp.float32], out_points2d: wp.array[wp.vec2]
 ) -> None:
-    # dim == n. The device-frame counterpart of mapping ``project_to_plane_2d`` over host-scope
-    # ``wp.vec3`` uniforms: each thread turns ``accumulate_loop_frame``'s three sums into the plane
+    # dim == n (the ring plus, when ``RING_CLOSING`` is set, the repeated closing point, whose
+    # projection nothing reads). Each thread turns ``accumulate_loop_frame``'s sums into the plane
     # frame itself -- the centre and ``plane_basis``' ``(u, v)`` -- so the frame never crosses to
     # the host and no single-thread launch has to build it first. Every thread evaluates the same
-    # expressions on the same three values, so all of them hold the one frame, bit for bit.
+    # expressions on the same values, so all of them hold the one frame, bit for bit.
     i = wp.int32(wp.tid())
-    u, v = plane_basis(normal[0])
-    center = weighted_midpoint[0] / total_length[0]
+    normal = wp.vec3(sums[FRAME_NORMAL], sums[FRAME_NORMAL + 1], sums[FRAME_NORMAL + 2])
+    weighted_midpoint = wp.vec3(
+        sums[FRAME_WEIGHTED_MIDPOINT],
+        sums[FRAME_WEIGHTED_MIDPOINT + 1],
+        sums[FRAME_WEIGHTED_MIDPOINT + 2],
+    )
+    u, v = plane_basis(normal)
+    center = weighted_midpoint / sums[FRAME_LENGTH]
     out_points2d[i] = project_to_plane_2d(polyline[i], center, u, v)
 
 
@@ -759,25 +999,50 @@ def mirror_y(p: wp.vec2) -> wp.vec2:
 
 
 @wp.kernel
-def accumulate_turning_angle(points2d: wp.array[wp.vec2], out_sums: wp.array[wp.float32]) -> None:
-    # Cyclic signed exterior angle at each vertex into ``out_sums[0]``; the sum's sign gives the
-    # loop orientation. Lane-strided single-slot reduction -- see ``accumulate_newell_normal`` for
-    # the shape and why no device branch is needed.
+def accumulate_turning_angle(
+    points2d: wp.array[wp.vec2],
+    detect_closing: wp.int32,
+    rtol: wp.float32,
+    atol: wp.float32,
+    out_sums: wp.array[wp.float32],
+) -> None:
+    # Cyclic signed exterior angle at each vertex into ``out_sums[RING_TURNING]``; the sum's sign
+    # gives the loop orientation. Lane-strided single-slot reduction -- see
+    # ``accumulate_newell_normal`` for the shape and why no device branch is needed.
+    #
+    # Over the ring of ``n_ring`` distinct vertices. Where the ring is the caller's own 2D input
+    # (``detect_closing != 0``, ``triangulate_polygon``) this kernel is the first to touch it, so it
+    # detects a repeated closing point itself and publishes the flag in ``RING_CLOSING``; the
+    # predicate is ``polyline_open``'s on the ``z = 0`` lift, which is what that function used to
+    # evaluate. Otherwise (``polyline_triangulate``) ``accumulate_loop_frame`` already decided it on
+    # the 3D input, and this kernel reads the flag it wrote.
     #
     # The same pass counts the reflex vertices, so the convex test needs no launch of its own --
     # and counts them twice, because which loop gets tested is not known until the total is:
-    # ``orient_ccw`` mirrors a clockwise loop in ``y`` afterwards. Slot 1 counts the clockwise turns
-    # of the loop as it stands and slot 2 those of its mirror image, each evaluated on exactly the
-    # operands ``orient_ccw`` would leave behind (a mirror is ``(x, -y)``, exact in float32), so
-    # the caller's pick -- slot 1 when the total is ``>= 0``, the comparison ``orient_ccw`` makes --
-    # is the count of the oriented loop, bit for bit. ``-orient2d`` of the unmirrored loop is *not*
-    # a substitute: with FMA contraction on CUDA the two roundings differ, and near-collinear
-    # vertices of a fine convex ring then read as reflex. The counts are ``float32`` so all three
-    # share one buffer and one readback, which is exact for the only question asked of them: a sum
-    # of non-negative whole numbers is zero only when every term is.
+    # ``orient_ccw`` mirrors a clockwise loop in ``y`` afterwards. Slot ``RING_TURNING + 1`` counts
+    # the clockwise turns of the loop as it stands and ``RING_TURNING + 2`` those of its mirror
+    # image, each evaluated on exactly the operands ``orient_ccw`` would leave behind (a mirror is
+    # ``(x, -y)``, exact in float32), so the caller's pick -- the first when the total is ``>= 0``,
+    # the test that decides whether ``orient_ccw`` runs -- is the count of the oriented loop, bit
+    # for bit. ``-orient2d`` of the unmirrored loop is *not* a substitute: with FMA contraction on
+    # CUDA the two roundings differ, and near-collinear vertices of a fine convex ring then read as
+    # reflex. The counts are ``float32`` so every slot shares one buffer and one readback, which is
+    # exact for the only question asked of them: a sum of non-negative whole numbers is zero only
+    # when every term is.
     chunk, lane = wp.tid()
     n = points2d.shape[0]
-    offset, count = block_chunk_1d(n, chunk)
+    closing = wp.int32(0)
+    if detect_closing != 0:
+        zero = wp.float32(0.0)
+        closing = ring_closing_flag(
+            lift_vec2(points2d[0], zero), lift_vec2(points2d[n - 1], zero), rtol, atol
+        )
+        if chunk == 0 and lane == 0:
+            out_sums[RING_CLOSING] = wp.float32(closing)
+    else:
+        closing = wp.int32(out_sums[RING_CLOSING])
+    n_ring = n - closing
+    offset, count = block_chunk_1d(n_ring, chunk)
     if count <= 0:
         return
     local = wp.float32(0.0)
@@ -786,8 +1051,8 @@ def accumulate_turning_angle(points2d: wp.array[wp.vec2], out_sums: wp.array[wp.
     for k in range(lane, count, wp.block_dim()):
         i = offset + k
         current = points2d[i]
-        nxt = points2d[(i + 1) % n]
-        after = points2d[(i + 2) % n]
+        nxt = points2d[(i + 1) % n_ring]
+        after = points2d[(i + 2) % n_ring]
         d1 = nxt - current
         d2 = after - nxt
         local += wp.atan2(cross2(d1, d2), wp.dot(d1, d2))
@@ -796,17 +1061,15 @@ def accumulate_turning_angle(points2d: wp.array[wp.vec2], out_sums: wp.array[wp.
             reflex += wp.float32(1.0)
         if orient2d(mirror_y(current), mirror_y(nxt), mirror_y(after)) < 0:
             reflex_mirrored += wp.float32(1.0)
-    commit_block_sum(lane, wp.vec3(local, reflex, reflex_mirrored), out_sums, 0)
+    commit_block_sum(lane, wp.vec3(local, reflex, reflex_mirrored), out_sums, RING_TURNING)
 
 
 @wp.kernel
-def orient_ccw(points2d: wp.array[wp.vec2], turning_angle: wp.array[wp.float32]) -> None:
+def orient_ccw(points2d: wp.array[wp.vec2]) -> None:
     # Mirror the y-axis to flip a clockwise loop to counter-clockwise (replaces libigl's row
-    # reversal); the convex/ear tests assume CCW orientation. The sign test reads the accumulated
-    # turning angle *on device*, so the caller does not have to synchronize between the two: on the
-    # convex fast path that pair of readbacks was the entire cost of the call.
-    if turning_angle[0] >= 0.0:
-        return
+    # reversal); the convex/ear tests assume CCW orientation. Launched only on the ear-clipping
+    # path, and only when the turning angle the caller read back is negative -- the fan needs no
+    # orientation at all, since its faces are index triples. dim == the ring length.
     i = wp.int32(wp.tid())
     points2d[i] = mirror_y(points2d[i])
 
@@ -820,15 +1083,61 @@ def fan_triangulate(out_faces: wp.array2d[wp.int32]) -> None:
     out_faces[k, 2] = k + 2
 
 
-@wp.kernel
-def init_ring(
-    left: wp.array[wp.int32], right: wp.array[wp.int32], active: wp.array[wp.int32]
+# The ear loop's state buffer: ``array.LOOP_ROUND`` / ``LOOP_CONDITION``, then the running face
+# count ``clip_selected`` appends through. One buffer, seeded by ``init_ring``, so the loop needs no
+# host upload and no zero-fill of its own and the final count is a read of one slot.
+EAR_COUNT = wp.constant(wp.int32(2))
+EAR_STATE_SIZE = 3
+
+
+@wp.func
+def init_ring_slot(
+    left: wp.array[wp.int32],
+    right: wp.array[wp.int32],
+    active: wp.array[wp.int32],
+    i: wp.int32,
+    n: wp.int32,
 ) -> None:
-    i = wp.int32(wp.tid())
-    n = left.shape[0]
+    # Corner ``i`` of an ``n``-corner ring before any clip: linked to both neighbours and active.
+    # Shared by ``init_ring`` (one thread per corner) and ``ear_clip_block`` (one block).
     left[i] = wrap_index(i - 1, n)
     right[i] = (i + 1) % n
     active[i] = wp.int32(1)
+
+
+@wp.kernel
+def init_ring(
+    left: wp.array[wp.int32],
+    right: wp.array[wp.int32],
+    active: wp.array[wp.int32],
+    out_state: wp.array[wp.int32],
+) -> None:
+    i = wp.int32(wp.tid())
+    if i == 0:
+        out_state[LOOP_ROUND] = wp.int32(0)
+        out_state[LOOP_CONDITION] = wp.int32(1)
+        out_state[EAR_COUNT] = wp.int32(0)
+    init_ring_slot(left, right, active, i, left.shape[0])
+
+
+@wp.func
+def ear_flag(
+    points2d: wp.array[wp.vec2],
+    left: wp.array[wp.int32],
+    right: wp.array[wp.int32],
+    active: wp.array[wp.int32],
+    i: wp.int32,
+    n: wp.int32,
+) -> wp.int32:
+    # ``1`` when corner ``i`` is an active ear. One round's first step, shared by ``compute_ears``
+    # (one thread per corner) and ``ear_clip_block`` (one block walks every corner).
+    # Nested rather than ``and``-joined: an inactive corner's ``left`` / ``right`` are stale, so
+    # its ring walk must never run.
+    flag = wp.int32(0)
+    if active[i] != 0:
+        if is_ear_at(points2d, left, right, active, i, n):
+            flag = wp.int32(1)
+    return flag
 
 
 @wp.kernel
@@ -840,14 +1149,7 @@ def compute_ears(
     out_is_ear: wp.array[wp.int32],
 ) -> None:
     i = wp.int32(wp.tid())
-    n = points2d.shape[0]
-    if active[i] == 0:
-        out_is_ear[i] = wp.int32(0)
-        return
-    if is_ear_at(points2d, left, right, active, i, n):
-        out_is_ear[i] = wp.int32(1)
-    else:
-        out_is_ear[i] = wp.int32(0)
+    out_is_ear[i] = ear_flag(points2d, left, right, active, i, points2d.shape[0])
 
 
 @wp.func
@@ -869,13 +1171,10 @@ def ear_outranks(a: wp.int32, b: wp.int32) -> wp.bool:
     return a < b
 
 
-@wp.kernel
-def select_independent(
-    is_ear: wp.array[wp.int32],
-    left: wp.array[wp.int32],
-    right: wp.array[wp.int32],
-    out_selected: wp.array[wp.int32],
-) -> None:
+@wp.func
+def ear_selected(
+    is_ear: wp.array[wp.int32], left: wp.array[wp.int32], right: wp.array[wp.int32], i: wp.int32
+) -> wp.int32:
     # Select ear i iff it outranks every ear within ring-distance 2. This keeps chosen ears >= 3
     # apart, so their clip footprints {L[i], i, R[i]} are disjoint and can be clipped concurrently.
     # The globally top-ranked ear is always selected, guaranteeing progress.
@@ -885,24 +1184,58 @@ def select_independent(
     # lets the ear at i - 2 suppress the ear at i for every i, so exactly one ear is clipped per
     # round and the clipper runs its full ``n``-round cap. Comparing by an effectively random key
     # instead makes this the textbook maximal-independent-set rule, which retires a constant
-    # fraction of the ears per round.
-    i = wp.int32(wp.tid())
-    out_selected[i] = wp.int32(0)
+    # fraction of the ears per round. Shared by ``select_independent`` and ``ear_clip_block``.
     if is_ear[i] == 0:
-        return
+        return wp.int32(0)
     ll = left[left[i]]
     left_i = left[i]
     r = right[i]
     rr = right[right[i]]
     if is_ear[ll] == 1 and ear_outranks(ll, i):
-        return
+        return wp.int32(0)
     if is_ear[left_i] == 1 and ear_outranks(left_i, i):
-        return
+        return wp.int32(0)
     if is_ear[r] == 1 and ear_outranks(r, i):
-        return
+        return wp.int32(0)
     if is_ear[rr] == 1 and ear_outranks(rr, i):
-        return
-    out_selected[i] = wp.int32(1)
+        return wp.int32(0)
+    return wp.int32(1)
+
+
+@wp.kernel
+def select_independent(
+    is_ear: wp.array[wp.int32],
+    left: wp.array[wp.int32],
+    right: wp.array[wp.int32],
+    out_selected: wp.array[wp.int32],
+) -> None:
+    i = wp.int32(wp.tid())
+    out_selected[i] = ear_selected(is_ear, left, right, i)
+
+
+@wp.func
+def clip_ear(
+    left: wp.array[wp.int32],
+    right: wp.array[wp.int32],
+    active: wp.array[wp.int32],
+    i: wp.int32,
+    count: wp.array[wp.int32],
+    count_slot: wp.int32,
+    faces: wp.array2d[wp.int32],
+) -> None:
+    # Clip the selected ear at corner ``i``: append its triangle at the slot ``count[count_slot]``
+    # hands out, retire the corner and link its neighbours past it. Selected ears are >= 3 apart
+    # (``ear_selected``), so concurrent clips touch disjoint slots. Shared by ``clip_selected`` and
+    # ``ear_clip_block``.
+    a = left[i]
+    b = right[i]
+    slot = wp.atomic_add(count, count_slot, 1)
+    faces[slot, 0] = a
+    faces[slot, 1] = i
+    faces[slot, 2] = b
+    active[i] = wp.int32(0)
+    right[a] = b
+    left[b] = a
 
 
 @wp.kernel
@@ -912,26 +1245,15 @@ def clip_selected(
     right: wp.array[wp.int32],
     active: wp.array[wp.int32],
     out_faces: wp.array2d[wp.int32],
-    out_count: wp.array[wp.int32],
+    out_state: wp.array[wp.int32],
 ) -> None:
     i = wp.int32(wp.tid())
-    if selected[i] == 0:
-        return
-    a = left[i]
-    b = right[i]
-    slot = wp.atomic_add(out_count, 0, 1)
-    out_faces[slot, 0] = a
-    out_faces[slot, 1] = i
-    out_faces[slot, 2] = b
-    active[i] = wp.int32(0)
-    right[a] = b
-    left[b] = a
+    if selected[i] != 0:
+        clip_ear(left, right, active, i, out_state, EAR_COUNT, out_faces)
 
 
 @wp.kernel
-def ear_loop_continue(
-    count: wp.array[wp.int32], target: wp.int32, max_rounds: wp.int32, state: wp.array[wp.int32]
-) -> None:
+def ear_loop_continue(target: wp.int32, max_rounds: wp.int32, state: wp.array[wp.int32]) -> None:
     # Ear-clipping loop control, kept on device so ``wp.capture_while`` can drive the rounds without
     # a readback each time; the slot table is ``array.LOOP_ROUND`` / ``LOOP_CONDITION``.
     # The round cap is what stops a degenerate or self-intersecting loop that never retires an ear
@@ -940,10 +1262,74 @@ def ear_loop_continue(
     # ``state`` is read-and-incremented round-index/loop-condition scratch carried across launches,
     # not a fresh per-call answer -- see ``rdp_begin_round``'s identical naming.
     state[LOOP_ROUND] = state[LOOP_ROUND] + 1
-    if count[0] < target and state[LOOP_ROUND] < max_rounds:
+    if state[EAR_COUNT] < target and state[LOOP_ROUND] < max_rounds:
         state[LOOP_CONDITION] = wp.int32(1)
     else:
         state[LOOP_CONDITION] = wp.int32(0)
+
+
+# Rings up to this length are clipped by ``ear_clip_block`` -- the whole round loop as one block --
+# rather than by the captured four-launch round loop, on CUDA (the CPU device takes the block form
+# at every size: its launch grid is a serial loop anyway, and the block form is the same walk
+# without a launch and a readback per round, 1.15-1.97x from 512 to 8 192 corners, faces
+# byte-identical). At this size a round is too little work to fill the device, so what the
+# multi-launch form pays is recording and replaying its conditional graph, flat in ``n``; one block
+# of ``EAR_BLOCK_DIM`` lanes, one corner per lane at the cap, trades that for three block barriers
+# a round -- 3.0x at 64 corners, 1.46-1.73x at 512-1 024. Past the cap round 0's O(ring) ear test
+# runs several corners per lane serially and the device-wide form wins again: 1.06x at 1 500,
+# 0.88x at 2 048, 0.41x at 4 096.
+EAR_ONE_BLOCK_MAX = 1024
+EAR_BLOCK_DIM = 1024
+
+
+@wp.kernel(enable_backward=False)
+def ear_clip_block(
+    points2d: wp.array[wp.vec2],
+    out_faces: wp.array2d[wp.int32],
+    out_ring: wp.array2d[wp.int32],
+    out_count: wp.array[wp.int32],
+) -> None:
+    # ``init_ring`` plus every round of ``compute_ears`` -> ``select_independent`` ->
+    # ``clip_selected`` -> ``ear_loop_continue``, as one block whose lanes stride the ring by
+    # ``wp.block_dim()`` -- so on the CPU device, where a block is one lane, it is the same serial
+    # walk the four launches make, corner by corner in index order, and the faces come out
+    # byte-identical. The block barriers are ``block_sum`` calls (Warp exposes no other): one after
+    # each step, the last of which also totals the round's clips, so the loop condition is
+    # block-uniform. The ear rule, the selection rule, the ring's initial links and the clip are
+    # the ``ear_flag`` / ``ear_selected`` / ``init_ring_slot`` / ``clip_ear`` the four launches
+    # call too.
+    #
+    # ``out_ring`` is ``(5, n_ring)`` scratch: rows ``left``, ``right``, ``active``, ``is_ear``,
+    # ``selected``.
+    # ``out_count`` is zeroed here and ends holding the face count.
+    _block, lane = wp.tid()
+    left = out_ring[0]
+    right = out_ring[1]
+    active = out_ring[2]
+    is_ear = out_ring[3]
+    selected = out_ring[4]
+    # The ring length, which ``points2d`` may exceed by a repeated closing point.
+    n = out_ring.shape[1]
+    if lane == 0:
+        out_count[0] = wp.int32(0)
+    for i in range(lane, n, wp.block_dim()):
+        init_ring_slot(left, right, active, i, n)
+    count = block_sum(wp.int32(0))
+    rounds = wp.int32(0)
+    while count < n - 2 and rounds < n:
+        for i in range(lane, n, wp.block_dim()):
+            is_ear[i] = ear_flag(points2d, left, right, active, i, n)
+        block_sum(wp.int32(0))
+        for i in range(lane, n, wp.block_dim()):
+            selected[i] = ear_selected(is_ear, left, right, i)
+        block_sum(wp.int32(0))
+        clipped = wp.int32(0)
+        for i in range(lane, n, wp.block_dim()):
+            if selected[i] != 0:
+                clip_ear(left, right, active, i, out_count, 0, out_faces)
+                clipped += 1
+        count += block_sum(clipped)
+        rounds += 1
 
 
 def _declare_map_kernels() -> None:
@@ -954,40 +1340,17 @@ def _declare_map_kernels() -> None:
     derived and what forks a ``wp.map`` module; only this module's *own* forking ops belong
     here (the shared builtins are declared there).
     """
-    # Every op here forks on the **length-1** axis alone, and it is the whole table's shape: the
-    # three of them are mapped over the shifted pair ``polyline[:-1]`` / ``polyline[1:]``, so a
-    # two-point polyline hands them one-element views where every longer one hands them dense
-    # arrays. That is section 3's "the fork axis is not only the dtype", and a two-point polyline
-    # is an ordinary input rather than a corner: ``polyline_centroid`` and ``polyline_radius``
-    # accept one, their guard being ``n_segments < 1``.
-    #
-    # Two of the three were missing from this list and the cost is what section 15 predicts:
-    # walking an 8-point polyline and then a 2-point one through ``polyline_centroid`` /
-    # ``polyline_radius`` / ``polyline_length`` with Warp's debug log on logs
-    # ``Module hash changed, recompiling`` for exactly the undeclared ops, seconds apiece, while
-    # the declared one holds.
+    # The one op here forks on the **length-1** axis alone: ``cumulative_arc_length`` maps it over
+    # the shifted pair ``polyline[:-1]`` / ``polyline[1:]``, so a two-point polyline hands it
+    # one-element views where every longer one hands it dense arrays. That is section 3's "the fork
+    # axis is not only the dtype", and a two-point polyline is an ordinary input rather than a
+    # corner. The per-segment ops the centroid and radius once mapped are now called inside their
+    # own reduction kernels, so they need no entry.
     dense, single = map_probe, map_probe_single
-    center, normal = wp.vec3(), wp.vec3()
     declare_map_signatures(
         [
             (segment_length, (dense(wp.vec3), dense(wp.vec3)), wp.float32),
             (segment_length, (single(wp.vec3), single(wp.vec3)), wp.float32),
-            (segment_midpoint_and_length, (dense(wp.vec3), dense(wp.vec3)), (wp.vec3, wp.float32)),
-            (
-                segment_midpoint_and_length,
-                (single(wp.vec3), single(wp.vec3)),
-                (wp.vec3, wp.float32),
-            ),
-            (
-                radius_segment_distances,
-                (dense(wp.vec3), dense(wp.vec3), center, normal),
-                wp.float32,
-            ),
-            (
-                radius_segment_distances,
-                (single(wp.vec3), single(wp.vec3), center, normal),
-                wp.float32,
-            ),
         ]
     )
 

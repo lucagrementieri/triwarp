@@ -1302,6 +1302,42 @@ def test_region_smoothers_leave_an_unreferenced_free_vertex_where_it_is(
     assert moved_np[free_np[:stray]].max() > 1e-4
 
 
+@pytest.mark.parametrize(
+    ("smoother", "edge_weights"),
+    [
+        (tw.smoothing.smooth_region_fixed_rim, None),
+        (tw.smoothing.smooth_region, "unit"),
+        (tw.smoothing.smooth_region, "cotan"),
+    ],
+)
+def test_region_smoothers_ignore_a_face_repeating_a_vertex(
+    device: str, smoother, edge_weights: str | None
+) -> None:
+    """
+    A face ``(a, a, b)`` adds no neighbour: the region solves answer as if it were absent.
+
+    Not a library comparison: every reference here either rejects a repeated-index face or cleans
+    it away on import, so none can be asked. The invariant is the contract the region solves' row
+    walks are built on -- a vertex's neighbours are the other endpoints of its unique edges, and the
+    self-loop ``(a, a)`` such a face contributes is no neighbour (it would put a second entry in the
+    diagonal's column). ``(a, b)`` is an edge of the mesh already, so the answer must not move.
+    """
+    vertices_np, faces_np, free_np = _sphere_region()
+    v_wp = points_to_warp(vertices_np, device)
+    free_wp = wp.array(free_np, dtype=wp.bool, device=device)
+    a, b = (int(x) for x in faces_np[np.flatnonzero(free_np[faces_np].all(axis=1))[0], :2])
+    degenerate_np = np.vstack([faces_np, [a, a, b]])
+    kwargs = {} if edge_weights is None else {"edge_weights": edge_weights}
+
+    def smooth(faces: np.ndarray) -> np.ndarray:
+        f_wp = wp.array(faces.reshape(-1).astype(np.int32), dtype=wp.int32, device=device)
+        return smoother(v_wp, f_wp, free_wp, **kwargs).numpy()
+
+    clean_np = smooth(faces_np)
+    assert np.linalg.norm(clean_np - vertices_np, axis=1).max() > 1e-4
+    assert np.allclose(smooth(degenerate_np), clean_np, rtol=1e-5, atol=1e-5)
+
+
 def _patch_to_refine(device: str):
     """Hole an icosphere, fill it, and mark the fill as the patch, with the pre-fill counts."""
     sphere_tm = tm.creation.icosphere(subdivisions=2, radius=1.0)

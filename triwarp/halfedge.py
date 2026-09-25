@@ -20,7 +20,8 @@ import warp as wp
 
 import triwarp as tw
 from triwarp._device import read_scalar, require_same_device
-from triwarp.constants import INT32_MAX
+from triwarp.constants import INDEX_RADIX_PAIR, INT32_MAX
+from triwarp.kernels import adjacency as kernel_adjacency
 from triwarp.kernels import halfedge as kernel_halfedge
 
 
@@ -325,13 +326,21 @@ def _pair_halfedges(
     if n_halfedges == 0:
         return twins
 
-    # Edge rows are built from face indices, so they are non-negative and below the vertex count by
+    # Edge keys are built from face indices, so they are non-negative and below the vertex count by
     # construction: the range check would only add a readback. And ``n_vertices`` is the packing
     # radix and nothing else -- no buffer here is sized by it -- so when the caller does not supply
     # one the pair radix serves instead of inferring the tight bound, which would be a device
-    # reduction plus a host readback for a fifth of this call.
-    edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
-    keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices, validate=False)
+    # reduction plus a host readback for a fifth of this call. The keys are written straight from
+    # the faces (``adjacency.face_edge_keys``), the same keys ``faces_to_edges(sorted=True)`` plus
+    # ``hash_indices_rows`` produce without the ``(3F, 2)`` rows between them.
+    keys = wp.empty(n_halfedges, dtype=wp.uint64, device=device)
+    wp.launch(
+        kernel_adjacency.face_edge_keys,
+        dim=n_halfedges // 3,
+        inputs=[faces, wp.uint64(INDEX_RADIX_PAIR if n_vertices is None else n_vertices)],
+        outputs=[keys],
+        device=device,
+    )
     sorted_keys, order = tw.array.sort_and_argsort(keys)
 
     # Slot 0 counts edge-non-manifold edges, slot 1 edges whose two halfedges run the same way;

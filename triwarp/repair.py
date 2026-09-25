@@ -298,24 +298,33 @@ def remove_unreferenced_vertices(
     device = faces.device
     n_vertices = int(vertices.shape[0])
 
-    referenced = tw.array.indices_to_mask(faces, n_vertices, device=device)
-
-    # ``flatnonzero`` already paid the readback that sizes its own output, and that size *is* the
-    # referenced count -- a separate ``reduce.sum`` of the mask would be a second scan and a second
-    # host sync for a number already in hand.
-    inverse = tw.array.flatnonzero(referenced)
-    n_referenced = int(inverse.shape[0])
-    remap = wp.full(n_vertices, -1, dtype=wp.int32, device=device)
-    if n_referenced > 0:
+    # The referenced flags are marked as ``int32`` and scanned in place, and one pass reads the scan
+    # to write all three maps: the tail of the scan is the referenced count, which sizes the
+    # outputs and is the one readback.
+    remap = wp.empty(n_vertices, dtype=wp.int32, device=device)
+    if n_vertices == 0:
+        new_vertices = wp.empty(0, dtype=wp.vec3, device=device)
+        inverse = wp.empty(0, dtype=wp.int32, device=device)
+    else:
+        inclusive = wp.zeros(n_vertices, dtype=wp.int32, device=device)
+        n_indices = int(faces.shape[0])
+        if n_indices > 0:
+            wp.launch(
+                kernel_repair.mark_referenced,
+                dim=n_indices,
+                inputs=[faces, inclusive],
+                device=device,
+            )
+        wp.utils.array_scan(inclusive, out_array=inclusive, inclusive=True)
+        n_referenced = int(read_scalar(inclusive))
+        new_vertices = wp.empty(n_referenced, dtype=wp.vec3, device=device)
+        inverse = wp.empty(n_referenced, dtype=wp.int32, device=device)
         wp.launch(
-            kernel_scatter.scatter_index, dim=n_referenced, inputs=[inverse, remap], device=device
+            kernel_repair.compact_referenced,
+            dim=n_vertices,
+            inputs=[vertices, inclusive, remap, new_vertices, inverse],
+            device=device,
         )
-
-    new_vertices = (
-        tw.array.gather(vertices, inverse)
-        if n_referenced > 0
-        else wp.empty(0, dtype=wp.vec3, device=vertices.device)
-    )
     new_faces = tw.array.remap_indices(faces, remap)
 
     if return_inverse:
@@ -1337,7 +1346,8 @@ def remove_degree3_vertices(
         ``(n_vertices,)`` mesh vertex positions.
     faces
         Length-``3 * n_faces`` ``wp.int32`` triangle index buffer. Must be edge-manifold, since the
-        fan around a vertex is what this reasons about.
+        fan around a vertex is what this reasons about. A pinched (vertex-non-manifold) vertex is
+        accepted and is never a candidate: its faces do not close into one fan of three.
     max_iter
         Cap on the number of passes. Each pass removes an independent set, so a chain of adjacent
         candidates needs one pass per link; the default covers any chain length likely in practice.
@@ -1373,103 +1383,92 @@ def remove_degree3_vertices(
     [`remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces]
         Removes faces by *geometry*; this one removes a vertex by its connectivity alone.
     [`vertex_one_rings`][triwarp.halfedge.vertex_one_rings]
-        The fan this walks.
+        The whole fan of every vertex; this reads only the three faces of a candidate.
     """
     require_same_device(vertices=vertices, faces=faces)
     if max_iter < 0:
         raise ValueError(f"max_iter must be non-negative, got {max_iter}")
     device = faces.device
     removed = 0
-    # Scratch hoisted to the pass-0 size and sliced, rather than reallocated per pass: the vertex
-    # count is constant across the loop (compaction is deferred to the end, below) and the face
-    # count only ever shrinks, so one allocation each serves every pass. ``counters`` holds the
-    # selection size in slot 0, the emit cursor in slot 1 and the count of vertices the pass turns
-    # into candidates in slot 2; all three are zeroed per pass.
     n_vertices = int(vertices.shape[0])
     n_faces0 = int(faces.shape[0]) // 3
-    candidate = wp.empty(n_vertices, dtype=wp.bool, device=device)
-    selected = wp.zeros(n_vertices, dtype=wp.bool, device=device)
-    counters = wp.zeros(3, dtype=wp.int32, device=device)
-    keep_scratch = wp.empty(n_faces0, dtype=wp.bool, device=device)
+    if n_faces0 > 0 and max_iter > 0:
+        # The documented edge-manifold check, on the input only. The pass below reasons about each
+        # vertex's three faces alone and needs no twin table, and replacing an interior degree-3
+        # fan by the one triangle over its rim keeps every rim edge at two faces with the same
+        # orientation, so a pass cannot make a valid mesh invalid and later passes do not re-prove
+        # it.
+        tw.halfedge.halfedge_twins(faces, n_vertices, validate=True)
+    # Scratch hoisted to the pass-0 size and sliced, rather than reallocated per pass: the vertex
+    # count is constant across the loop (compaction is deferred to the end, below) and the face
+    # count only ever shrinks, so one allocation each serves every pass. ``tables`` holds each
+    # vertex's corner count, link sum and decrement tally (``degree3_fan_tables`` and
+    # ``emit_degree3_replacement`` say what each means) and is zeroed per pass in one fill;
+    # ``counters`` holds the emit cursor -- the selection size -- in slot 0 and the next-pass
+    # candidate count in slot 1, read back together.
+    tables = wp.zeros((3, n_vertices), dtype=wp.int32, device=device)
+    counts, link_sums, lost = tables[0], tables[1], tables[2]
+    fans = twt.empty_2d((n_vertices, 3), wp.int32, device=device)
+    counters = wp.zeros(2, dtype=wp.int32, device=device)
+    cursor, next_candidates = counters[0:1], counters[1:2]
+    new_faces = twt.empty_2d((max(n_faces0 // 3, 1), 3), wp.int32, device=device)
     # The kept-face flags, scanned in place into their inclusive ranks.
     keep_ranks = wp.empty(n_faces0, dtype=wp.int32, device=device)
     for pass_index in range(max_iter):
         n_faces = int(faces.shape[0]) // 3
         if n_faces == 0:
             break
-        # The topology checks run on the input only. Replacing an interior degree-3 fan by the one
-        # triangle over its rim keeps every rim edge at two faces with the same orientation and
-        # leaves each rim vertex one fan, so a pass cannot make a valid mesh invalid -- and a later
-        # pass paying both checks' readbacks would only re-prove it.
-        ring_halfedges, ring_offsets, is_boundary = tw.halfedge.vertex_one_rings(
-            faces, n_vertices=n_vertices, validate=pass_index == 0
-        )
-        wp.map(
-            kernel_repair.is_interior_degree3,
-            ring_offsets[:-1],
-            ring_offsets[1:],
-            is_boundary,
-            out=candidate,
-        )
-        selected.zero_()
-        counters.zero_()
+        if pass_index > 0:
+            tables.zero_()
+            counters.zero_()
         wp.launch(
-            kernel_repair.select_independent_degree3,
-            dim=n_vertices,
-            inputs=[faces, ring_offsets, ring_halfedges, candidate, selected, counters[:1]],
+            kernel_repair.degree3_fan_tables,
+            dim=3 * n_faces,
+            inputs=[faces, counts, link_sums, fans],
             device=device,
         )
-        # The selection size sizes the replacement buffer, and is the loop's termination test on a
-        # pass that finds nothing (only pass 0 can: every later pass runs because the previous one
-        # counted a new candidate, below, and the lowest-indexed candidate always wins). The count
-        # comes straight off ``select_independent_degree3``'s own atomic rather than from a
-        # whole-array cast plus a reduction over ``selected`` -- the kernel that built the selection
-        # already knew its size.
-        n_selected = int(read_scalar(counters, 0))
-        if n_selected == 0:
-            break
-
-        cursor = counters[1:2]
-        # Every face starts kept and the emit pass clears the fans it replaces, so the kept-face
-        # mask comes straight out of that pass. The fans are disjoint and each is three faces, so
-        # the kept count is known without reading it back, and the kept faces and the new ones are
-        # written into one buffer: kept first, in order, then the replacements.
-        n_kept = n_faces - 3 * n_selected
-        keep = keep_scratch[:n_faces]
-        keep.fill_(True)
-        out_faces = wp.empty(3 * (n_kept + n_selected), dtype=wp.int32, device=device)
+        # Every face starts kept and the emit pass clears the fans it replaces, so the kept flags
+        # come straight out of that pass.
+        ranks = keep_ranks[:n_faces]
+        ranks.fill_(1)
         wp.launch(
             kernel_repair.emit_degree3_replacement,
             dim=n_vertices,
             inputs=[
                 faces,
-                ring_offsets,
-                ring_halfedges,
-                is_boundary,
-                selected,
+                fans,
+                counts,
+                link_sums,
                 cursor,
-                keep,
-                out_faces[3 * n_kept :].reshape((n_selected, 3)),
-                counters[2:],
+                lost,
+                ranks,
+                new_faces,
+                next_candidates,
             ],
             device=device,
         )
-        ranks = keep_ranks[:n_faces]
-        wp.launch(kernel_array.bool_flags, dim=n_faces, inputs=[keep, ranks], device=device)
+        # One readback per pass, carrying both of the loop's host decisions: the selection size
+        # sizes the output and ends the loop on a pass that finds nothing (only pass 0 can: every
+        # later pass runs because the previous one counted a possible candidate), and the
+        # next-pass count skips the pass that would only learn it finds nothing.
+        n_selected, n_next = (int(x) for x in counters.numpy())
+        if n_selected == 0:
+            break
+        # The fans are disjoint and each is three faces, so the kept count is known without reading
+        # it back, and the kept faces and the new ones are written into one buffer: kept first, in
+        # order, then the replacements.
+        n_kept = n_faces - 3 * n_selected
+        out_faces = wp.empty(3 * (n_kept + n_selected), dtype=wp.int32, device=device)
         wp.utils.array_scan(ranks, out_array=ranks, inclusive=True)
         wp.launch(
             kernel_repair.compact_kept_faces,
             dim=n_faces,
-            inputs=[faces, keep, ranks, out_faces],
+            inputs=[faces, ranks, new_faces, n_kept, n_selected, out_faces],
             device=device,
         )
         faces = out_faces
         removed += n_selected
-        # Removing a fan changes only its rim vertices' face counts, so the emit pass already knows
-        # whether the next pass would find a candidate. Reading that here replaces the next pass's
-        # ring build, candidate map and selection whenever the answer is no -- which it always is on
-        # the last pass that removes anything.
-        if pass_index + 1 < max_iter and int(read_scalar(counters, 2)) == 0:
+        if n_next == 0:
             break
     if removed == 0:
         return (vertices, faces, 0) if return_count else (vertices, faces)

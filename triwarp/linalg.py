@@ -122,6 +122,7 @@ from __future__ import annotations
 import math
 import warnings
 import weakref
+from collections.abc import Sequence
 from typing import Any, Literal, cast, overload
 
 import numpy as np
@@ -538,7 +539,9 @@ def solve_spd(
         [`chebyshev_preconditioner`][triwarp.linalg.chebyshev_preconditioner] build for ``matrix``
         are solved by this module's own conjugate gradient through a state kept for ``matrix``'s
         lifetime, so a later solve against the same operator replays its recorded loop instead of
-        recording one; any other operator is applied as given through ``warp.optim.linear.cg``.
+        recording one -- and an operator rebuilt per call, of a shape already solved, is copied
+        into a kept state of that shape, which replays too. Any other operator is applied as given
+        through ``warp.optim.linear.cg``.
     name
         Caller name, used in the non-convergence warning.
 
@@ -546,7 +549,8 @@ def solve_spd(
     -------
     tuple[int, float, float]
         Whatever ``warp.optim.linear.cg`` returns: iteration count, residual and tolerance. Device
-        1-element arrays instead of host scalars when ``check_every=0``.
+        1-element arrays instead of host scalars when ``check_every=0``, which belong to the kept
+        state and are overwritten by its next solve.
 
     Raises
     ------
@@ -671,7 +675,13 @@ def _solve_spd_batched(
         )
         return cast("tuple[int, float, float]", result)
     solver = _cached_solver(
-        matrix, 1, tol=tol, maxiter=cap, check_every=_supported_check_every(0), preconditioner=kind
+        matrix,
+        1,
+        tol=tol,
+        maxiter=cap,
+        check_every=_supported_check_every(0),
+        preconditioner=kind,
+        pooled=True,
     )
     result = solver.solve(rhs, solution)
     if check_every == 0 or not isinstance(result[0], wp.array):
@@ -1085,7 +1095,9 @@ def solve_spd_settled(
     -------
     wp.array[wp.int32]
         One-element device array holding the rounds that took a step. It belongs to the solver
-        state kept for ``matrix`` and is overwritten by the next solve against it.
+        state kept for ``matrix`` and is overwritten by the next solve against it -- or, for an
+        operator rebuilt per call, against the next operator of its shape, whose solve takes the
+        same state (see [`solve_spd`][triwarp.linalg.solve_spd]).
 
     Raises
     ------
@@ -1139,6 +1151,7 @@ def solve_spd_settled(
         preconditioner="diag",
         settle=(int(check_rounds), float(change_tolerance), int(settle_rounds)),
         narrow_values=True,
+        pooled=True,
     )
     solver.solve(rhs_flat, solution_flat)
     return solver._iterations
@@ -1289,6 +1302,7 @@ def _cg_columns(
         maxiter=iteration_cap,
         check_every=supported,
         preconditioner=preconditioner,
+        pooled=True,
     )
     return cast("tuple[int, float, float]", state.solve(rhs.flatten(), solution.flatten()))
 
@@ -1690,9 +1704,16 @@ class _BatchedCg:
         preconditioner: str | SquaredLaplacianPreconditioner = "diag",
         settle: tuple[int, float, int] | None = None,
         narrow_values: bool = False,
+        own_storage: bool = False,
     ) -> None:
         device = matrix.device
         self._device = device
+        # A pooled state (``_cached_solver``) holds a copy of its operator's storage rather than the
+        # caller's, so ``refresh`` can write the next operator of the same shape into the same
+        # arrays the recorded graph reads.
+        if own_storage:
+            matrix = _owned_copy(matrix)
+        self._owns_storage = own_storage
         self._matrix = matrix
         self._n_columns, self._n = int(solution.shape[0]), int(solution.shape[1])
         self._tol = float(tol)
@@ -1711,9 +1732,7 @@ class _BatchedCg:
         # below that a round is bound by its launches, and one ``bsr_mv`` a column plus a dots
         # launch lose to the one fused launch (measured 0.91-0.94x on ``smooth_region``'s
         # three-column, twenty-entry-a-row systems). One four-byte read per state.
-        entries = read_scalar(matrix.offsets, self._n) if self._n > 0 and not self._fold else 0
-        self._heavy = entries > CG_HEAVY_ROW_ENTRIES * self._n
-        self._mv_tile = _HEAVY_ROW_TILE if entries > _HEAVY_ROW_TILED_ENTRIES * self._n else -1
+        self._heavy, self._mv_tile = _row_path(matrix, self._n, self._fold)
         self._stride = self._blocks * self._span
         self._dofs = self._n_columns * self._stride
         # The values the fused mat-vec reads: the operator's own, or -- ``narrow_values``, taken by
@@ -1848,6 +1867,50 @@ class _BatchedCg:
             self._settle_state = wp.zeros(
                 kernel_cg.SETTLE_STATE_SIZE, dtype=wp.float64, device=device
             )
+
+    def refresh(self, matrix: wps.BsrMatrix[wp.float64]) -> None:
+        """
+        Write ``matrix`` into this pooled state's own operator storage, and re-derive from it.
+
+        One launch (``kernels/linalg.refresh_pooled_operator``) copies the pattern and the values
+        and rewrites what construction derived from them -- the narrowed values, the Jacobi
+        inverse diagonal -- and, under the Jacobi-Chebyshev polynomial, the Gershgorin ratios its
+        interval is refitted to on the device. The recorded graph reads these same arrays, so the
+        state then solves ``matrix`` with no new recording. Only for a state built with
+        ``own_storage``, whose operator has ``matrix``'s shape.
+        """
+        assert self._owns_storage
+        owned = self._matrix
+        chebyshev = isinstance(self._cycle, _JacobiChebyshevApply)
+        narrowed = None if self._round_values is owned.values else self._round_values
+        ratios = None
+        if chebyshev:
+            assert isinstance(self._cycle, _JacobiChebyshevApply)
+            ratios = self._cycle.owner.ratios
+        if self._n > 0:
+            wp.launch(
+                kernel_linalg.refresh_pooled_operator,
+                dim=self._n,
+                inputs=[
+                    matrix.offsets,
+                    matrix.columns,
+                    matrix.values,
+                    wp.int32(0 if narrowed is None else 1),
+                    wp.int32(2 if chebyshev else (0 if self._inv_diag is None else 1)),
+                ],
+                outputs=[
+                    owned.offsets,
+                    owned.columns,
+                    owned.values,
+                    narrowed,
+                    self._inv_diag,
+                    ratios,
+                ],
+                device=self._device,
+            )
+        if chebyshev:
+            assert isinstance(self._cycle, _JacobiChebyshevApply)
+            self._cycle.owner.refit()
 
     def _settle_check(self) -> None:
         """Issue the settle monitor's two launches, after a block of ``check_rounds`` rounds."""
@@ -2168,6 +2231,7 @@ def _cached_solver(
     preconditioner: str,
     settle: tuple[int, float, int] | None = None,
     narrow_values: bool = False,
+    pooled: bool = False,
 ) -> _BatchedCg:
     """
     Return the ``_BatchedCg`` state for this operator and configuration, built on first use.
@@ -2186,9 +2250,19 @@ def _cached_solver(
     converges to the new system's answer, and only the preconditioner -- derived from the values at
     construction -- goes stale, which changes the rate and not the fixed point.
 
+    **A fresh operator of a shape already seen takes a pooled state instead** (``pooled``, for a
+    caller that runs the state at once and keeps nothing of it). A recorded graph holds pointers
+    into its operator's storage and nothing rebinds them, so every fresh operator recorded anew --
+    most of a solve's cost on small and medium systems whenever the operators are rebuilt per call.
+    A pooled state owns a copy of its operator's storage, and ``_BatchedCg.refresh`` writes the new
+    operator into it in one launch, so the graph replays. It is refreshed on every use, whether the
+    operator changed or not, which is what keeps it right under in-place rewrites and under two
+    live operators of one shape alternating. The first operator of a shape keeps a state of its
+    own as above, so an operator solved once, or a single hoisted one, pays no copy.
+
     Two solves against one state must run on one stream, as every caller here does.
     """
-    key = (
+    config = (
         n_columns,
         float(tol),
         int(maxiter),
@@ -2196,12 +2270,47 @@ def _cached_solver(
         preconditioner,
         settle,
         narrow_values,
-        id(matrix.offsets),
-        id(matrix.columns),
-        id(matrix.values),
     )
+    key = (*config, id(matrix.offsets), id(matrix.columns), id(matrix.values))
     entries = _SOLVER_CACHE.setdefault(matrix, {})
     state = entries.pop(key, None)
+    if state is None and pooled and _poolable(matrix, preconditioner):
+        n = int(matrix.nrow)
+        fold = kernel_cg.cg_layout(n, CG_FOLD_MAX_BLOCKS)[2]
+        shape = (
+            *config,
+            n,
+            int(matrix.offsets.shape[0]),
+            int(matrix.columns.shape[0]),
+            int(matrix.values.shape[0]),
+            _row_path(matrix, n, fold),
+            str(matrix.device),
+        )
+        if shape in _SHAPES_SEEN:
+            pooled_state = _SOLVER_POOL.pop(shape, None)
+            if pooled_state is None:
+                solution = twt.empty_2d((n_columns, n), wp.float64, device=matrix.device)
+                pooled_state = _BatchedCg(
+                    matrix,
+                    None,
+                    solution,
+                    tol=tol,
+                    maxiter=maxiter,
+                    check_every=check_every,
+                    preconditioner=preconditioner,
+                    settle=settle,
+                    narrow_values=narrow_values,
+                    own_storage=True,
+                )
+            else:
+                pooled_state.refresh(matrix)
+            while len(_SOLVER_POOL) >= _SOLVER_POOL_ENTRIES:
+                _SOLVER_POOL.pop(next(iter(_SOLVER_POOL)))
+            _SOLVER_POOL[shape] = pooled_state
+            return pooled_state
+        if len(_SHAPES_SEEN) >= _SHAPES_SEEN_ENTRIES:
+            _SHAPES_SEEN.clear()
+        _SHAPES_SEEN.add(shape)
     if state is None:
         n = int(matrix.nrow)
         solution = twt.empty_2d((n_columns, n), matrix.values.dtype, device=matrix.device)
@@ -2221,6 +2330,51 @@ def _cached_solver(
     # Re-inserted last, so the eviction above drops the least recently used.
     entries[key] = state
     return state
+
+
+# ``_cached_solver``'s pooled states, one per operator shape and configuration, least recently
+# used first, and the shapes it has seen once (``_SHAPES_SEEN``), which a second fresh operator of
+# the same shape then pools on. Both bounded: a pooled state holds a copy of its operator.
+_SOLVER_POOL: dict[tuple[Any, ...], _BatchedCg] = {}
+_SOLVER_POOL_ENTRIES = 8
+_SHAPES_SEEN: set[tuple[Any, ...]] = set()
+_SHAPES_SEEN_ENTRIES = 256
+
+
+def _poolable(matrix: wps.BsrMatrix[Any], preconditioner: str) -> bool:
+    """Whether ``_BatchedCg.refresh`` can rebuild everything a state derives from ``matrix``."""
+    return (
+        matrix.values.dtype == wp.float64
+        and preconditioner in ("diag", "chebyshev")
+        and int(matrix.nrow) > 0
+    )
+
+
+def _row_path(matrix: wps.BsrMatrix[Any], n: int, fold: bool) -> tuple[bool, int]:
+    """
+    ``_BatchedCg``'s mat-vec path for ``matrix``: whether it takes ``bsr_mv``, and at what tile.
+
+    ``bsr_mv`` (see ``CG_HEAVY_ROW_ENTRIES``) is decided on the true entry count -- ``nnz`` is a
+    capacity -- and only for a column too long to fold: below that a round is bound by its
+    launches, and one ``bsr_mv`` a column plus a dots launch lose to the one fused launch (measured
+    0.91-0.94x on ``smooth_region``'s three-column, twenty-entry-a-row systems). One four-byte
+    read for a column that does not fold.
+    """
+    entries = read_scalar(matrix.offsets, n) if n > 0 and not fold else 0
+    heavy = entries > CG_HEAVY_ROW_ENTRIES * n
+    return heavy, _HEAVY_ROW_TILE if entries > _HEAVY_ROW_TILED_ENTRIES * n else -1
+
+
+def _owned_copy(matrix: wps.BsrMatrix[Any]) -> wps.BsrMatrix[Any]:
+    """Build a ``BsrMatrix`` over copies of ``matrix``'s arrays, for a pooled state to own."""
+    owned = wps.bsr_zeros(
+        int(matrix.nrow), int(matrix.ncol), matrix.values.dtype, device=matrix.device
+    )
+    owned.offsets = wp.clone(matrix.offsets)
+    owned.columns = wp.clone(matrix.columns)
+    owned.values = wp.clone(matrix.values)
+    owned.notify_nnz_changed(nnz=int(matrix.nnz))
+    return owned
 
 
 def _storage_alias(matrix: wps.BsrMatrix[Any]) -> wps.BsrMatrix[Any]:
@@ -2279,6 +2433,109 @@ def bsr_with_values(matrix: wps.BsrMatrix[Any], values: wp.array[Any]) -> wps.Bs
     result.row_counts = matrix.row_counts
     result.notify_nnz_changed(nnz=int(matrix.nnz))
     return result
+
+
+# ``block_diag``'s results, keyed weakly by the first operator of the stack.
+_BLOCK_DIAG_CACHE: weakref.WeakKeyDictionary[
+    Any, dict[tuple[int, ...], tuple[tuple[Any, ...], wps.BsrMatrix[wp.float64]]]
+] = weakref.WeakKeyDictionary()
+
+
+def block_diag(matrices: Sequence[wps.BsrMatrix[Any]]) -> wps.BsrMatrix[wp.float64]:
+    """
+    Stack square sparse operators into one block-diagonal ``float64`` operator.
+
+    The operator ``scipy.sparse.block_diag`` builds. Its use here is to solve several independent
+    systems as one: a single conjugate-gradient iteration over the stack advances every block at
+    once, in the launches of one solve rather than several, and stops when the slowest block does.
+    A ``wp.mat22d`` operator enters as its scalar expansion over interleaved unknowns -- the memory
+    of a ``wp.vec2d`` array viewed as ``float64`` -- so a tangent-field system and scalar systems
+    stack together.
+
+    The result is **kept per set of operators**: a later call with the same operators, over the
+    same storage, returns the same matrix, so a solve against it replays its recorded loop (see
+    [`solve_spd`][triwarp.linalg.solve_spd]). The stack is a copy, so values rewritten in place
+    in one of ``matrices`` afterwards do not reach it.
+
+    Parameters
+    ----------
+    matrices
+        One or more square operators, ``float64`` or ``wp.mat22d`` blocks, on one device.
+
+    Returns
+    -------
+    warp.sparse.BsrMatrix
+        ``float64`` operator whose row count is the sum of the blocks' scalar row counts, in the
+        order given.
+
+    Raises
+    ------
+    ValueError
+        If ``matrices`` is empty, or holds an operator that is not square or has another block type.
+    RuntimeError
+        If ``matrices`` are not all on one device.
+
+    See Also
+    --------
+    [`solve_spd_settled`][triwarp.linalg.solve_spd_settled]
+    [`replicated_operator`][triwarp.linalg.replicated_operator]
+    """
+    require_same_device(matrices=list(matrices))
+    if len(matrices) == 0:
+        raise ValueError("block_diag needs at least one operator")
+    for matrix in matrices:
+        if matrix.values.dtype not in (wp.float64, wp.mat22d) or matrix.nrow != matrix.ncol:
+            raise ValueError(
+                "block_diag stacks square float64 or wp.mat22d operators, got a "
+                f"{matrix.nrow} x {matrix.ncol} operator of {matrix.values.dtype}"
+            )
+    identity = tuple(
+        i
+        for matrix in matrices
+        for i in (id(matrix.offsets), id(matrix.columns), id(matrix.values))
+    )
+    entries = _BLOCK_DIAG_CACHE.setdefault(matrices[0], {})
+    cached = entries.get(identity)
+    if cached is not None:
+        return cached[1]
+    blocks = [
+        _scalar_expansion(matrix) if matrix.values.dtype == wp.mat22d else matrix
+        for matrix in matrices
+    ]
+    device = blocks[0].device
+    n_rows = sum(int(block.nrow) for block in blocks)
+    capacity = sum(int(block.values.shape[0]) for block in blocks)
+    descriptors = []
+    for block in blocks:
+        descriptor = kernel_linalg.CsrBlock()
+        descriptor.offsets = block.offsets
+        descriptor.columns = block.columns
+        descriptor.values = block.values
+        descriptor.n_rows = int(block.nrow)
+        descriptors.append(descriptor)
+    offsets = wp.empty(n_rows + 1, dtype=wp.int32, device=device)
+    columns = wp.empty(capacity, dtype=wp.int32, device=device)
+    values = wp.empty(capacity, dtype=wp.float64, device=device)
+    if n_rows == 0:
+        offsets.zero_()
+    else:
+        wp.launch(
+            kernel_linalg.stack_block_diagonal,
+            dim=n_rows,
+            inputs=[wp.array(descriptors, dtype=kernel_linalg.CsrBlock, device=device)],
+            outputs=[offsets, columns, values],
+            device=device,
+        )
+    stacked = wps.bsr_zeros(n_rows, n_rows, wp.float64, device=device)
+    stacked.offsets = offsets
+    stacked.columns = columns
+    stacked.values = values
+    # A capacity, as the blocks' own counts are: the offsets bound every row.
+    stacked.notify_nnz_changed(nnz=capacity)
+    # The entry holds every block's arrays, so the identities in its key cannot be reused.
+    held = tuple((matrix.offsets, matrix.columns, matrix.values) for matrix in matrices)
+    entries[identity] = (held, stacked)
+    return stacked
 
 
 def replicated_operator(
@@ -2672,6 +2929,51 @@ class SquaredLaplacianPreconditioner:
         )
         self._narrowed: tuple[wp.array[wp.float32], wp.array[wp.float32]] | None = None
 
+    @classmethod
+    def from_factors(
+        cls,
+        factor: wps.BsrMatrix[wp.float64],
+        factor_t: wps.BsrMatrix[wp.float64],
+        ratios: wp.array[wp.float64],
+        narrowed: tuple[wp.array[wp.float32], wp.array[wp.float32]] | None = None,
+    ) -> SquaredLaplacianPreconditioner:
+        """
+        Build the preconditioner from a caller-assembled ``M_ff = D⁻¹ L`` and its transpose.
+
+        For a caller that writes the factor while assembling its system, as
+        ``smoothing.smooth_region``'s normal equations do: the constructor's copy, row scaling,
+        transpose and Gershgorin reduction are then work already done.
+
+        Parameters
+        ----------
+        factor
+            ``(n, n)`` ``D⁻¹ L``, ``float64``.
+        factor_t
+            Its transpose, ``float64``. It may share ``factor``'s pattern, holding explicit zeros.
+        ratios
+            Length-``n`` ``sum_j |L_ij| / D_i``, ``0`` for an empty row: what the constructor's
+            ``scaled_row_abs_sums`` writes.
+        narrowed
+            ``factor``'s and ``factor_t``'s values in ``float32``, when the caller wrote them
+            too; otherwise ``narrowed()``
+            casts them on first use.
+
+        Returns
+        -------
+        SquaredLaplacianPreconditioner
+            Hand to [`solve_spd_columns`][triwarp.linalg.solve_spd_columns] as ``preconditioner=``.
+        """
+        self = cls.__new__(cls)
+        self._n = int(factor.nrow)
+        self._device = factor.values.device
+        self._factor = factor
+        self._factor_t = factor_t
+        self._steps = _device_chebyshev_steps(
+            ratios, SQUARED_LAPLACIAN_INTERVAL, SQUARED_LAPLACIAN_DEGREE, squared=True
+        )
+        self._narrowed = narrowed
+        return self
+
     def bind(self, n_columns: int, stride: int) -> _SquaredLaplacianApply:
         """Working vectors for ``n_columns`` blocks at column pitch ``stride``."""
         return _SquaredLaplacianApply(self, n_columns, stride)
@@ -2791,12 +3093,12 @@ class _JacobiChebyshev:
         # otherwise cost.
         self._matrix = matrix
         self._inverse_diagonal = wp.empty(self._n, dtype=wp.float64, device=self._device)
-        ratios = twt.empty_1d(self._n, wp.float64, device=self._device)
+        self.ratios = twt.empty_1d(self._n, wp.float64, device=self._device)
         wp.launch(
             kernel_linalg.jacobi_dominance_rows,
             dim=self._n,
             inputs=[matrix.offsets, matrix.columns, matrix.values],
-            outputs=[self._inverse_diagonal, ratios],
+            outputs=[self._inverse_diagonal, self.ratios],
             device=self._device,
         )
         # Gershgorin's discs for ``D⁻¹ A`` are centred on 1 with radius ``r_i = sum_j |A_ij| /
@@ -2810,7 +3112,13 @@ class _JacobiChebyshev:
         # 1 - r), 1 + r]`` with ``r = max(max_i r_i, 1e-3)``, computed on the device
         # (``_device_chebyshev_steps``).
         self._steps = _device_chebyshev_steps(
-            ratios, CHEBYSHEV_INTERVAL, CHEBYSHEV_DEGREE, squared=False
+            self.ratios, CHEBYSHEV_INTERVAL, CHEBYSHEV_DEGREE, squared=False
+        )
+
+    def refit(self) -> None:
+        """Refit the steps, in place, to ``ratios`` as a pooled state's ``refresh`` rewrote them."""
+        _device_chebyshev_steps(
+            self.ratios, CHEBYSHEV_INTERVAL, CHEBYSHEV_DEGREE, squared=False, out=self._steps
         )
 
     def bind(self, n_columns: int, stride: int) -> _JacobiChebyshevApply:
@@ -2825,6 +3133,11 @@ class _JacobiChebyshevApply(_ChebyshevApply):
         super().__init__(owner._n, n_columns, stride, owner._steps, owner._device)
         self._owner = owner
         self._scaled = wp.zeros(self._dofs, dtype=wp.float64, device=self._device)
+
+    @property
+    def owner(self) -> _JacobiChebyshev:
+        """The operator-side half, which a pooled state's ``refresh`` rewrites."""
+        return self._owner
 
     @property
     def inverse_diagonal(self) -> wp.array[wp.float64]:
@@ -2861,7 +3174,12 @@ class _JacobiChebyshevApply(_ChebyshevApply):
 
 
 def _device_chebyshev_steps(
-    ratios: wp.array[wp.float64], interval: float, degree: int, *, squared: bool
+    ratios: wp.array[wp.float64],
+    interval: float,
+    degree: int,
+    *,
+    squared: bool,
+    out: wp.array[wp.vec4d] | None = None,
 ) -> wp.array[wp.vec4d]:
     """
     Fit a degree-``degree`` Chebyshev semi-iteration's steps on the device.
@@ -2870,7 +3188,7 @@ def _device_chebyshev_steps(
     ``kernels/linalg.chebyshev_steps`` fits the interval and writes one ``(scale, previous_scale,
     momentum, step)`` per launch of the polynomial, so building a preconditioner reads nothing
     back. ``squared`` picks the squared-Laplacian interval over the Jacobi-Chebyshev one; see
-    that kernel for both.
+    that kernel for both. ``out``, when given, is written in place of a new array.
     """
     device = ratios.device
     n = int(ratios.shape[0])
@@ -2883,7 +3201,7 @@ def _device_chebyshev_steps(
             block_dim=TILE_1D,
             device=device,
         )
-    steps = wp.empty(degree - 1, dtype=wp.vec4d, device=device)
+    steps = wp.empty(degree - 1, dtype=wp.vec4d, device=device) if out is None else out
     wp.launch(
         kernel_linalg.chebyshev_steps,
         dim=1,

@@ -9,6 +9,7 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import read_scalar, require_nonempty_mesh, require_same_device
+from triwarp.kernels import adjacency as kernel_adjacency
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import intersection as kernel_intersections
 from triwarp.kernels import triangles as kernel_triangles
@@ -81,14 +82,7 @@ def is_edge_manifold(
     if n_faces == 0:
         return True
 
-    if edges_sorted is None:
-        edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
-    if n_vertices is None:
-        # One reduction, not two: the packing's range check would re-derive a bound this call
-        # already took from the same indices, so only its negative half is informative.
-        n_vertices = tw.array.index_bound(faces, require_non_negative=validate)
-        validate = False
-    keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices, validate=validate)
+    keys = _manifold_edge_keys(faces, edges_sorted, n_vertices, validate)
     return not _edge_share_count_violated(keys, allow_boundary_edges)
 
 
@@ -175,14 +169,7 @@ def edge_manifold_mask(
     if n_faces == 0:
         return wp.empty(0, dtype=wp.bool, device=device)
 
-    if edges_sorted is None:
-        edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
-    if n_vertices is None:
-        # One reduction, not two: the packing's range check would re-derive a bound this call
-        # already took from the same indices, so only its negative half is informative.
-        n_vertices = tw.array.index_bound(faces, require_non_negative=validate)
-        validate = False
-    keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices, validate=validate)
+    keys = _manifold_edge_keys(faces, edges_sorted, n_vertices, validate)
     _, inverse, counts = tw.grouping.unique_1d(keys, return_inverse=True, return_counts=True)
 
     out_mask = wp.empty(n_faces, dtype=wp.bool, device=device)
@@ -193,6 +180,40 @@ def edge_manifold_mask(
         device=device,
     )
     return out_mask
+
+
+def _manifold_edge_keys(
+    faces: wp.array[wp.int32],
+    edges_sorted: twt.Array2dInt32 | None,
+    n_vertices: int | None,
+    validate: bool,
+) -> wp.array[wp.uint64]:
+    """
+    Packed undirected key of every halfedge, for the two edge-manifold predicates.
+
+    Without ``edges_sorted`` and past the range check, one launch writes the keys straight from
+    the faces (``adjacency.face_edge_keys``) -- the keys ``faces_to_edges(sorted=True)`` plus
+    ``hash_indices_rows`` produce, without the ``(3F, 2)`` rows between them.
+    """
+    if n_vertices is None:
+        # One reduction, not two: the packing's range check would re-derive a bound this call
+        # already took from the same indices, so only its negative half is informative.
+        n_vertices = tw.array.index_bound(faces, require_non_negative=validate)
+        validate = False
+    if edges_sorted is None and not validate:
+        n_faces = int(faces.shape[0]) // 3
+        keys = wp.empty(3 * n_faces, dtype=wp.uint64, device=faces.device)
+        wp.launch(
+            kernel_adjacency.face_edge_keys,
+            dim=n_faces,
+            inputs=[faces, wp.uint64(n_vertices)],
+            outputs=[keys],
+            device=faces.device,
+        )
+        return keys
+    if edges_sorted is None:
+        edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
+    return tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices, validate=validate)
 
 
 def is_vertex_manifold(

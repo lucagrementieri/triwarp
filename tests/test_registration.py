@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 import numpy as np
 import open3d as o3d
 import pymeshlab as ml
@@ -1244,10 +1246,13 @@ def test_nearest_into_matches_query_nearest(device: str) -> None:
     """
     Triwarp against triwarp: the ICP loop's hoisted nearest search against ``query_nearest``.
 
-    Both ICP loops issue ``query_nearest``'s ``k = 1`` BVH launch themselves, into buffers they
-    allocate once, so the two must agree exactly; ``query_nearest`` carries the oracle in
-    ``tests/test_neighbors.py``. The queries sit both on and well off the cloud so the deepening
-    search takes more than its first radius on some rows.
+    Both ICP loops issue ``query_nearest``'s ``k = 1`` BVH-backend launch themselves, over the
+    collapsed-triangle mesh and into buffers they allocate once, so the two must agree exactly;
+    ``query_nearest`` carries the oracle in ``tests/test_neighbors.py``. The distances must also
+    equal a radius-deepening walk over a caller's ``wp.Bvh`` to the bit, which is the search the
+    loops used before. The queries sit both on and well off the cloud so that walk takes more than
+    its first radius on some rows. The step-applying variant is checked against moving the
+    queries first and searching from there.
     """
     rng = np.random.default_rng(21)
     target_np = rng.standard_normal((400, 3)).astype(np.float32)
@@ -1263,11 +1268,25 @@ def test_nearest_into_matches_query_nearest(device: str) -> None:
         wp.empty((200, 1), dtype=wp.float32, device=device),
     )
     tw.registration._nearest_into(target_wp, queries_wp, target_index, rows)
-    index_wp, distance_wp = tw.neighbors.query_nearest(target_wp, queries_wp, 1, **target_index)
+    index_wp, distance_wp = tw.neighbors.query_nearest(target_wp, queries_wp, 1, backend="bvh")
+    _walk_index_wp, walk_distance_wp = tw.neighbors.query_nearest(
+        target_wp, queries_wp, 1, accelerator=tw.neighbors.bvh_from_points(target_wp)
+    )
 
     assert np.array_equal(rows[0].numpy()[:, 0], index_wp.numpy())
     assert np.array_equal(rows[1].numpy()[:, 0], distance_wp.numpy())
+    assert np.array_equal(rows[1].numpy()[:, 0], walk_distance_wp.numpy())
     assert np.unique(index_wp.numpy()).shape[0] > 100
+
+    step_np = np.eye(4, dtype=np.float32)
+    step_np[:3, 3] = (0.3, -0.2, 0.1)
+    step_wp = wp.array([wp.mat44(*step_np.ravel())], dtype=wp.mat44, device=device)
+    moved_wp = wp.empty(200, dtype=wp.vec3, device=device)
+    tw.registration._nearest_into(target_wp, queries_wp, target_index, rows, step_wp, moved_wp)
+    assert np.allclose(moved_wp.numpy(), queries_np + step_np[:3, 3], atol=1e-6)
+    index_wp, distance_wp = tw.neighbors.query_nearest(target_wp, moved_wp, 1, backend="bvh")
+    assert np.array_equal(rows[0].numpy()[:, 0], index_wp.numpy())
+    assert np.array_equal(rows[1].numpy()[:, 0], distance_wp.numpy())
 
 
 @pytest.mark.parametrize(
@@ -1409,6 +1428,48 @@ def test_icp_point_to_plane_tukey_all_weights_zero(device: str) -> None:
     # zeroed accumulator would otherwise read as a perfect fit.
     assert np.allclose(matrix_wp.numpy()[0], np.eye(4), atol=1e-6)
     assert not np.isfinite(cost_tw)
+
+
+def test_icp_point_to_plane_convergence_stop_matches_the_host_rule(device: str) -> None:
+    """
+    Not a library comparison: the device loop's convergence break against the host's rule.
+
+    The iterations after the first run as one recorded device loop whose ``dim=1`` round kernel
+    applies ``old_cost - cost < threshold`` itself. Iteration ``i`` tests the objective at the pose
+    after ``i`` steps, which is exactly the ``cost`` a call pinned to ``i`` iterations returns, so
+    the pinned costs ``c(0), c(1), ...`` give the host's answer: the loop stops after the solve of
+    the first ``i >= 1`` with ``c(i - 1) - c(i) < threshold``, i.e. it returns the pinned
+    ``i + 1``-iteration result -- to the bit on the CPU device, where the accumulation is serial.
+    Non-vacuity: that stop lies strictly between the first iterations and the cap. Mutation probe:
+    scaling the kernel's threshold by 0.1 moves the stop and fails the comparison.
+    """
+    rng = np.random.default_rng(23)
+    target_np = rng.standard_normal((100, 3)).astype(np.float32) * 2.0
+    normals_np = target_np / np.linalg.norm(target_np, axis=1, keepdims=True)
+    source_np = (target_np + np.array([0.5, 0.25, -0.15], dtype=np.float32)).astype(np.float32)
+    call = partial(
+        tw.registration.icp_point_to_plane,
+        points_to_warp(source_np, device),
+        points_to_warp(target_np, device),
+        None,
+        target_normals=points_to_warp(normals_np, device),
+        robust_kernel="tukey",
+        robust_scale=0.2,
+    )
+    threshold, cap = 1e-2, 30
+    pinned = [call(max_iterations=count, threshold=-np.inf) for count in range(cap + 1)]
+    costs = [result[2] for result in pinned]
+    stop = next(i for i in range(1, cap) if costs[i - 1] - costs[i] < threshold)
+    assert 2 < stop + 1 < cap
+    matrix_wp, transformed_wp, cost = call(max_iterations=cap, threshold=threshold)
+    expected_matrix_wp, expected_transformed_wp, expected_cost = pinned[stop + 1]
+    if wp.get_device(device).is_cuda:
+        assert np.allclose(matrix_wp.numpy(), expected_matrix_wp.numpy(), atol=1e-5)
+        assert np.isclose(cost, expected_cost, rtol=1e-4)
+    else:
+        assert np.array_equal(matrix_wp.numpy(), expected_matrix_wp.numpy())
+        assert np.array_equal(transformed_wp.numpy(), expected_transformed_wp.numpy())
+        assert cost == expected_cost
 
 
 def test_icp_point_to_plane_rejects_an_off_menu_robust_kernel(device: str) -> None:

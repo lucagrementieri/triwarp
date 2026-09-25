@@ -578,6 +578,63 @@ def test_solver_cache_keys_on_the_operator(device: str, monkeypatch: pytest.Monk
         )
 
 
+@pytest.mark.parametrize("kind", ["diag", "chebyshev"])
+def test_pooled_solver_state_follows_each_operator(
+    device: str, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """
+    Class A, against ``numpy.linalg.solve``: operators of one shape share a pooled state correctly.
+
+    A fresh operator of a shape already solved is copied into a kept state of that shape rather
+    than recorded (``linalg._cached_solver``), so the claims are that three operators alternating
+    through it each get their own answer -- a state that kept the previous operator's values or
+    preconditioner would converge to that operator's system -- that a value rewritten in place is
+    seen on the next solve, and that no solve after the first two records a graph. The
+    Jacobi-Chebyshev arm also refits the polynomial on the device. The one-block gate is lowered
+    so these small systems reach the cache.
+    """
+    monkeypatch.setattr(tw.linalg, "CG_ONE_BLOCK_MAX_ROWS", 0)
+    systems = [_spd_system(device, n_rhs=1, seed=seed) for seed in (31, 32, 33)]
+
+    def solve(matrix_wp: wps.BsrMatrix, rhs_wp: wp.array) -> np.ndarray:
+        solution_wp = wp.zeros(int(rhs_wp.shape[1]), dtype=wp.float64, device=device)
+        preconditioner = None
+        if kind == "chebyshev":
+            preconditioner = tw.linalg.chebyshev_preconditioner(matrix_wp)
+        tw.linalg.solve_spd(
+            matrix_wp, twt.as_dense(rhs_wp[0]), solution_wp, preconditioner=preconditioner
+        )
+        return solution_wp.numpy()
+
+    for matrix_wp, rhs_wp, _dense_np, _rhs_np in systems[:2]:
+        solve(matrix_wp, rhs_wp)
+    captures = 0
+    enter = wp.ScopedCapture.__enter__
+
+    def counting_enter(self: wp.ScopedCapture) -> wp.ScopedCapture:
+        nonlocal captures
+        captures += 1
+        return enter(self)
+
+    monkeypatch.setattr(wp.ScopedCapture, "__enter__", counting_enter)
+    for matrix_wp, rhs_wp, dense_np, rhs_np in systems + systems:
+        expected_np = np.linalg.solve(dense_np, rhs_np[0])
+        assert np.allclose(solve(matrix_wp, rhs_wp), expected_np, rtol=1e-6, atol=1e-6)
+    matrix_wp, rhs_wp, dense_np, rhs_np = systems[2]
+    matrix_wp.values.assign(2.0 * matrix_wp.values.numpy())
+    expected_np = np.linalg.solve(2.0 * dense_np, rhs_np[0])
+    assert np.allclose(solve(matrix_wp, rhs_wp), expected_np, rtol=1e-6, atol=1e-6)
+    if wp.get_device(device).is_cuda and wp.is_conditional_graph_supported():
+        assert captures == 0
+    if kind == "chebyshev":
+        # The refit is a rate, not a fixed point, so the answers above cannot see it: compare the
+        # pooled polynomial with the one a new state would fit to the last operator.
+        pooled = list(tw.linalg._SOLVER_POOL.values())[-1]
+        fresh = tw.linalg._JacobiChebyshev(matrix_wp)._steps.numpy()
+        assert isinstance(pooled._cycle, tw.linalg._JacobiChebyshevApply)
+        assert np.array_equal(pooled._cycle.owner._steps.numpy(), fresh)
+
+
 def test_solver_cache_does_not_outlive_its_operator(
     device: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1243,6 +1300,62 @@ def test_chebyshev_preconditioner_needs_far_fewer_iterations(device: str) -> Non
             preconditioner=name,
         )[0]
     assert counts["chebyshev"] * 4 < counts["diag"], counts
+
+
+def test_block_diag_matches_scipy(device: str) -> None:
+    """
+    Class A, against ``scipy.sparse.block_diag`` of the same operators written out densely.
+
+    The stack mixes a ``wp.mat22d`` operator -- entering as its scalar expansion over interleaved
+    unknowns -- with two scalar ones, one of them a duplicate-accumulating triplet build whose
+    ``nnz`` is a stale capacity (CLAUDE.md 3.7): a stack sized off that field would place the
+    second block's rows at the wrong entries. A repeated call returns the same matrix, which is what
+    lets a solve against it replay its recorded loop.
+    """
+    rng = np.random.default_rng(29)
+    n_blocks = 6
+    dense_block_np = rng.standard_normal((2 * n_blocks, 2 * n_blocks))
+    blocks_np = dense_block_np.reshape(n_blocks, 2, n_blocks, 2).transpose(0, 2, 1, 3)
+    rows_np, cols_np = np.meshgrid(np.arange(n_blocks), np.arange(n_blocks), indexing="ij")
+    vector_wp = wps.bsr_from_triplets(
+        n_blocks,
+        n_blocks,
+        wp.array(rows_np.ravel().astype(np.int32), dtype=wp.int32, device=device),
+        wp.array(cols_np.ravel().astype(np.int32), dtype=wp.int32, device=device),
+        wp.array(np.ascontiguousarray(blocks_np.reshape(-1, 2, 2)), dtype=wp.mat22d, device=device),
+    )
+    n = 9
+    rows = rng.integers(0, n, 40).astype(np.int32)
+    cols = rng.integers(0, n, 40).astype(np.int32)
+    vals = rng.standard_normal(40)
+    scalar_wp = wps.bsr_from_triplets(
+        n,
+        n,
+        wp.array(rows, dtype=wp.int32, device=device),
+        wp.array(cols, dtype=wp.int32, device=device),
+        wp.array(vals, dtype=wp.float64, device=device),
+    )
+    # Duplicates, so the triplet build's ``nnz`` really is a capacity.
+    assert len(set(zip(rows.tolist(), cols.tolist(), strict=True))) < rows.shape[0]
+    scalar_np = sp.coo_matrix((vals, (rows, cols)), shape=(n, n)).toarray()
+
+    stacked_wp = tw.linalg.block_diag((vector_wp, scalar_wp, scalar_wp))
+
+    expected_np = sp.block_diag((dense_block_np, scalar_np, scalar_np)).toarray()
+    assert stacked_wp.nrow == expected_np.shape[0]
+    assert np.allclose(
+        bsr_to_dense(stacked_wp, expected_np.shape[0]), expected_np, rtol=1e-12, atol=1e-12
+    )
+    assert tw.linalg.block_diag((vector_wp, scalar_wp, scalar_wp)) is stacked_wp
+
+
+def test_block_diag_rejects_a_rectangular_operator(device: str) -> None:
+    """Not a library comparison: a rectangular block has no place on a diagonal."""
+    rectangular_wp = wps.bsr_zeros(3, 4, wp.float64, device=device)
+    with pytest.raises(ValueError, match="square"):
+        tw.linalg.block_diag((rectangular_wp,))
+    with pytest.raises(ValueError, match="at least one"):
+        tw.linalg.block_diag(())
 
 
 @pytest.mark.parametrize("n_columns", [1, 3])

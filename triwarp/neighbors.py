@@ -93,6 +93,51 @@ def bvh_from_points(points: wp.array[wp.vec3], leaf_size: int = 4) -> wp.Bvh:
     return wp.Bvh(points, points, leaf_size=leaf_size)
 
 
+def mesh_from_points(points: wp.array[wp.vec3]) -> wp.Mesh:
+    """
+    Build a ``warp.Mesh`` over ``points`` whose triangles each collapse onto one point.
+
+    Its closest-face query is then a nearest-point query: the closest point of a triangle whose
+    three corners coincide is that corner, so ``wp.mesh_query_point_no_sign`` returns the nearest
+    point's index as its face. This is the tree
+    [`query_nearest`][triwarp.neighbors.query_nearest] answers ``k = 1`` with under
+    ``backend="bvh"``, and its cost follows the tree's depth rather than how far a query sits from
+    the cloud.
+
+    Parameters
+    ----------
+    points
+        ``(n, 3)`` positions as ``wp.vec3``, ``n >= 1``. The mesh aliases them rather than copying,
+        so do not mutate them while it is in use.
+
+    Returns
+    -------
+    warp.Mesh
+        Mesh of ``n`` degenerate triangles, triangle ``i`` on ``points[i]``.
+
+    Raises
+    ------
+    ValueError
+        If ``points`` is empty: a ``warp.Mesh`` with no triangles corrupts the CUDA allocator.
+
+    See Also
+    --------
+    [`bvh_from_points`][triwarp.neighbors.bvh_from_points]
+    """
+    n = int(points.shape[0])
+    if n == 0:
+        raise ValueError("mesh_from_points needs at least one point")
+    corners = wp.empty(3 * n, dtype=wp.int32, device=points.device)
+    wp.launch(
+        kernel_neighbors.point_triangle_indices, dim=3 * n, inputs=[corners], device=points.device
+    )
+    # ``lbvh``: the other constructors build this tree several times slower, for no faster query.
+    # One triangle per leaf: a leaf test here is Warp's full closest-point-on-triangle routine on a
+    # triangle that is one point, so every extra primitive in a leaf is wasted arithmetic: one per
+    # leaf is the fastest query, for a build no slower and the same distances.
+    return wp.Mesh(points=points, indices=corners, bvh_constructor="lbvh", bvh_leaf_size=1)
+
+
 def hashgrid_from_points(
     points: wp.array[wp.vec3], radius: float, grid_bins: int = 128
 ) -> wp.HashGrid:
@@ -447,8 +492,9 @@ def query_ball(
         Grid resolution when building a hash grid. Ignored under ``backend="bvh"`` and whenever
         ``accelerator`` is given.
     leaf_size
-        Maximum primitives per leaf when building a BVH. Ignored under ``backend="hashgrid"`` and
-        whenever ``accelerator`` is given.
+        Maximum primitives per leaf when building a BVH. Ignored under ``backend="hashgrid"``,
+        whenever ``accelerator`` is given, and at ``k == 1``, where the tree is a
+        [`mesh_from_points`][triwarp.neighbors.mesh_from_points].
     return_sorted
         If ``True``, neighbors within each query are ordered by increasing distance. If ``False``,
         order follows the broad phase's traversal (undefined ordering).
@@ -930,7 +976,10 @@ def query_nearest(
 
         ``"bvh"`` has no cell width to get wrong, so it is the one to reach for when the query scale
         is unknown, the cloud is non-uniform, or the queries sit outside it. Its own cost grows
-        with ``k`` faster than the grid's, so at small ``k`` the grid tends to win.
+        with ``k`` faster than the grid's, so at small ``k`` the grid tends to win. At ``k == 1``
+        with no ``accelerator`` it is not a radius search at all but a closest-point query over
+        [`mesh_from_points`][triwarp.neighbors.mesh_from_points], whose cost does not grow with the
+        queries' distance from the cloud.
 
         **But at moderate ``k`` the tree can win on a perfectly uniform cloud too, which is not what
         "an awkward one" suggests.** The grid's cost is *non-monotonic* in cloud size at moderate
@@ -978,7 +1027,8 @@ def query_nearest(
         not only a shortcut**: it also fixes the per-query radius at which a scan is provably
         complete, so a box that does not contain ``points`` can end the search early and leave
         slots unfilled (``-1`` and ``inf``) rather than merely running slower. Pass the real
-        bounding box, or leave it ``None``.
+        bounding box, or leave it ``None``. Neither this nor ``initial_radius`` is read by the
+        ``k == 1`` BVH-backend query without an ``accelerator``, which has no radius to deepen.
 
     Returns
     -------
@@ -1031,16 +1081,31 @@ def query_nearest(
     if m == 0 or n == 0:
         return _empty_nearest(m, k, single_query, device)
 
+    # ``wp.empty``, not ``wp.full``: every row is written in full by the kernel, so pre-filling
+    # here would be two wasted launches.
+    neighbor_indices = twt.empty_2d((m, k), wp.int32, device=device)
+    neighbor_distances = twt.empty_2d((m, k), wp.float32, device=device)
+    if kind == "bvh" and k == 1 and resolved is None:
+        # One nearest point is a closest-point query over the collapsed-triangle mesh: its descent
+        # needs no radius to deepen, so neither the bounding box nor the density estimate (two
+        # reductions and their readbacks) is computed, and a query far off the cloud costs what an
+        # on-surface one does. The distances are the radius search's to the bit. A caller's
+        # ``wp.Bvh`` cannot take this path, since the query needs a ``wp.Mesh``.
+        mesh = mesh_from_points(points)
+        wp.launch(
+            kernel_neighbors.query_nearest_via_mesh,
+            dim=m,
+            inputs=[mesh.id, points, queries, wp.float32(max_radius)],
+            outputs=[neighbor_indices, neighbor_distances],
+            device=device,
+        )
+        return _shape_nearest(neighbor_indices, neighbor_distances, k, single_query)
+
     if bounds is None:
         bounds = tw.bounds.aabb(points)
     min_bound, max_bound = bounds
     if initial_radius is None:
         initial_radius = knn_initial_radius(points, k, bounds=bounds)
-
-    # ``wp.empty``, not ``wp.full``: every row is written in full by the kernel, so pre-filling
-    # here would be two wasted launches.
-    neighbor_indices = twt.empty_2d((m, k), wp.int32, device=device)
-    neighbor_distances = twt.empty_2d((m, k), wp.float32, device=device)
     search = [points, queries]
     shared = [wp.int32(k), wp.float32(max_radius), wp.float32(initial_radius)]
     outputs = [neighbor_indices, neighbor_distances]
@@ -1111,18 +1176,13 @@ def _finish_deferred_nearest(
     # The one sync the k = 1 path adds, and it decides whether a whole-cloud build is needed.
     if int(read_scalar(deferred, 0)) == 0:
         return
-    device = points.device
-    n = int(points.shape[0])
-    corners = wp.empty(3 * n, dtype=wp.int32, device=device)
-    wp.launch(kernel_neighbors.point_triangle_indices, dim=3 * n, inputs=[corners], device=device)
-    # ``lbvh``: the other constructors build this tree several times slower, for no faster query.
-    mesh = wp.Mesh(points=points, indices=corners, bvh_constructor="lbvh")
+    mesh = mesh_from_points(points)
     wp.launch(
         kernel_neighbors.nearest_point_via_mesh,
         dim=int(queries.shape[0]),
         inputs=[mesh.id, points, queries, wp.float32(max_radius)],
         outputs=[neighbor_indices, neighbor_distances],
-        device=device,
+        device=points.device,
     )
 
 

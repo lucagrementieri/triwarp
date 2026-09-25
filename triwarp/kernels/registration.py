@@ -1,5 +1,6 @@
 import warp as wp
 
+from triwarp.kernels.array import LOOP_CONDITION, LOOP_ROUND, LOOP_STATE_SIZE
 from triwarp.kernels.predicates import normalize_or_zero
 from triwarp.kernels.proximity import write_closest_point_query
 from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, block_chunk_1d, block_sum, commit_block_sum
@@ -40,6 +41,10 @@ PROCRUSTES_ACC_SIZE = 26
 ICP_COST = wp.constant(0)  # sum robust_loss(r); see ``robust_weight_and_loss``
 ICP_WEIGHT_SUM = wp.constant(1)  # sum w
 ICP_SCALAR_ACC_SIZE = 2
+# ``icp_point_to_plane``'s device-loop state: the shared round and condition slots of
+# ``kernels/array.py``, and a third recording that the loop stopped because nothing carried weight.
+ICP_LOOP_WEIGHTLESS = wp.constant(wp.int32(LOOP_STATE_SIZE))
+ICP_LOOP_STATE_SIZE = LOOP_STATE_SIZE + 1
 
 
 @wp.func
@@ -592,7 +597,7 @@ def accumulate_point_to_plane(
     # the fold has enough to amortize.
     #
     # The tree is the *more* accurate arm on every component, which matters here because ``out_jtj``
-    # is the matrix ``solve_point_to_plane`` factorizes.
+    # is the matrix ``point_to_plane_round`` factorizes.
     i, lane = wp.tid()
     offset, remaining = block_chunk_1d(source.shape[0], i)
     if remaining <= 0:
@@ -701,28 +706,44 @@ def solve_spd6(a: wp.spatial_matrix, b: wp.spatial_vector) -> wp.spatial_vector:
 
 
 @wp.kernel
-def solve_point_to_plane(
-    jtj: wp.array[wp.spatial_matrix],
-    jtr: wp.array[wp.spatial_vector],
+def point_to_plane_round(
     damping: wp.float32,
-    total: wp.array[wp.mat44],
-    out_step: wp.array[wp.mat44],
+    threshold: wp.float64,
+    max_iterations: wp.int32,
+    out_jtj: wp.array[wp.spatial_matrix],
+    out_jtr: wp.array[wp.spatial_vector],
+    out_scalars: wp.array[wp.float32],
     out_total: wp.array[wp.mat44],
-    out_next_jtj: wp.array[wp.spatial_matrix],
-    out_next_jtr: wp.array[wp.spatial_vector],
-    out_next_scalars: wp.array[wp.float32],
+    out_old_cost: wp.array[wp.float64],
+    out_step: wp.array[wp.mat44],
+    out_state: wp.array[wp.int32],
 ) -> None:
     """
-    Solve the linearized point-to-plane system, build the step and compose it into the transform.
+    Close one ``icp_point_to_plane`` iteration on the device and decide whether another runs.
 
-    ``dim=1``, and it is also the iteration's bookkeeping, which is why it takes three buffers it
-    only zeroes: the loop ping-pongs two accumulator sets, and zeroing the *next* iteration's set
-    here costs three stores where three memsets on the host cost three API calls per iteration.
-    ``out_total = out_step * total`` into the other half of a second ping-pong is the running
-    transform the separate one-element ``wp.mul`` launch used to fold -- same product, same order.
+    ``dim=1``. The host loop's whole per-iteration tail -- the weightless test, the 6x6 solve, the
+    composition into the running transform and the convergence test -- so that the loop body is a
+    fixed sequence ``_device.run_device_loop`` can record once and replay, with no readback:
+
+    - **weightless**: no correspondence carried weight, so nothing is solved; ``out_state``
+      records it (``ICP_LOOP_WEIGHTLESS``) and stops the loop, and the host reports ``inf``;
+    - otherwise the damped system is solved, ``out_step`` written, ``out_total`` composed in place
+      (``step * total``, the product and order the host ping-pong formed) and the accumulators
+      zeroed for the next iteration -- after they are read, by this one thread, so no memset;
+    - the loop continues while fewer than ``max_iterations`` have run and, past the first, the
+      cost fell by at least ``threshold``. The test is the host's ``old_cost - cost < threshold``
+      in ``float64``, where the host held both costs as Python floats of the ``float32`` values.
+
+    Every ``out_`` argument but ``out_step`` is loop state, read *and* rewritten every round; they
+    wear the prefix as ``kernels/array.loop_advance``'s ``out_state`` does.
     """
-    a = jtj[0]
-    b = jtr[0]
+    if out_scalars[ICP_WEIGHT_SUM] <= wp.float32(0.0):
+        out_state[ICP_LOOP_WEIGHTLESS] = 1
+        out_state[LOOP_CONDITION] = 0
+        return
+    cost = wp.float64(out_scalars[ICP_COST])
+    a = out_jtj[0]
+    b = out_jtr[0]
 
     # Levenberg-style diagonal damping, scaled by the mean diagonal magnitude,
     # keeps the system positive-definite for planar / rank-deficient targets.
@@ -741,11 +762,11 @@ def solve_point_to_plane(
 
     step = make_affine44(rot, tvec)
     out_step[0] = step
-    out_total[0] = wp.mul(step, total[0])
+    out_total[0] = wp.mul(step, out_total[0])
 
-    out_next_jtj[0] = wp.spatial_matrix(wp.float32(0.0))
+    out_jtj[0] = wp.spatial_matrix(wp.float32(0.0))
     # Longhand for the reason ``solve_spd6`` gives: ``wp.spatial_vector`` has no broadcast fill.
-    out_next_jtr[0] = wp.spatial_vector(
+    out_jtr[0] = wp.spatial_vector(
         wp.float32(0.0),
         wp.float32(0.0),
         wp.float32(0.0),
@@ -754,4 +775,11 @@ def solve_point_to_plane(
         wp.float32(0.0),
     )
     for slot in range(ICP_SCALAR_ACC_SIZE):
-        out_next_scalars[slot] = wp.float32(0.0)
+        out_scalars[slot] = wp.float32(0.0)
+
+    iteration = out_state[LOOP_ROUND]
+    converged = iteration > 0 and out_old_cost[0] - cost < threshold
+    out_old_cost[0] = cost
+    out_state[LOOP_ROUND] = iteration + 1
+    keep_going = not converged and iteration + 1 < max_iterations
+    out_state[LOOP_CONDITION] = wp.where(keep_going, wp.int32(1), wp.int32(0))

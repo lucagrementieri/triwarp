@@ -66,14 +66,15 @@ delta on a *fixed* mesh, not the absolute time. Two things the two targets do sa
 
 * The **mesh** target is the faster of the two, because it rides Warp's built-in
   ``wp.mesh_query_point_no_sign`` and never touches the k-NN path at all.
-* The **point-cloud** target is within a small factor of it, and is only so because
-  [`query_nearest`][triwarp.neighbors.query_nearest] deepens iteratively from a density estimate
-  and the target's BVH, bounds and radius are hoisted out of the loop. With ``max_radius=inf`` it
-  clamps the query cube to the scene diagonal instead, the BVH prunes nothing, and the search costs
-  one to two orders of magnitude more -- enough to lose to open3d's serial ``KDTreeFlann`` rather
-  than to beat it. The residual gap to the mesh target is per-iteration ``procrustes`` latency, not
-  the search, which is why ``icp_point_to_plane``, whose iteration has no ``procrustes`` call,
-  lands between the two.
+* The **point-cloud** target searches the target's
+  [`mesh_from_points`][triwarp.neighbors.mesh_from_points] -- a ``wp.Mesh`` whose triangles each
+  collapse onto one target point -- with the same closest-point descent, built once per call and
+  hoisted out of the loop. Its cost does not grow with how far the source sits off the target,
+  which the radius-deepening BVH walk it replaced did: that walk was most of every iteration at
+  these misalignments, and the swap alone is worth 1.1-4.4x on the point-to-point rows.
+* ``icp_point_to_plane`` runs its iterations after the first as one recorded device loop
+  (``_device.run_device_loop``), so its rows carry no per-iteration readback; ``icp`` still reads
+  its cost back every iteration for its ``procrustes`` fit.
 """
 
 from __future__ import annotations

@@ -13,11 +13,11 @@ The module's other half, the batched conjugate-gradient iteration that solves th
 assembles, lives in ``triwarp.kernels.algorithms.conjugate_gradient``.
 
 !!! note
-    ``smoothing``'s ``dirichlet_system_triplets`` / ``laplacian_ls_triplets`` are deliberately
-    *not* merged in here. They look similar but solve a different problem: they **build** the
-    operator ``A = D - W`` from a weight CSR (plus a stabilizer, with a reserved diagonal slot per
-    row), whereas these kernels **extract** the free-free block of an operator that already exists.
-    Routing them through here would force an extra full matrix build.
+    ``smoothing``'s region assembly (``dirichlet_system_values`` / ``least_squares_rows`` /
+    ``normal_equations_*``) is deliberately *not* merged in here. It looks similar but solves a
+    different problem: it **builds** the operator from per-edge weights over a region's own
+    pattern, whereas these kernels **extract** the free-free block of an operator that already
+    exists. Routing it through here would force an extra full matrix build.
 """
 
 from typing import Any
@@ -297,6 +297,47 @@ def jacobi_inverse_diagonal(
 
 
 @wp.kernel
+def refresh_pooled_operator(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.float64],
+    narrow: wp.int32,
+    derive: wp.int32,
+    out_offsets: wp.array[wp.int32],
+    out_columns: wp.array[wp.int32],
+    out_values: wp.array[wp.float64],
+    out_narrowed: wp.array[wp.float32],
+    out_inverse_diagonal: wp.array[wp.float64],
+    out_ratio: wp.array[wp.float64],
+) -> None:
+    # One thread per row: copy a scalar CSR operator into a pooled conjugate-gradient state's own
+    # storage (``linalg._cached_solver``) and re-derive, from the same walk of the row, what the
+    # state derived from its operator when it was built -- the ``float32`` copy of the values the
+    # rounds read (``narrow``), the Jacobi inverse diagonal (``derive >= 1``) and the Gershgorin
+    # ratio the Jacobi-Chebyshev interval is fitted to (``derive == 2``). Each is the same
+    # arithmetic as the kernel that built it (``jacobi_inverse_diagonal`` /
+    # ``jacobi_dominance_rows``), so a refreshed state holds what a new one would. The arrays a
+    # flag leaves off may be ``None``. The last thread also writes the terminating offset.
+    i = wp.int32(wp.tid())
+    start = offsets[i]
+    end = offsets[i + 1]
+    out_offsets[i] = start
+    if i == out_offsets.shape[0] - 2:
+        out_offsets[i + 1] = end
+    for e in range(start, end):
+        value = values[e]
+        out_columns[e] = columns[e]
+        out_values[e] = value
+        if narrow != 0:
+            out_narrowed[e] = wp.float32(value)
+    if derive != 0:
+        diagonal, off_sum = csr_row_diagonal(offsets, columns, values, i)
+        out_inverse_diagonal[i] = inverse_or_one(diagonal)
+        if derive == 2:
+            out_ratio[i] = dominance_ratio(diagonal, off_sum)
+
+
+@wp.kernel
 def scaled_row_abs_sums(
     offsets: wp.array[wp.int32],
     values: wp.array[wp.float64],
@@ -345,6 +386,49 @@ def expand_block_csr_2x2(
                 out_values[row_start + 2 * e + b] = block[a, b]
     if i == offsets.shape[0] - 2:
         out_offsets[2 * i + 2] = 4 * offsets[i + 1]
+
+
+@wp.struct
+class CsrBlock:
+    """One diagonal block of ``stack_block_diagonal``: a square scalar ``float64`` CSR."""
+
+    offsets: wp.array[wp.int32]
+    columns: wp.array[wp.int32]
+    values: wp.array[wp.float64]
+    n_rows: wp.int32
+
+
+@wp.kernel
+def stack_block_diagonal(
+    blocks: wp.array[CsrBlock],
+    out_offsets: wp.array[wp.int32],
+    out_columns: wp.array[wp.int32],
+    out_values: wp.array[wp.float64],
+) -> None:
+    # One thread per row of the block-diagonal stack of ``blocks``, copying its block's row with
+    # the columns shifted by the rows above it. Each block's stored count is its own last offset,
+    # read here rather than off ``nnz`` (a capacity, CLAUDE.md 3.7), so a row's start needs no
+    # scan and no readback: a handful of blocks, a handful of reads. The last thread also writes
+    # the terminating offset.
+    r = wp.int32(wp.tid())
+    row_base = wp.int32(0)
+    entry_base = wp.int32(0)
+    b = wp.int32(0)
+    while r - row_base >= blocks[b].n_rows:
+        entry_base += blocks[b].offsets[blocks[b].n_rows]
+        row_base += blocks[b].n_rows
+        b += 1
+    block = blocks[b]
+    i = r - row_base
+    start = block.offsets[i]
+    end = block.offsets[i + 1]
+    destination = entry_base + start
+    out_offsets[r] = destination
+    for e in range(end - start):
+        out_columns[destination + e] = block.columns[start + e] + row_base
+        out_values[destination + e] = block.values[start + e]
+    if r == out_offsets.shape[0] - 2:
+        out_offsets[r + 1] = entry_base + end
 
 
 @wp.kernel

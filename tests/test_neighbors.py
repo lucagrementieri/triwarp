@@ -39,6 +39,31 @@ from tests.conversions import (
 from triwarp.kernels import neighbors as kernel_neighbors
 
 
+def test_mesh_from_points_answers_the_nearest_point(device: str) -> None:
+    """
+    Class A against ``KDTree``: the collapsed-triangle mesh's closest face is the nearest point.
+
+    Reached through ``query_nearest(k=1, backend="bvh")``, whose search the mesh is. Queries sit
+    up to a cloud diameter off the cloud, which is the regime the mesh descent exists for; the face
+    index is the point index, so indices are compared as well as distances. The empty cloud
+    raises rather than building a triangle-free ``wp.Mesh`` (``.claude/CLAUDE.md`` section 12.1).
+    """
+    rng = np.random.default_rng(3)
+    points = rng.random((500, 3), dtype=np.float32)
+    queries = np.ascontiguousarray(rng.random((80, 3), dtype=np.float32) * 3.0 - 1.0)
+    points_wp = points_to_warp(points, device)
+    mesh = tw.neighbors.mesh_from_points(points_wp)
+    assert np.array_equal(mesh.indices.numpy(), np.arange(3 * points.shape[0]) // 3)
+    distances_kd, indices_kd = KDTree(points).query(queries)
+    indices_wp, distances_wp = tw.neighbors.query_nearest(
+        points_wp, points_to_warp(queries, device), k=1, backend="bvh"
+    )
+    assert np.array_equal(indices_wp.numpy(), indices_kd)
+    assert np.allclose(distances_wp.numpy(), distances_kd, rtol=1e-5, atol=1e-5)
+    with pytest.raises(ValueError, match="at least one point"):
+        tw.neighbors.mesh_from_points(points_to_warp(np.zeros((0, 3), np.float32), device))
+
+
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
 def test_query_ball_single(device: str, backend: Literal["bvh", "hashgrid"]):
     rng = np.random.default_rng(0)
@@ -910,6 +935,36 @@ def test_query_nearest_ties(device: str, backend: Literal["bvh", "hashgrid"], k:
     assert np.allclose(gathered, query_distances_np, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
+def test_query_nearest_exact_duplicates_answer_a_nearest(
+    device: str, backend: Literal["bvh", "hashgrid"]
+) -> None:
+    """
+    Class B against ``KDTree`` (reduction: which copy of a duplicated point wins is unspecified).
+
+    Every point is stored twice, so every ``k = 1`` query ties exactly between two indices. The
+    three ``k = 1`` searches break that tie differently -- the BVH-backend mesh query takes
+    whichever collapsed triangle its descent reaches first -- and all of them are correct, so the
+    claim pinned is that the index returned is *a* nearest: one of the two copies of ``KDTree``'s
+    answer, at exactly the distance reported. Queries on the cloud and a cloud diameter off it.
+    """
+    rng = np.random.default_rng(21)
+    base = rng.random((300, 3), dtype=np.float32)
+    points = np.ascontiguousarray(np.vstack([base, base]))
+    queries = np.ascontiguousarray(
+        np.vstack([rng.random((50, 3)), rng.random((50, 3)) + 1.0]), dtype=np.float32
+    )
+    indices_wp, distances_wp = tw.neighbors.query_nearest(
+        points_to_warp(points, device), points_to_warp(queries, device), k=1, backend=backend
+    )
+    distances_kd, indices_kd = KDTree(base).query(queries)
+    indices_np = indices_wp.numpy()
+    assert np.array_equal(indices_np % base.shape[0], indices_kd)
+    assert np.allclose(distances_wp.numpy(), distances_kd, rtol=1e-5, atol=1e-5)
+    gathered = np.linalg.norm(points[indices_np] - queries, axis=-1)
+    assert np.allclose(gathered, distances_wp.numpy(), rtol=1e-6, atol=1e-6)
+
+
 def test_knn_sorted_insert_rejects_nan_instead_of_writing_past_its_row(device: str):
     """
     Not a library comparison: no reference can observe an out-of-bounds kernel write.
@@ -1260,6 +1315,23 @@ def test_the_two_backends_agree(device: str) -> None:
     idx_grid, dist_grid = tw.neighbors.query_nearest(points_wp, queries_wp, k=5, backend="hashgrid")
     assert np.array_equal(idx_bvh.numpy(), idx_grid.numpy())
     assert np.allclose(dist_bvh.numpy(), dist_grid.numpy(), rtol=1e-5, atol=1e-5)
+
+    # ``k = 1`` has three searches -- the grid (deferring far rows to the collapsed-triangle mesh),
+    # the BVH backend's mesh query, and a caller's ``wp.Bvh`` walked by radius deepening -- and
+    # every one computes the distance as ``wp.length`` of the same difference, so they agree to the
+    # bit. The shifted queries sit off the cloud, where the grid defers and the walk deepens.
+    shifted_wp = points_to_warp(rng.random((60, 3)) + 1.5, device)
+    for queries in (queries_wp, shifted_wp):
+        answers = [
+            tw.neighbors.query_nearest(points_wp, queries, k=1, backend="bvh"),
+            tw.neighbors.query_nearest(points_wp, queries, k=1, backend="hashgrid"),
+            tw.neighbors.query_nearest(
+                points_wp, queries, k=1, accelerator=tw.neighbors.bvh_from_points(points_wp)
+            ),
+        ]
+        for indices, distances in answers[1:]:
+            assert np.array_equal(indices.numpy(), answers[0][0].numpy())
+            assert np.array_equal(distances.numpy(), answers[0][1].numpy())
 
 
 @pytest.mark.parity(
