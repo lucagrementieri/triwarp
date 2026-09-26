@@ -101,7 +101,17 @@ def delaunay_triangulation(points: wp.array[wp.vec2], max_iter: int = 1000) -> w
 
     faces = wp.array(np.ascontiguousarray(faces_np.reshape(-1)), dtype=wp.int32, device=device)
 
-    def launch(adjacency, adjacency_edges, unshared, sorted_keys, key_base, out_flip, out_quad):
+    def launch(
+        adjacency,
+        adjacency_edges,
+        unshared,
+        sorted_keys,
+        edge_set,
+        edge_set_mask,
+        key_base,
+        out_flip,
+        out_quad,
+    ):
         wp.launch(
             kernel_remesh.incircle_flip_candidates,
             dim=int(adjacency.shape[0]),
@@ -112,6 +122,8 @@ def delaunay_triangulation(points: wp.array[wp.vec2], max_iter: int = 1000) -> w
                 adjacency_edges,
                 unshared,
                 sorted_keys,
+                edge_set,
+                edge_set_mask,
                 key_base,
                 out_flip,
                 out_quad,

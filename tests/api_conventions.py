@@ -469,6 +469,10 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     ),
     ("energies", "scatter_edge_halfedges"): frozenset({"cursor"}),
     ("repair", "emit_degree3_replacement"): frozenset({"cursor"}),
+    # The flip loop's incremental state, carried across rounds and kept current by the commit that
+    # rewrites the faces: the row <-> halfedge maps and the tracked valences. Neither an input nor
+    # the answer (the answer is the face buffer), so they keep the names of what they hold.
+    ("remesh", "commit_flips"): frozenset({"halfedge_row", "row_halfedges", "valence"}),
     ("repair", "emit_straighten_faces"): frozenset({"cursor"}),
     # ``counter`` and ``overflow`` are the work list the capped first pass hands the tiled second
     # one -- scratch, not the answer.

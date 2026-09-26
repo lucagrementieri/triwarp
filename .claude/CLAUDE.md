@@ -6748,7 +6748,7 @@ level alone or has identical counts and device time in both arms (next paragraph
 
 - **`radix_sort_pairs(end_bit=)` is the cheapest lever found this round** (§13.1). Taken where a
   packed key's radix is known: the flip loop's regroup (**88 -> 55 us a replay** on
-  `tangle_torus_small`, 134 -> 108 on `tangle_torus`; §20.3's lead is priced and closed below),
+  `tangle_torus_small`, 134 -> 108 on `tangle_torus`; the regroup itself is gone since, §16.24),
   `sorted_undirected_edge_keys`, the deleted-face keys, the voxel buckets, the candidate-triangle
   keys, and `unique_1d(max_value=)` -- a new public keyword `edges_unique`, `unique_faces`,
   `cluster_decimate`, `split_nonmanifold`'s labels and `submeshes_from_face_groups` pass. The pair
@@ -6806,3 +6806,57 @@ Python-scope gather (`wp.indexedarray`) passes straight to a kernel parameter an
 `wp.indexedarray[T]`, removing the gather copy when the consumer only reads; `wp.copy`'s offsets on
 a contiguous rank-2 array count scalar elements, not rows; and `.numpy()` on a strided column view
 is one readback plus an internal contiguous copy.
+
+### 16.24 The flip loop keeps its adjacency instead of regrouping (2026-09-26)
+
+Round 20's open lead, priced at 11-15 % of `fix_self_intersections` and built on request. Every
+`_flip_interior_edges` round used to end in a whole-mesh regroup (a key launch, a radix sort, a
+mark, a scan, an emit); now only the first flipping round does, and that regroup also builds the
+incremental state every later round -- the recorded ones -- runs on. **Byte-identical on CPU**
+against `9612307` over 46 outputs of every flip entry point (`flip_to_delaunay` whole and region,
+`flip_by_objective` x3, `isotropic_remesh`, `subdivide_region_to_size`, `refine_region_to_density`,
+`flip_t_vertices`, `fix_self_intersections`, `delaunay_triangulation`), also with the rebuild
+budget forced to 7 flips; on CUDA the only differences are `isotropic_remesh`'s two run-to-run
+outcomes, which the baseline alternates between too. Harness, one process per module, min of 3:
+`delaunay_triangulation` 1.26-1.44x, `flip_by_objective` 1.12-1.37x, `flip_to_delaunay` 1.20-1.22x,
+`fix_self_intersections(local)` 1.10x / 1.16x, `refill_region[lucy refined]` 1.38x,
+`fill_smooth[rim_short refined]` 1.14x; `subdivide_region_to_size[None]` at parity (0.97-0.99x).
+
+**Three things make it byte-identical, and the first is the one that is not obvious:**
+
+- **The claims rank candidates by edge key, not row index** (`kernel_remesh.flip_priority`,
+  `uint64` `atomic_min`, which works on both devices). A regroup emits rows in ascending key order,
+  so the smallest row index *was* the smallest key: the winners are the same whatever order the
+  rows are in, which is what frees each edge to keep its row.
+- **Rows are rebuilt from maintained halfedges, not patched.** `commit_flips` keeps a
+  halfedge -> row and a row -> halfedges map current (each side edge of a flipped quad keeps its row
+  and moves to a new halfedge of one of the two rewritten faces), and `refresh_flip_rows` rewrites
+  every row through the same `write_flip_row` the emit uses. Patching a row's face and apex columns
+  in place instead races: a side edge's two faces can belong to two different committing flips.
+  Moving a halfedge is race-free because each flip only writes the column holding its own face's
+  halfedge, and the other column can never equal it.
+- **The duplicate-edge guard reads a hashed key set** (`grouping.hash_find_or_insert` plus a new
+  `key_set_remove` tombstone) once the sort is stale, and the sorted keys before
+  (`kernel_remesh.edge_key_exists`, a warp-uniform selector on the mask). Inserts claim only empty
+  slots, so an insert racing a remove in one launch is safe; tombstones only accumulate, and
+  `_FlipTopology.flipped` rebuilds once the flips since the last build could fill the table past
+  three quarters. `valence` rides the commit too (one edge moves from `a`, `c` to `b`, `d`).
+
+**The first cut regressed the short calls, and the census found why at every step.** Built with
+the state eager -- set seeded, maps written, a refresh every round -- `subdivide_region_to_size`
+read 0.86-0.93x: its flip calls run one round that flips little, so the machinery was pure cost
+(+3 launches, +11 allocations, +1.2 ms of device time at `sphere_large` from zeroing and filling a
+2n-slot table). Making the key set lazy took it to 0.94-0.96x; refreshing an issued round only when
+it flipped and passing `None` / the sort buffer as the inactive state took the launch count level;
+and **starting plain and taking the incremental build as the regroup after the first flipping
+round** removed the rest, so a call that flips at most once costs exactly what it did. The general
+form: **an incremental structure that replaces a per-round rebuild should be built by the rebuild
+it replaces, the first time one is needed** -- not up front, where the calls that never iterate pay
+for it. `edges_unique` re-sorts only (the rows, maps and set are current), rather than rebuilding.
+
+A flip loop on `icosphere(4)` jittered by 0.3 of an edge oscillates at one flip a round to its
+iteration cap, in the baseline too (`[354, 163, 55, 16, 6, 1, 1, ...]` over 50 rounds) -- a
+pre-existing cycle, not this change; `test_flip_topology_incremental_state_matches_a_fresh_build`
+uses `icosphere(3)` at the same jitter (79, 28, 9, 1 flips past the plain round), which is the
+smallest fixture found that exercises the incremental rounds at all -- at a jitter of 0.02 every
+flip happens in the plain round and the test passed a no-op `refresh`.

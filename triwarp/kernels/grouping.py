@@ -200,6 +200,22 @@ def hash_find(key: wp.Int, slot_key: wp.array[wp.Int], mask: wp.int32) -> wp.int
     return h
 
 
+# A deleted slot of a ``hash_find_or_insert`` table used as a *set* with removal: never ``0`` (the
+# empty sentinel) and never an encoded key, since ``encode_key`` of every non-negative ``int64`` key
+# stays below it. ``hash_find`` probes past it and ``hash_find_or_insert`` claims only empty slots,
+# so an insert racing a removal in one launch is safe; the cost is that tombstones only accumulate,
+# and the owner rebuilds the table before they fill it.
+KEY_SET_TOMBSTONE = wp.constant(wp.uint64(0xFFFFFFFFFFFFFFFF))
+
+
+@wp.func
+def key_set_remove(key: wp.uint64, slot_key: wp.array[wp.uint64], mask: wp.int32) -> None:
+    """Delete ``key`` from a ``hash_find_or_insert`` set, leaving a tombstone; absent is a no-op."""
+    h = hash_find(key, slot_key, mask)
+    if h >= 0:
+        slot_key[h] = KEY_SET_TOMBSTONE
+
+
 @wp.kernel
 def hash_insert(
     data: wp.array[wp.Int],

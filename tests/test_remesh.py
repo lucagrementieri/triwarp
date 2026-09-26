@@ -1946,8 +1946,9 @@ def test_flip_topology_matches_the_composed_adjacency(
     [`face_adjacency_unshared`][triwarp.adjacency.face_adjacency_unshared] and a second
     [`sort_and_argsort`][triwarp.array.sort_and_argsort] of the edge keys, and builds all three on
     fixed buffers instead — a measured 1.5-2.6x. That is only sound while the two agree row for
-    row, including the row *order*, which the independent-set tie-break depends on. This is an
-    internal-consistency check, not a reference comparison, so it carries no parity marker.
+    row, including a fresh build's row *order* (ascending key, which is the order the
+    independent-set claims rank candidates in). This is an internal-consistency check, not a
+    reference comparison, so it carries no parity marker.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     faces = mesh_wp.indices
@@ -1970,6 +1971,79 @@ def test_flip_topology_matches_the_composed_adjacency(
     assert np.array_equal(topology.adjacency_edges.numpy(), adjacency_edges_ref.numpy())
     assert np.array_equal(topology.unshared.numpy(), unshared_ref.numpy())
     assert np.array_equal(topology.sorted_keys.numpy(), keys_ref.numpy())
+
+
+@pytest.mark.parametrize("flip_budget", [None, 7])
+def test_flip_topology_incremental_state_matches_a_fresh_build(
+    icosphere: tuple[tm.Trimesh, wp.Mesh], flip_budget: int | None
+) -> None:
+    """
+    Triwarp against triwarp: the flip loop's maintained topology against a rebuild of its output.
+
+    After the first flipping round the loop stops regrouping and keeps its rows, halfedge maps and
+    duplicate-edge set current through each commit. Whatever state it ends in must describe the
+    faces it ends with exactly as a fresh build of them does: the same rows (as a set -- the
+    maintained ones keep their slots rather than ascending key order), each row's halfedges on its
+    own two faces, every halfedge mapped to the row of its edge, and the key set holding exactly
+    the current edges. ``flip_budget=7`` forces the tombstone rebuild mid-loop.
+    """
+    mesh_tm, mesh_wp = icosphere
+    device = mesh_wp.device
+    rng = np.random.default_rng(11)
+    # Large enough that flips continue for several rounds past the plain first one (79, 28, 9 and
+    # 1 flips on ``icosphere``), which is where the incremental state is exercised at all.
+    jitter = rng.normal(scale=0.3 * mesh_tm.edges_unique_length.mean(), size=mesh_tm.vertices.shape)
+    vertices, faces = numpy_to_warp(mesh_tm.vertices + jitter, mesh_tm.faces, device)
+    n_vertices = len(mesh_tm.vertices)
+    region = wp.ones(int(faces.shape[0]) // 3, dtype=wp.int32, device=device)
+
+    topology = tw.remesh._FlipTopology(faces, n_vertices)
+    if flip_budget is not None:
+        topology._flip_budget = flip_budget
+    flips = tw.remesh._flip_region_faces(vertices, faces, region, None, None, 50, topology)
+    assert flips > 200
+    assert topology.incremental
+    halfedge_row = topology.halfedge_row
+    row_halfedges = topology.row_halfedges
+    assert halfedge_row is not None
+    assert row_halfedges is not None
+
+    fresh = tw.remesh._FlipTopology(faces, n_vertices)
+    fresh.rebuild(incremental=True)
+
+    def rows(t: tw.remesh._FlipTopology) -> np.ndarray:
+        return np.hstack([t.adjacency.numpy(), t.adjacency_edges.numpy(), t.unshared.numpy()])
+
+    assert np.array_equal(lexsort_rows(rows(topology)), lexsort_rows(rows(fresh)))
+
+    faces_np = faces.numpy().reshape(-1, 3)
+    row_halfedges_np = row_halfedges.numpy()
+    assert np.array_equal(np.sort(row_halfedges_np // 3, axis=1), topology.adjacency.numpy()), (
+        "a row's halfedges are not on its two faces"
+    )
+    tails = faces_np.reshape(-1)[row_halfedges_np]
+    heads = faces_np[row_halfedges_np // 3, (row_halfedges_np % 3 + 1) % 3]
+    assert np.array_equal(
+        np.sort(np.stack([tails[:, 0], heads[:, 0]], 1), axis=1), topology.adjacency_edges.numpy()
+    )
+
+    # Map each maintained row to the fresh row of the same edge, then compare the halfedge maps.
+    def key(edges_np: np.ndarray) -> np.ndarray:
+        return edges_np[:, 0].astype(np.int64) + edges_np[:, 1].astype(np.int64) * n_vertices
+
+    fresh_row_of_key = dict(
+        zip(key(fresh.adjacency_edges.numpy()).tolist(), range(fresh.rows), strict=True)
+    )
+    to_fresh = np.array([fresh_row_of_key[k] for k in key(topology.adjacency_edges.numpy())])
+    maintained = halfedge_row.numpy()
+    mapped = np.where(maintained >= 0, to_fresh[np.maximum(maintained, 0)], -1)
+    fresh_halfedge_row = fresh.halfedge_row
+    assert fresh_halfedge_row is not None
+    assert np.array_equal(mapped, fresh_halfedge_row.numpy())
+
+    slots = topology.edge_set.numpy()
+    live = slots[(slots != 0) & (slots != np.uint64(0xFFFFFFFFFFFFFFFF))] - np.uint64(1)
+    assert np.array_equal(np.sort(live), np.unique(fresh.sorted_keys.numpy()))
 
 
 def test_flip_topology_drops_non_manifold_edges_like_face_adjacency(device: str) -> None:

@@ -35,7 +35,7 @@ import warp.sparse as wps
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import read_scalar, require_nonempty_mesh, require_same_device
-from triwarp.constants import INT32_MAX, INT64_MAX, TOLERANCE_MOLLIFY
+from triwarp.constants import INT64_MAX, TOLERANCE_MOLLIFY, UINT64_MAX
 from triwarp.kernels import adjacency as kernel_adjacency
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import remesh as kernel_remesh
@@ -49,7 +49,9 @@ _LaunchCandidates = Callable[
         twt.Array2dInt32,  # adjacency (m, 2)
         twt.Array2dInt32,  # adjacency_edges (m, 2)
         twt.Array2dInt32,  # unshared (m, 2)
-        "wp.array[wp.uint64]",  # sorted edge keys
+        "wp.array[wp.uint64]",  # sorted edge keys of the last build
+        "wp.array[wp.uint64]",  # edge-key set (grouping.hash_find_or_insert table)
+        "wp.int32",  # edge-key set mask, -1 while the sorted keys are current
         "wp.uint64",  # key base (n_vertices)
         "wp.array[wp.bool]",  # out_flip (m,)
         twt.Array2dInt32,  # out_quad (m, 4)
@@ -645,20 +647,22 @@ def _valence_flip_pass(
     n_vertices = int(vertices.shape[0])
     _codes, boundary_vertex = _classify(vertices, faces, feature, incidence)
 
-    def launch(adjacency, adjacency_edges, unshared, sorted_keys, key_base, out_flip, out_quad):
-        # Valence is recomputed each pass because the faces are mutated in place -- but from
-        # ``sorted_keys``, which the topology rebuild that produced this call has just radix-sorted,
-        # rather than from a fresh ``edges_unique``. Both give the number of incident unique edges;
-        # the second would group the identical corner rows a *third* time (after ``_classify``, and
-        # after the rebuild's own sort) to reach a number the sorted buffer already carries.
-        valence = wp.zeros(n_vertices, dtype=wp.int32, device=device)
-        n_keys = int(sorted_keys.shape[0])
-        wp.launch(
-            kernel_scatter.scatter_valence_from_sorted_edge_keys,
-            dim=n_keys,
-            inputs=[sorted_keys, wp.int32(n_keys), key_base, valence],
-            device=device,
-        )
+    # Valence is the loop's own: seeded by its one build, from the keys that build radix-sorts,
+    # and kept current by every committed flip (a flip moves one edge from ``a``, ``c`` to ``b``,
+    # ``d``), rather than recounted from a re-sort each round.
+    valence = wp.empty(n_vertices, dtype=wp.int32, device=device)
+
+    def launch(
+        adjacency,
+        adjacency_edges,
+        unshared,
+        sorted_keys,
+        edge_set,
+        edge_set_mask,
+        key_base,
+        out_flip,
+        out_quad,
+    ):
         wp.launch(
             kernel_remesh.valence_flip_candidates,
             dim=int(adjacency.shape[0]),
@@ -669,6 +673,8 @@ def _valence_flip_pass(
                 adjacency_edges,
                 unshared,
                 sorted_keys,
+                edge_set,
+                edge_set_mask,
                 key_base,
                 valence,
                 boundary_vertex,
@@ -679,7 +685,7 @@ def _valence_flip_pass(
             device=device,
         )
 
-    return _flip_interior_edges(faces, n_vertices, launch, max_iter)
+    return _flip_interior_edges(faces, n_vertices, launch, max_iter, valence=valence)
 
 
 def _smooth_pass(
@@ -763,30 +769,35 @@ def _flip_interior_edges(
     launch_candidates: _LaunchCandidates,
     max_iter: int,
     topology: _FlipTopology | None = None,
+    valence: wp.array[wp.int32] | None = None,
 ) -> int:
     """
     Repeatedly flip an independent set of interior edges until none is a candidate.
 
-    ``faces`` is mutated in place. Each iteration rebuilds face adjacency, lets
-    ``launch_candidates`` mark flippable edges (predicate-specific), then commits a
-    conflict-free subset (no two committed flips touch a shared face or create the same new
-    edge). Returns the total number of flips performed. The winding rewrite matches
-    ``igl::flip_edge``.
+    ``faces`` is mutated in place. Each iteration lets ``launch_candidates`` mark flippable edges
+    (predicate-specific) and commits a conflict-free subset (no two committed flips touch a shared
+    face or create the same new edge). The first flipping round is followed by a regroup that also
+    builds ``_FlipTopology``'s incremental state; every later round refreshes the adjacency rows
+    from the halfedge maps the commit kept current instead of regrouping. Returns the total number
+    of flips performed. The winding rewrite matches ``igl::flip_edge``.
+
+    ``launch_candidates(adjacency, adjacency_edges, unshared, sorted_keys, edge_set, edge_set_mask,
+    key_base, out_flip, out_quad)`` receives the current rows and the current edge keys for the
+    duplicate-edge guard, which ``kernel_remesh.edge_key_exists`` reads: the last build's sorted
+    keys while ``edge_set_mask`` is ``-1``, and the hashed set once a flip has made the sort stale.
+    ``valence``, when given, is a per-vertex buffer the loop seeds with each vertex's unique-edge
+    count and keeps current across flips, for a predicate that reads it.
 
     [`intrinsic_delaunay`][triwarp.remesh.intrinsic_delaunay] does not use this engine: it carries
     an edge-length table beside the face buffer and needs to create a second edge between two
     already-adjacent vertices, which this loop's vertex-pair-keyed topology cannot represent. It
     drives its own halfedge-twin-based loop instead (see ``kernel_remesh.build_intrinsic_twins``).
 
-    The per-pass topology is built by ``_FlipTopology`` on fixed buffers rather than by composing
-    the public wrappers, which avoids rebuilding structure that does not change shape between
-    passes; see it for why.
-
     A caller may pass its own ``topology`` over this very ``faces`` buffer (and ``n_vertices``).
-    Either way it is left describing the face buffer as this call leaves it -- no round that
-    flipped ends without its regroup -- so the caller can read the sorted edge keys afterwards
-    (``_FlipTopology.edges_unique``) or hand the same object to the next call on the same buffer,
-    which then skips its opening build.
+    Either way it is left describing the face buffer as this call leaves it, so the caller can read
+    the unique edges afterwards (``_FlipTopology.edges_unique``, which re-sorts if a flip made the
+    sort stale) or hand the same object to the next call on the same buffer, which then skips its
+    opening build.
     """
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
@@ -798,19 +809,22 @@ def _flip_interior_edges(
     # The one readback of the row count. A committed flip trades one two-face edge for a new one
     # (the duplicate-edge guard every candidate kernel opens with rejects a flip whose new edge
     # already exists, and the claim table stops two flips creating the same one) and leaves the
-    # quad's four sides alone, so the interior-edge count is fixed from here on and every later
-    # rebuild regroups the same number of rows.
-    m = topology.rows if topology.built else topology.rebuild()
+    # quad's four sides alone, so the interior-edge count is fixed from here on and every row keeps
+    # describing one edge. A tracked valence is seeded by a build, so it forces one.
+    topology.valence = valence
+    m = topology.rows if topology.built and valence is None else topology.rebuild()
     if m == 0:
         return 0
 
-    def flip_round(progress: wp.array[wp.int32], *, regroup: bool = True) -> None:
-        """Mark, claim and commit one independent set of flips, then regroup for the next round."""
+    def flip_round(progress: wp.array[wp.int32], *, refresh: bool = True) -> None:
+        """Mark, claim and commit one independent set of flips, then refresh the rows they moved."""
         launch_candidates(
             topology.adjacency,
             topology.adjacency_edges,
             topology.unshared,
             topology.sorted_keys,
+            topology.edge_set,
+            wp.int32(topology.active_edge_set_mask),
             key_base,
             topology.flip,
             topology.quad,
@@ -828,8 +842,8 @@ def _flip_interior_edges(
         # code where a mistake silently changes which edges flip -- for one launch of a round's
         # dozen. The claim/commit pair below is not fusible at all (a commit must see every
         # claim).
-        topology.face_claim.fill_(INT32_MAX)
-        topology.edge_claim.fill_(INT32_MAX)
+        topology.face_claim.fill_(UINT64_MAX)
+        topology.edge_claim.fill_(UINT64_MAX)
         wp.launch(
             kernel_remesh.claim_flips,
             dim=m,
@@ -837,6 +851,7 @@ def _flip_interior_edges(
                 topology.flip,
                 topology.quad,
                 topology.adjacency,
+                topology.adjacency_edges,
                 wp.int32(topology.edge_claim_mask),
                 key_base,
                 topology.face_claim,
@@ -851,20 +866,27 @@ def _flip_interior_edges(
                 topology.flip,
                 topology.quad,
                 topology.adjacency,
+                topology.adjacency_edges,
                 topology.face_claim,
                 topology.edge_claim,
                 wp.int32(topology.edge_claim_mask),
                 key_base,
+                wp.int32(topology.active_edge_set_mask),
+                topology.row_halfedges,
+                topology.halfedge_row,
+                topology.edge_set,
+                valence,
                 faces,
                 progress,
             ],
             device=device,
         )
-        # Regrouped at the end of the round rather than the start, so the recorded body is one
-        # round and the host rebuild above serves the first; the last round's regroup is spare.
-        # An issued round leaves it to the caller, which regroups only if something flipped.
-        if regroup:
-            topology.rebuild(read_count=False)
+        # The commit kept the halfedge <-> row maps, the duplicate-edge set and the valences
+        # current, so the rows are rebuilt in place from them: one launch over the rows instead of
+        # a whole-mesh regroup (a key launch, a radix sort, a mark, a scan and an emit). An issued
+        # round leaves it to the caller, which refreshes only if something flipped.
+        if refresh:
+            topology.refresh()
 
     count = wp.zeros(1, dtype=wp.int32, device=device)
     graph = None
@@ -877,58 +899,74 @@ def _flip_interior_edges(
             # Every round is the same launch sequence over the same buffers -- only the face
             # buffer's contents change -- so a long call records one round and replays it, and a
             # round costs one graph launch rather than a dozen launches' worth of Python. Replayed
-            # from the host rather than under ``wp.capture_while``, which would also drop the
-            # per-round count read: the regroup's ``wp.utils.array_scan`` allocates scratch, and a
-            # conditional graph's body may not.
+            # from the host rather than under ``wp.capture_while``, because the host reads each
+            # round's count anyway: it is what tells ``topology.flipped`` when the duplicate-edge
+            # set's tombstones call for a rebuild.
             with wp.ScopedCapture(device) as capture:
                 count.zero_()
                 flip_round(count)
             graph = capture.graph
             wp.capture_launch(graph)
         else:
-            # An issued round reads its count before regrouping, so a round that flipped nothing --
-            # the common last round, and the only one a call at the fixpoint runs -- skips a regroup
-            # of a face buffer it did not change.
+            # An issued round reads its count before refreshing, so a round that flipped nothing --
+            # the common last round, and the only one a call at the fixpoint runs -- skips it.
             count.zero_()
-            flip_round(count, regroup=False)
+            flip_round(count, refresh=False)
             n = int(read_scalar(count, 0))
-            if n != 0:
-                topology.rebuild(read_count=False)
             total += n
             if n == 0:
                 break
+            if topology.incremental:
+                topology.refresh()
+                topology.flipped(n)
+            else:
+                # A plain build's first flipping round regroups, as every round once did, and that
+                # regroup builds the incremental state the later rounds -- the recorded ones --
+                # run on. A call that flips at most once never pays for it.
+                topology.rebuild(read_count=False, incremental=True)
             continue
         n = int(read_scalar(count, 0))
         total += n
         if n == 0:
             break
+        topology.flipped(n)
+    return total
     return total
 
 
 class _FlipTopology:
     """
-    Persistent per-pass working set of the parallel edge-flip loop.
+    Persistent working set of the parallel edge-flip loop.
 
-    The flip loop reruns the same topology build many times on a face buffer whose *shape* never
-    changes — a flip rewrites two triangles' corners and leaves the vertex, face and interior-edge
-    counts alone — so composing the public wrappers would pay for a fresh allocation chain every
-    pass. Every buffer here is instead allocated once and rewritten in place.
+    A flip rewrites two triangles' corners and leaves the vertex, face and interior-edge counts
+    alone, so every buffer here is allocated once and rewritten in place, and a long flip loop
+    maintains the face adjacency rather than rebuilding it every round.
 
-    The pass also needs its edge keys sorted only **once**, not twice: the same radix sort that
-    groups the interior-edge rows also produces the "would this flip duplicate an existing edge"
-    table the candidate predicates search, where composing the public wrappers would sort twice for
-    the same information. What remains per pass is one key launch, one sort, a run-length mark, a
-    scan and a single emit launch that writes the adjacency pairs, their shared-edge endpoints and
-    the opposite apexes together.
+    A build is one key launch, one radix sort, a run-length mark, a scan and a single emit that
+    writes the adjacency pairs, their shared-edge endpoints and the opposite apexes together. An
+    *incremental* build also keeps the two halfedges of each row in both directions and seeds the
+    set of every edge key, and from then on a flip round never regroups: ``commit_flips`` moves the
+    halfedges of the rows a flip touched, swaps the old diagonal's key for the new one in the set,
+    and ``refresh`` rewrites every row from its halfedges in one launch. The flip loop starts
+    plain and takes the incremental build as the regroup after its first flipping round, so a call
+    that flips at most once pays for none of it.
+
+    Each edge keeps its row, so the rows stop being in ascending key order after the first
+    incremental flip -- which no consumer depends on, since the independent-set claims rank
+    candidates by *key* (``kernel_remesh.flip_priority``) and the smallest key was exactly the
+    smallest row index of a fresh build. The loop is therefore byte-identical to one that regroups
+    every round. ``edges_unique`` needs the sort itself and re-sorts once if a flip made it stale.
+
+    The key set is a ``grouping.hash_find_or_insert`` table with tombstone deletes, sized at twice
+    the corner count. A delete never frees a slot, so ``flipped`` rebuilds everything once the flips
+    since the last build could have filled it past three quarters.
 
     [`intrinsic_delaunay`][triwarp.remesh.intrinsic_delaunay] uses this class for exactly one
-    build, not a per-round rebuild: its input is still a simplicial complex at that point, so the
-    vertex-pair key this class groups on is trustworthy, and the one build seeds an
-    incrementally-maintained halfedge twin table that the rest of its loop drives instead (see
-    ``kernel_remesh.build_intrinsic_twins``). A flip can make that key ambiguous, which is exactly
-    why nothing after the first round goes through a rebuild here.
+    build: its input is still a simplicial complex at that point, so the vertex-pair key this class
+    groups on is trustworthy, and the one build seeds an incrementally-maintained halfedge twin
+    table that the rest of its loop drives instead (see ``kernel_remesh.build_intrinsic_twins``).
 
-    Every intermediate is byte-identical to the composed path: the keys match
+    Every intermediate of a build is byte-identical to the composed path: the keys match
     [`hash_indices_rows`][triwarp.grouping.hash_indices_rows] over
     [`faces_to_edges`][triwarp.edges.faces_to_edges] rows (see
     [`face_edge_keys`][triwarp.kernels.adjacency.face_edge_keys]), and the scan reproduces the
@@ -938,25 +976,39 @@ class _FlipTopology:
     Attributes
     ----------
     sorted_keys : wp.array[wp.uint64]
-        Length ``3 * n_faces`` ascending undirected-edge keys of the current triangulation, which
-        the candidate predicates binary-search for the duplicate-edge guard.
+        Length ``3 * n_faces`` ascending undirected-edge keys as of the last build -- stale once a
+        flip commits (``edges_unique`` re-sorts first).
+    edge_set : wp.array[wp.uint64]
+        Every current undirected edge key, as a ``grouping.hash_find_or_insert`` set, for the
+        candidate predicates' duplicate-edge guard once an incremental build seeded it.
+    edge_set_mask : int
+        Power-of-two mask for ``edge_set`` slots.
     adjacency : twt.Array2dInt32
         ``(m, 2)`` ascending face pairs sharing an interior edge.
     adjacency_edges : twt.Array2dInt32
         ``(m, 2)`` sorted endpoints of each shared edge, row-aligned with ``adjacency``.
     unshared : twt.Array2dInt32
         ``(m, 2)`` apex of each incident face opposite the shared edge.
+    row_halfedges : twt.Array2dInt32 | None
+        ``(m, 2)`` the two halfedges (``3f + corner``) each row's edge is made of; ``None`` until an
+        incremental build.
+    halfedge_row : wp.array[wp.int32] | None
+        Length ``3 * n_faces`` row of each halfedge's edge, or ``-1`` for an edge that is not a
+        two-face interior edge; ``None`` until an incremental build.
     flip : wp.array[wp.bool]
         Length ``m`` candidate mask. Every predicate kernel opens by writing all of it, so it is
         deliberately not zeroed between passes.
     quad : twt.Array2dInt32
         ``(m, 4)`` flip quad ``(a, b, c, d)``, written only where ``flip`` is set.
-    face_claim : wp.array[wp.int32]
-        Length ``n_faces`` per-face winner of the independent-set round.
-    edge_claim : wp.array[wp.int32]
+    face_claim : wp.array[wp.uint64]
+        Length ``n_faces`` per-face winning key of the independent-set round.
+    edge_claim : wp.array[wp.uint64]
         Open-addressed claim table over the new edges, one slot per hashed key.
     edge_claim_mask : int
         Power-of-two mask for ``edge_claim`` slots.
+    valence : wp.array[wp.int32] | None
+        Per-vertex unique-edge count a build seeds and ``commit_flips`` keeps current, when the
+        loop's caller asked for one.
     """
 
     def __init__(self, faces: wp.array[wp.int32], n_vertices: int) -> None:
@@ -965,21 +1017,41 @@ class _FlipTopology:
         self._device = faces.device
         self._n_faces = int(faces.shape[0]) // 3
         self._n_corners = self._n_faces * 3
+        self._n_vertices = n_vertices
         self._radix = wp.uint64(n_vertices)
         # A key packs an edge as ``min + max * n_vertices``, so every key is below
         # ``n_vertices ** 2`` and the sort orders only that many low bits: the stable sort's
-        # permutation is identical, and a 64-bit sort's fixed per-digit passes dominate a regroup.
+        # permutation is identical, and a 64-bit sort's fixed per-digit passes dominate a build.
         self._key_bits = max(1, (n_vertices * n_vertices - 1).bit_length())
         n = self._n_corners
         # ``radix_sort_pairs`` ping-pongs through the upper half of both buffers, so each is
-        # double width and only ``[:n]`` is data. The sorted keys are the duplicate-edge table.
+        # double width and only ``[:n]`` is data.
         self._keys = wp.empty(2 * n, dtype=wp.uint64, device=self._device)
         self._order = wp.empty(2 * n, dtype=wp.int32, device=self._device)
         self._starts = wp.empty(n, dtype=wp.int32, device=self._device)
         self._ranks = wp.empty(n, dtype=wp.int32, device=self._device)
         self._ranks_tail = self._ranks[n - 1 :]
         self.sorted_keys = self._keys[:n]
-        self.face_claim = wp.empty(self._n_faces, dtype=wp.int32, device=self._device)
+        self.face_claim = wp.empty(self._n_faces, dtype=wp.uint64, device=self._device)
+        # The incremental state is allocated by the first incremental build; a plain build passes
+        # ``None`` for it (a null descriptor, which the kernels read as "no incremental state").
+        self.incremental = False
+        self.halfedge_row: wp.array[wp.int32] | None = None
+        self.row_halfedges: twt.Array2dInt32 | None = None
+        table = 1
+        while table < 2 * n:
+            table <<= 1
+        self._edge_set_table = table
+        # Until an incremental build seeds it, ``edge_set`` stands in with a buffer of the right
+        # dtype that no thread reads (the guard takes the sorted keys while the mask is ``-1``).
+        self.edge_set = self._keys
+        self.edge_set_mask = table - 1
+        # Unique edges at a build are at most ``n``, and each flip spends one empty slot, so
+        # ``table * 3 // 4 - n`` flips keep the set under three-quarters full.
+        self._flip_budget = max(0, table * 3 // 4 - n)
+        self._flips_since_build = 0
+        self._sorted_stale = False
+        self.valence: wp.array[wp.int32] | None = None
         self._rows = -1
         self._allocate_rows(0)
         self.built = False
@@ -989,23 +1061,91 @@ class _FlipTopology:
         """Interior-edge row count of the last build (``0`` before one)."""
         return self._rows
 
-    def rebuild(self, *, read_count: bool = True) -> int:
+    def rebuild(self, *, read_count: bool = True, incremental: bool = False) -> int:
         """
-        Regroup the mutated face buffer into interior-edge rows, and return how many there are.
+        Build every table from the face buffer, and return the interior-edge row count.
 
         Every public attribute is rewritten; the returned row count is also the launch dimension
         for the candidate, claim and commit kernels. ``read_count=False`` skips the one readback,
-        for a regroup of a face buffer whose row count is already known (a flip round's), which is
-        also what lets the regroup be recorded into a graph; it returns the known count.
+        for a rebuild of a face buffer whose row count is already known (a flip loop's), and
+        returns the known count. ``incremental=True`` also builds the state a flip round keeps
+        current -- the halfedge <-> row maps and the duplicate-edge set -- and the topology stays
+        incremental from then on.
 
-        **It is launch-bound, not data-bound, and that is why the region flip pass does not scope
-        it to the region.** The cost is dominated by the fixed launches' own marshalling rather than
-        by the radix sort over the mesh, so it grows very little with mesh size — which is also why
-        ``_flip_region_faces`` rebuilds over the whole mesh even though only edges with *both* faces
-        in the region are flippable, rather than scoping the rebuild to the region. Restricting the
-        *duplicate-edge* table to the region would also need the region's vertex one-ring closure to
-        stay exact, since a flip's new edge may already exist outside the region.
+        **It is whole-mesh, not region-scoped**: ``_flip_region_faces`` builds over the whole mesh
+        even though only edges with *both* faces in the region are flippable, because the
+        duplicate-edge set must hold every edge -- a flip's new edge may already exist outside the
+        region.
         """
+        n = self._n_corners
+        self._sort()
+        self.built = True
+        self._flips_since_build = 0
+        self.incremental = self.incremental or incremental
+        if self.incremental:
+            if self.halfedge_row is None:
+                self.halfedge_row = wp.empty(n, dtype=wp.int32, device=self._device)
+                self.edge_set = wp.zeros(self._edge_set_table, dtype=wp.uint64, device=self._device)
+            else:
+                self.edge_set.zero_()
+        wp.launch(
+            kernel_remesh.mark_edge_pair_starts,
+            dim=n,
+            inputs=[
+                self._keys,
+                self._order,
+                wp.int32(n),
+                wp.int32(self.active_edge_set_mask),
+                self.edge_set,
+                self._starts,
+                self.halfedge_row,
+            ],
+            device=self._device,
+        )
+        # Inclusive, so the row count is one 4-byte tail read and the emit kernel's row is
+        # ``ranks[i] - 1`` -- the contract ``array.flatnonzero`` uses for the same reason.
+        wp.utils.array_scan(self._starts, out_array=self._ranks, inclusive=True)
+        if read_count:
+            m = int(read_scalar(self._ranks_tail, 0))
+            if m != self._rows:
+                self._allocate_rows(m)
+        else:
+            m = self._rows
+            # The invariant the skipped read rests on, checked where Warp's debug mode is already
+            # paying for bounds checks: a rebuild whose row count moved would index past the tables.
+            if wp.config.mode == "debug" and not wp.get_device(self._device).is_capturing:
+                assert int(read_scalar(self._ranks_tail, 0)) == m, "interior-edge count changed"
+        if self.incremental and (self.row_halfedges is None or self.row_halfedges.shape[0] != m):
+            self.row_halfedges = twt.empty_2d((m, 2), wp.int32, device=self._device)
+        if m > 0:
+            wp.launch(
+                kernel_remesh.emit_flip_topology,
+                dim=n,
+                inputs=[
+                    self._faces,
+                    self._order,
+                    self._starts,
+                    self._ranks,
+                    self.adjacency,
+                    self.adjacency_edges,
+                    self.unshared,
+                    self.row_halfedges,
+                    self.halfedge_row,
+                ],
+                device=self._device,
+            )
+        if self.valence is not None:
+            self.valence.zero_()
+            wp.launch(
+                kernel_scatter.scatter_valence_from_sorted_edge_keys,
+                dim=n,
+                inputs=[self._keys, wp.int32(n), self._radix, self.valence],
+                device=self._device,
+            )
+        return m
+
+    def _sort(self) -> None:
+        """Pack every corner's edge key and radix-sort them, with the corner order as payload."""
         n = self._n_corners
         wp.launch(
             kernel_adjacency.face_edge_keys,
@@ -1020,56 +1160,54 @@ class _FlipTopology:
             device=self._device,
         )
         wp.utils.radix_sort_pairs(self._keys, self._order, count=n, end_bit=self._key_bits)
-        self.built = True
+        self._sorted_stale = False
+
+    def refresh(self) -> None:
+        """Rewrite every row from the halfedges ``commit_flips`` kept current, in one launch."""
         wp.launch(
-            kernel_remesh.mark_edge_pair_starts,
-            dim=n,
-            inputs=[self._keys, wp.int32(n), self._starts],
-            device=self._device,
-        )
-        # Inclusive, so the row count is one 4-byte tail read and the emit kernel's row is
-        # ``ranks[i] - 1`` -- the contract ``array.flatnonzero`` uses for the same reason.
-        wp.utils.array_scan(self._starts, out_array=self._ranks, inclusive=True)
-        if read_count:
-            m = int(read_scalar(self._ranks_tail, 0))
-            if m == 0:
-                self._rows = 0
-                return 0
-            if m != self._rows:
-                self._allocate_rows(m)
-        else:
-            m = self._rows
-            # The invariant the skipped read rests on, checked where Warp's debug mode is already
-            # paying for bounds checks -- and not while the regroup is being recorded, where a
-            # readback is an error: a regroup whose row count moved would index past the tables.
-            if wp.config.mode == "debug" and not wp.get_device(self._device).is_capturing:
-                assert int(read_scalar(self._ranks_tail, 0)) == m, "interior-edge count changed"
-        wp.launch(
-            kernel_remesh.emit_flip_topology,
-            dim=n,
+            kernel_remesh.refresh_flip_rows,
+            dim=self._rows,
             inputs=[
                 self._faces,
-                self._order,
-                self._starts,
-                self._ranks,
+                self.row_halfedges,
                 self.adjacency,
                 self.adjacency_edges,
                 self.unshared,
             ],
             device=self._device,
         )
-        return m
+
+    @property
+    def active_edge_set_mask(self) -> int:
+        """``edge_set_mask`` once an incremental build seeded the key set, else ``-1``."""
+        return self.edge_set_mask if self.incremental else -1
+
+    def flipped(self, count: int) -> None:
+        """
+        Record ``count`` committed flips, rebuilding once the key set's tombstones call for it.
+
+        A flip makes the sort stale (``edges_unique`` re-sorts), and a plain build's first flipping
+        round is followed by the incremental build the loop runs from then on. Once the flips since
+        the last build could have filled the key set past three quarters, everything is rebuilt.
+        """
+        self._sorted_stale = True
+        self._flips_since_build += count
+        if self._flips_since_build > self._flip_budget:
+            self.rebuild(read_count=False, incremental=True)
 
     def edges_unique(self) -> tuple[twt.Array2dInt32, wp.array[wp.int32]]:
         """
-        ``edges.edges_unique(faces, n_vertices=n_vertices)`` for the face buffer as last built.
+        ``edges.edges_unique(faces, n_vertices=n_vertices)`` for the face buffer as it is now.
 
-        The build already radix-sorted every corner's undirected edge key against the same radix
+        A build already radix-sorted every corner's undirected edge key against the same radix
         ``edges_unique`` packs with, so the unique edges are the runs of that sort: a run-start
         mark, a scan and one emit give the identical ascending-key rows and corner map, without
-        re-hashing the whole mesh. Reuses the pair-start scratch, which only a build reads, so the
-        tables a later flip call starts from are untouched. Requires a build.
+        re-hashing the whole mesh. The sort goes stale when a flip commits, and is redone first
+        then. Reuses the pair-start scratch, which only a build reads. Requires a build.
         """
+        if self._sorted_stale:
+            # Only the sort is stale: the rows, the halfedge maps and the key set were kept current.
+            self._sort()
         n = self._n_corners
         wp.launch(
             kernel_remesh.mark_sorted_run_starts,
@@ -1101,7 +1239,7 @@ class _FlipTopology:
         table = 1
         while table < 4 * m + 1:
             table <<= 1
-        self.edge_claim = wp.empty(table, dtype=wp.int32, device=self._device)
+        self.edge_claim = wp.empty(table, dtype=wp.uint64, device=self._device)
         self.edge_claim_mask = table - 1
 
 
@@ -2229,7 +2367,17 @@ def flip_to_delaunay(
     out_faces, n_vertices, region_flags = setup
     mac, mdsq, car = _flip_gates(max_angle_change, max_deviation, critical_aspect_ratio)
 
-    def launch(adjacency, adjacency_edges, unshared, sorted_keys, key_base, out_flip, out_quad):
+    def launch(
+        adjacency,
+        adjacency_edges,
+        unshared,
+        sorted_keys,
+        edge_set,
+        edge_set_mask,
+        key_base,
+        out_flip,
+        out_quad,
+    ):
         wp.launch(
             kernel_remesh.delone_flip_candidates,
             dim=int(adjacency.shape[0]),
@@ -2241,6 +2389,8 @@ def flip_to_delaunay(
                 unshared,
                 region_flags,
                 sorted_keys,
+                edge_set,
+                edge_set_mask,
                 key_base,
                 mac,
                 mdsq,
@@ -2380,7 +2530,17 @@ def flip_by_objective(
     # The gate is on the dihedral's cosine so the kernel needs no inverse trigonometry.
     planar_cos = wp.float32(math.cos(math.radians(planar_angle)))
 
-    def launch(adjacency, adjacency_edges, unshared, sorted_keys, key_base, out_flip, out_quad):
+    def launch(
+        adjacency,
+        adjacency_edges,
+        unshared,
+        sorted_keys,
+        edge_set,
+        edge_set_mask,
+        key_base,
+        out_flip,
+        out_quad,
+    ):
         wp.launch(
             kernel_remesh.objective_flip_candidates,
             dim=int(adjacency.shape[0]),
@@ -2392,6 +2552,8 @@ def flip_by_objective(
                 unshared,
                 region_flags,
                 sorted_keys,
+                edge_set,
+                edge_set_mask,
                 key_base,
                 objective_flag,
                 metric_flag,
@@ -3895,7 +4057,17 @@ def _flip_region_faces(
     n_vertices = int(vertices.shape[0])
     mac, mdsq, car = _flip_gates(max_angle_change, max_deviation)
 
-    def launch(adjacency, adjacency_edges, unshared, sorted_keys, key_base, out_flip, out_quad):
+    def launch(
+        adjacency,
+        adjacency_edges,
+        unshared,
+        sorted_keys,
+        edge_set,
+        edge_set_mask,
+        key_base,
+        out_flip,
+        out_quad,
+    ):
         wp.launch(
             kernel_remesh.delone_flip_candidates,
             dim=int(adjacency.shape[0]),
@@ -3907,6 +4079,8 @@ def _flip_region_faces(
                 unshared,
                 region_flags,
                 sorted_keys,
+                edge_set,
+                edge_set_mask,
                 key_base,
                 mac,
                 mdsq,

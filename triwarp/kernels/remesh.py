@@ -14,7 +14,13 @@ from triwarp.kernels.array import (
     to_vec3,
     to_vec3d,
 )
-from triwarp.kernels.grouping import hash_slot, sorted_run_start
+from triwarp.kernels.grouping import (
+    hash_find,
+    hash_find_or_insert,
+    hash_slot,
+    key_set_remove,
+    sorted_run_start,
+)
 from triwarp.kernels.predicates import (
     delone_metrics,
     dihedral_angle,
@@ -812,7 +818,13 @@ def _incircle_d(a: wp.vec2d, b: wp.vec2d, c: wp.vec2d, d: wp.vec2d) -> wp.float6
 
 @wp.kernel
 def mark_edge_pair_starts(
-    sorted_keys: wp.array[wp.uint64], n: wp.int32, out_starts: wp.array[wp.int32]
+    sorted_keys: wp.array[wp.uint64],
+    order: wp.array[wp.int32],
+    n: wp.int32,
+    edge_set_mask: wp.int32,
+    edge_set: wp.array[wp.uint64],
+    out_starts: wp.array[wp.int32],
+    out_halfedge_row: wp.array[wp.int32],
 ) -> None:
     # ``grouping.mark_group_starts`` specialized to ``length=2``. Both emit ``int32`` for the same
     # reason: the flag feeds ``warp.utils.array_scan``, which has no bool overload. Flags the
@@ -822,41 +834,46 @@ def mark_edge_pair_starts(
     # Differs from ``mark_unique_edge_starts`` below only in requiring the run to be exactly two:
     # that one takes every run whatever its length, because the decimation pass wants all unique
     # edges where a flip pass wants only the manifold-interior ones.
+    #
+    # An incremental build (``out_halfedge_row`` given, ``edge_set_mask >= 0``) seeds the flip
+    # loop's other two structures in the same pass: every halfedge starts with no row
+    # (``emit_flip_topology`` then writes the interior ones), and every run -- every undirected
+    # edge, whatever its multiplicity -- goes into the zeroed duplicate-edge set.
     i = wp.int32(wp.tid())
+    if out_halfedge_row.shape[0] > 0:
+        out_halfedge_row[order[i]] = -1
+    run_start = sorted_run_start(sorted_keys, i)
+    if run_start and edge_set_mask >= 0:
+        hash_find_or_insert(sorted_keys[i], edge_set, edge_set_mask)
     start = wp.int32(0)
-    if i + 2 <= n and sorted_run_start(sorted_keys, i):
-        if sorted_keys[i] == sorted_keys[i + 1]:
-            start = wp.int32(1)
-            if i + 2 < n:
-                if sorted_keys[i] == sorted_keys[i + 2]:
-                    start = wp.int32(0)  # run longer than two
+    # Nested rather than one ``and``: a kernel-scope ``and`` does not short-circuit, and each read
+    # is valid only under its own bound.
+    if i + 2 <= n:
+        if run_start:
+            if sorted_keys[i] == sorted_keys[i + 1]:
+                start = wp.int32(1)
+                if i + 2 < n:
+                    if sorted_keys[i] == sorted_keys[i + 2]:
+                        start = wp.int32(0)  # run longer than two
     out_starts[i] = start
 
 
-@wp.kernel
-def emit_flip_topology(
+@wp.func
+def write_flip_row(
     faces: wp.array[wp.int32],
-    order: wp.array[wp.int32],
-    starts: wp.array[wp.int32],
-    ranks: wp.array[wp.int32],
+    edge_0: wp.int32,
+    edge_1: wp.int32,
+    slot: wp.int32,
     out_adjacency: wp.array2d[wp.int32],
     out_adjacency_edges: wp.array2d[wp.int32],
     out_unshared: wp.array2d[wp.int32],
 ) -> None:
-    # The whole face-adjacency table a flip pass needs, in one launch over the ``3 * n_faces``
-    # sorted edge slots: ``adjacency.face_adjacency``'s pair table, its shared-edge endpoints and
-    # ``face_adjacency_unshared``'s opposite apexes. Everything comes out of the two grouped *edge*
-    # indices, so no edge table is materialized and nothing is gathered through one.
-    #
-    # ``ranks`` is the inclusive scan of ``starts``, so ``ranks[i] - 1`` is the row a start writes
-    # -- the same ascending-key row order the ``flatnonzero`` compaction inside
-    # ``grouping.group`` produces, which is what keeps this byte-identical to the composed path.
-    i = wp.int32(wp.tid())
-    if starts[i] == 0:
-        return
-    slot = ranks[i] - 1
+    # One interior-edge row of the flip tables from its two halfedges: the shared edge's sorted
+    # endpoints, the face pair ascending and each face's opposite apex aligned with it. Only the
+    # halfedges' *faces* and the edge are read, so the row is the same whichever of the two comes
+    # first -- which is what lets ``refresh_flip_rows`` rebuild a row from halfedges that moved.
     shared_a, shared_b, face_0, face_1, unshared_0, unshared_1 = edge_pair_topology(
-        faces, order[i], order[i + 1]
+        faces, edge_0, edge_1
     )
     out_adjacency_edges[slot, 0] = shared_a
     out_adjacency_edges[slot, 1] = shared_b
@@ -870,6 +887,70 @@ def emit_flip_topology(
         out_adjacency[slot, 1] = face_0
         out_unshared[slot, 0] = unshared_1
         out_unshared[slot, 1] = unshared_0
+
+
+@wp.kernel
+def emit_flip_topology(
+    faces: wp.array[wp.int32],
+    order: wp.array[wp.int32],
+    starts: wp.array[wp.int32],
+    ranks: wp.array[wp.int32],
+    out_adjacency: wp.array2d[wp.int32],
+    out_adjacency_edges: wp.array2d[wp.int32],
+    out_unshared: wp.array2d[wp.int32],
+    out_row_halfedges: wp.array2d[wp.int32],
+    out_halfedge_row: wp.array[wp.int32],
+) -> None:
+    # The whole face-adjacency table a flip pass needs, in one launch over the ``3 * n_faces``
+    # sorted edge slots: ``adjacency.face_adjacency``'s pair table, its shared-edge endpoints and
+    # ``face_adjacency_unshared``'s opposite apexes. Everything comes out of the two grouped *edge*
+    # indices, so no edge table is materialized and nothing is gathered through one.
+    #
+    # ``ranks`` is the inclusive scan of ``starts``, so ``ranks[i] - 1`` is the row a start writes
+    # -- the same ascending-key row order the ``flatnonzero`` compaction inside
+    # ``grouping.group`` produces, which is what keeps this byte-identical to the composed path.
+    #
+    # An incremental build keeps the two halfedges too, in both directions (row -> halfedges,
+    # halfedge -> row; ``mark_edge_pair_starts`` resets the second first), which is what lets
+    # ``commit_flips`` keep the rows current across a flip round instead of regrouping the whole
+    # mesh. A plain build passes ``None`` for both.
+    i = wp.int32(wp.tid())
+    if starts[i] == 0:
+        return
+    slot = ranks[i] - 1
+    edge_0 = order[i]
+    edge_1 = order[i + 1]
+    write_flip_row(faces, edge_0, edge_1, slot, out_adjacency, out_adjacency_edges, out_unshared)
+    if out_halfedge_row.shape[0] == 0:
+        return
+    out_row_halfedges[slot, 0] = edge_0
+    out_row_halfedges[slot, 1] = edge_1
+    out_halfedge_row[edge_0] = slot
+    out_halfedge_row[edge_1] = slot
+
+
+@wp.kernel
+def refresh_flip_rows(
+    faces: wp.array[wp.int32],
+    row_halfedges: wp.array2d[wp.int32],
+    out_adjacency: wp.array2d[wp.int32],
+    out_adjacency_edges: wp.array2d[wp.int32],
+    out_unshared: wp.array2d[wp.int32],
+) -> None:
+    # Every row of the flip tables again, from the halfedges ``commit_flips`` kept current: the
+    # rows ``emit_flip_topology`` would write after a full regroup, row for row, except that each
+    # edge keeps the row it had instead of moving to its new key's rank -- which the flip loop does
+    # not depend on, since ``claim_flips`` ranks candidates by key rather than by row.
+    k = wp.int32(wp.tid())
+    write_flip_row(
+        faces,
+        row_halfedges[k, 0],
+        row_halfedges[k, 1],
+        k,
+        out_adjacency,
+        out_adjacency_edges,
+        out_unshared,
+    )
 
 
 @wp.kernel
@@ -928,11 +1009,28 @@ def _resolve_flip_quad(
 
 
 @wp.func
+def edge_key_exists(
+    sorted_edge_keys: wp.array[wp.uint64],
+    edge_set: wp.array[wp.uint64],
+    edge_set_mask: wp.int32,
+    key: wp.uint64,
+) -> wp.bool:
+    # Is ``key`` an edge of the current triangulation? Two spellings of one set, chosen by a
+    # warp-uniform selector: the flip loop's sorted keys while a build's sort is still current
+    # (``edge_set_mask < 0``), its hashed key set once a flip has committed and made the sort stale.
+    if edge_set_mask < 0:
+        return binary_search_sorted_contains(sorted_edge_keys, key)
+    return hash_find(key, edge_set, edge_set_mask) >= 0
+
+
+@wp.func
 def _resolve_flip_quad_guarded(
     faces: wp.array[wp.int32],
     adjacency_edges: wp.array2d[wp.int32],
     unshared: wp.array2d[wp.int32],
     sorted_edge_keys: wp.array[wp.uint64],
+    edge_set: wp.array[wp.uint64],
+    edge_set_mask: wp.int32,
     key_base: wp.uint64,
     k: wp.int32,
     f0: wp.int32,
@@ -954,8 +1052,8 @@ def _resolve_flip_quad_guarded(
         if (
             quad[0] >= 0
             and quad[1] != quad[3]
-            and not binary_search_sorted_contains(
-                sorted_edge_keys, pack_edge_key(quad[1], quad[3], key_base)
+            and not edge_key_exists(
+                sorted_edge_keys, edge_set, edge_set_mask, pack_edge_key(quad[1], quad[3], key_base)
             )
         ):
             a = quad[0]
@@ -977,6 +1075,8 @@ def _resolve_flip_quad_in_region(
     unshared: wp.array2d[wp.int32],
     region_flags: wp.array[wp.int32],
     sorted_edge_keys: wp.array[wp.uint64],
+    edge_set: wp.array[wp.uint64],
+    edge_set_mask: wp.int32,
     key_base: wp.uint64,
     k: wp.int32,
     out_quad: wp.array2d[wp.int32],
@@ -992,7 +1092,16 @@ def _resolve_flip_quad_in_region(
     if region_flags[f0] == 0 or region_flags[adjacency[k, 1]] == 0:
         return wp.int32(-1), wp.int32(-1), wp.int32(-1), wp.int32(-1)
     return _resolve_flip_quad_guarded(
-        faces, adjacency_edges, unshared, sorted_edge_keys, key_base, k, f0, out_quad
+        faces,
+        adjacency_edges,
+        unshared,
+        sorted_edge_keys,
+        edge_set,
+        edge_set_mask,
+        key_base,
+        k,
+        f0,
+        out_quad,
     )
 
 
@@ -1021,6 +1130,8 @@ def delone_flip_candidates(
     unshared: wp.array2d[wp.int32],
     region_flags: wp.array[wp.int32],
     sorted_edge_keys: wp.array[wp.uint64],
+    edge_set: wp.array[wp.uint64],
+    edge_set_mask: wp.int32,
     key_base: wp.uint64,
     max_angle_change: wp.float32,
     max_deviation_sq: wp.float32,
@@ -1037,6 +1148,8 @@ def delone_flip_candidates(
         unshared,
         region_flags,
         sorted_edge_keys,
+        edge_set,
+        edge_set_mask,
         key_base,
         k,
         out_quad,
@@ -1065,6 +1178,8 @@ def incircle_flip_candidates(
     adjacency_edges: wp.array2d[wp.int32],
     unshared: wp.array2d[wp.int32],
     sorted_edge_keys: wp.array[wp.uint64],
+    edge_set: wp.array[wp.uint64],
+    edge_set_mask: wp.int32,
     key_base: wp.uint64,
     out_flip: wp.array[wp.bool],
     out_quad: wp.array2d[wp.int32],
@@ -1073,7 +1188,16 @@ def incircle_flip_candidates(
     out_flip[k] = wp.bool(False)
     f0 = adjacency[k, 0]
     a, b, c, d = _resolve_flip_quad_guarded(
-        faces, adjacency_edges, unshared, sorted_edge_keys, key_base, k, f0, out_quad
+        faces,
+        adjacency_edges,
+        unshared,
+        sorted_edge_keys,
+        edge_set,
+        edge_set_mask,
+        key_base,
+        k,
+        f0,
+        out_quad,
     )
     if a < 0:
         return
@@ -1089,31 +1213,40 @@ def incircle_flip_candidates(
 
 
 @wp.func
+def flip_priority(
+    adjacency_edges: wp.array2d[wp.int32], key_base: wp.uint64, k: wp.int32
+) -> wp.uint64:
+    # A candidate's rank in the independent-set claims: its edge's key. Interior-edge keys are
+    # distinct, and a regroup emits the rows in ascending key order, so the smallest key is the
+    # smallest row index there -- the claims pick the same winners whether or not the rows have
+    # been regrouped since, which is what lets the flip loop keep its rows across rounds.
+    return pack_edge_key(adjacency_edges[k, 0], adjacency_edges[k, 1], key_base)
+
+
+@wp.func
 def flip_claim_won(
     flip: wp.array[wp.bool],
     quad: wp.array2d[wp.int32],
     adjacency: wp.array2d[wp.int32],
-    face_claim: wp.array[wp.int32],
-    edge_claim: wp.array[wp.int32],
+    adjacency_edges: wp.array2d[wp.int32],
+    face_claim: wp.array[wp.uint64],
+    edge_claim: wp.array[wp.uint64],
     edge_claim_mask: wp.int32,
     key_base: wp.uint64,
     k: wp.int32,
 ) -> tuple[wp.int32, wp.int32, wp.bool]:
-    # Did candidate ``k`` win every claim ``claim_flips`` above wrote -- both its faces and the
+    # Did candidate ``k`` win every claim ``claim_flips`` below wrote -- both its faces and the
     # hashed slot of the new diagonal it would create? Returns the two face indices alongside the
-    # verdict because every caller needs them straight afterwards, and both are already loaded here.
-    #
-    # Shared by ``commit_flips`` and ``update_flipped_lengths``, which must agree *exactly* on which
-    # candidates commit: the second rewrites the edge-length rows of the faces the first rewrites
-    # the connectivity of, so a divergence would leave the two tables describing different meshes.
+    # verdict because the caller needs them straight afterwards, and both are already loaded here.
     if not flip[k]:
         return wp.int32(-1), wp.int32(-1), False
     f0 = adjacency[k, 0]
     f1 = adjacency[k, 1]
-    if face_claim[f0] != k or face_claim[f1] != k:
+    priority = flip_priority(adjacency_edges, key_base, k)
+    if face_claim[f0] != priority or face_claim[f1] != priority:
         return f0, f1, False
     slot = hash_slot(pack_edge_key(quad[k, 1], quad[k, 3], key_base), edge_claim_mask)
-    if edge_claim[slot] != k:
+    if edge_claim[slot] != priority:
         return f0, f1, False
     return f0, f1, True
 
@@ -1123,18 +1256,20 @@ def claim_flips(
     flip: wp.array[wp.bool],
     quad: wp.array2d[wp.int32],
     adjacency: wp.array2d[wp.int32],
+    adjacency_edges: wp.array2d[wp.int32],
     edge_claim_mask: wp.int32,
     key_base: wp.uint64,
-    out_face_claim: wp.array[wp.int32],
-    out_edge_claim: wp.array[wp.int32],
+    out_face_claim: wp.array[wp.uint64],
+    out_edge_claim: wp.array[wp.uint64],
 ) -> None:
     k = wp.int32(wp.tid())
     if not flip[k]:
         return
-    wp.atomic_min(out_face_claim, adjacency[k, 0], k)
-    wp.atomic_min(out_face_claim, adjacency[k, 1], k)
+    priority = flip_priority(adjacency_edges, key_base, k)
+    wp.atomic_min(out_face_claim, adjacency[k, 0], priority)
+    wp.atomic_min(out_face_claim, adjacency[k, 1], priority)
     slot = hash_slot(pack_edge_key(quad[k, 1], quad[k, 3], key_base), edge_claim_mask)
-    wp.atomic_min(out_edge_claim, slot, k)
+    wp.atomic_min(out_edge_claim, slot, priority)
 
 
 @wp.func
@@ -1160,21 +1295,68 @@ def write_flipped_quad(
     write_corner_triple(out_faces, f1, c, d, b)
 
 
+@wp.func
+def local_directed_edge(
+    faces: wp.array[wp.int32], f: wp.int32, u: wp.int32, v: wp.int32
+) -> wp.int32:
+    # The corner ``j`` of face ``f`` whose halfedge runs ``u -> v`` (``faces[3f + j] == u`` and the
+    # next corner is ``v``), or ``-1``.
+    j = wp.int32(-1)
+    for k in range(3):
+        if faces[f * 3 + k] == u and faces[f * 3 + (k + 1) % 3] == v:
+            j = k
+    return j
+
+
+@wp.func
+def move_row_halfedge(
+    row_halfedges: wp.array2d[wp.int32], row: wp.int32, old: wp.int32, new: wp.int32
+) -> None:
+    # Repoint interior-edge row ``row``'s halfedge ``old`` at ``new``. Race-free across a commit
+    # launch: a row's two halfedges lie in two different faces, each face belongs to at most one
+    # committing flip, and a flip only ever writes the column holding a halfedge of its own face --
+    # the other column never equals ``old``, whatever the other flip is writing into it.
+    if row < 0:
+        return
+    if row_halfedges[row, 0] == old:
+        row_halfedges[row, 0] = new
+    else:
+        row_halfedges[row, 1] = new
+
+
 @wp.kernel
 def commit_flips(
     flip: wp.array[wp.bool],
     quad: wp.array2d[wp.int32],
     adjacency: wp.array2d[wp.int32],
-    face_claim: wp.array[wp.int32],
-    edge_claim: wp.array[wp.int32],
+    adjacency_edges: wp.array2d[wp.int32],
+    face_claim: wp.array[wp.uint64],
+    edge_claim: wp.array[wp.uint64],
     edge_claim_mask: wp.int32,
     key_base: wp.uint64,
+    edge_set_mask: wp.int32,
+    row_halfedges: wp.array2d[wp.int32],
+    halfedge_row: wp.array[wp.int32],
+    edge_set: wp.array[wp.uint64],
+    valence: wp.array[wp.int32],
     out_faces: wp.array[wp.int32],
     out_count: wp.array[wp.int32],
 ) -> None:
+    # Commit the winning flips, and keep the loop's incremental state describing the new faces:
+    # the halfedge <-> row maps (so ``refresh_flip_rows`` can rebuild every row without a regroup),
+    # the duplicate-edge set once it exists (``edge_set_mask >= 0``; the old diagonal out, the new
+    # one in -- it cannot already be there,
+    # or the candidate guard would have rejected the flip, and the edge claim stops two flips
+    # creating it) and, when given, the vertex valences the diagonal moves between.
+    #
+    # The quad is ``(a, b, c, d)`` with ``f0`` traversing ``a -> c`` and apex ``d``, ``f1``
+    # traversing ``c -> a`` and apex ``b`` (``_resolve_flip_quad``); ``write_flipped_quad`` turns
+    # them into ``(a, b, d)`` and ``(c, d, b)``. Each side edge keeps its row but changes halfedge:
+    # ``a-b`` and ``b-c`` were ``f1``'s, ``c-d`` and ``d-a`` ``f0``'s, and afterwards ``a-b`` and
+    # ``d-a`` are ``f0``'s, ``c-d`` and ``b-c`` ``f1``'s.
     k = wp.int32(wp.tid())
     f0, f1, won = flip_claim_won(
-        flip, quad, adjacency, face_claim, edge_claim, edge_claim_mask, key_base, k
+        flip, quad, adjacency, adjacency_edges, face_claim, edge_claim, edge_claim_mask, key_base, k
     )
     if not won:
         return
@@ -1182,7 +1364,46 @@ def commit_flips(
     b = quad[k, 1]
     c = quad[k, 2]
     d = quad[k, 3]
+    if halfedge_row.shape[0] == 0:
+        # A plain build's round: no incremental state to keep; the caller regroups.
+        write_flipped_quad(out_faces, f0, f1, a, b, c, d)
+        wp.atomic_add(out_count, 0, 1)
+        return
+    j = local_directed_edge(out_faces, f0, a, c)
+    i = local_directed_edge(out_faces, f1, c, a)
+    old_cd = f0 * 3 + (j + 1) % 3
+    old_da = f0 * 3 + (j + 2) % 3
+    old_ab = f1 * 3 + (i + 1) % 3
+    old_bc = f1 * 3 + (i + 2) % 3
+    row_cd = halfedge_row[old_cd]
+    row_da = halfedge_row[old_da]
+    row_ab = halfedge_row[old_ab]
+    row_bc = halfedge_row[old_bc]
+
     write_flipped_quad(out_faces, f0, f1, a, b, c, d)
+    # (a, b, d): a->b, b->d, d->a;  (c, d, b): c->d, d->b, b->c.
+    halfedge_row[f0 * 3 + 0] = row_ab
+    halfedge_row[f0 * 3 + 1] = k
+    halfedge_row[f0 * 3 + 2] = row_da
+    halfedge_row[f1 * 3 + 0] = row_cd
+    halfedge_row[f1 * 3 + 1] = k
+    halfedge_row[f1 * 3 + 2] = row_bc
+    row_halfedges[k, 0] = f0 * 3 + 1
+    row_halfedges[k, 1] = f1 * 3 + 1
+    move_row_halfedge(row_halfedges, row_ab, old_ab, f0 * 3 + 0)
+    move_row_halfedge(row_halfedges, row_da, old_da, f0 * 3 + 2)
+    move_row_halfedge(row_halfedges, row_cd, old_cd, f1 * 3 + 0)
+    move_row_halfedge(row_halfedges, row_bc, old_bc, f1 * 3 + 2)
+
+    if edge_set_mask >= 0:
+        key_set_remove(pack_edge_key(a, c, key_base), edge_set, edge_set_mask)
+        hash_find_or_insert(pack_edge_key(b, d, key_base), edge_set, edge_set_mask)
+    # ``valence`` is passed as ``None`` (a null descriptor, shape 0) when the loop tracks none.
+    if valence.shape[0] > 0:
+        wp.atomic_sub(valence, a, 1)
+        wp.atomic_sub(valence, c, 1)
+        wp.atomic_add(valence, b, 1)
+        wp.atomic_add(valence, d, 1)
     wp.atomic_add(out_count, 0, 1)
 
 
@@ -1593,6 +1814,8 @@ def valence_flip_candidates(
     adjacency_edges: wp.array2d[wp.int32],
     unshared: wp.array2d[wp.int32],
     sorted_edge_keys: wp.array[wp.uint64],
+    edge_set: wp.array[wp.uint64],
+    edge_set_mask: wp.int32,
     key_base: wp.uint64,
     valence: wp.array[wp.int32],
     boundary_vertex: wp.array[wp.bool],
@@ -1614,7 +1837,16 @@ def valence_flip_candidates(
     if vector_angle(n0, n1) > feature_angle:
         return
     a, b, c, d = _resolve_flip_quad_guarded(
-        faces, adjacency_edges, unshared, sorted_edge_keys, key_base, k, f0, out_quad
+        faces,
+        adjacency_edges,
+        unshared,
+        sorted_edge_keys,
+        edge_set,
+        edge_set_mask,
+        key_base,
+        k,
+        f0,
+        out_quad,
     )
     if a < 0:
         return
@@ -2276,6 +2508,8 @@ def objective_flip_candidates(
     unshared: wp.array2d[wp.int32],
     region_flags: wp.array[wp.int32],
     sorted_edge_keys: wp.array[wp.uint64],
+    edge_set: wp.array[wp.uint64],
+    edge_set_mask: wp.int32,
     key_base: wp.uint64,
     objective: wp.int32,
     metric: wp.int32,
@@ -2301,6 +2535,8 @@ def objective_flip_candidates(
         unshared,
         region_flags,
         sorted_edge_keys,
+        edge_set,
+        edge_set_mask,
         key_base,
         k,
         out_quad,
