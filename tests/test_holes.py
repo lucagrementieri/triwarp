@@ -3014,39 +3014,58 @@ def test_bridge_edges_rejects_bad_pairs(hemisphere: tuple[tm.Trimesh, wp.Mesh]) 
     )
 
 
-def test_bridge_edges_precomputed_rim_keeps_the_chord_check(
+def test_bridge_edges_rim_check_agrees_with_the_rim_table(
     hemisphere: tuple[tm.Trimesh, wp.Mesh],
 ) -> None:
     """
-    Triwarp against triwarp: ``boundary_edges=`` is a shortcut, not a third setting of ``validate``.
+    Triwarp against triwarp: the validation's one scan of the faces is the rim table's membership.
 
-    Passing the rim table skips only the *on-rim* half of the check -- the half a pair taken out of
-    that very table satisfies by construction. The chord-duplicate half must still fire, because a
-    bridge can leave two vertices sharing a second edge however its rim edges were chosen, and that
-    is the failure ``validate`` exists for. ``join_closest_components`` takes this path on every
-    join, so a shortcut that quietly disabled the other half would go unnoticed there.
-
-    The oracle is the same call without the keyword: same patch, same rejection.
+    ``bridge_edges`` decides both halves of ``validate`` from per-pair edge counts over the faces
+    rather than from an edge table, so this pins the rim half to
+    [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges], which carries the
+    definition: every row of that table is accepted as ``edge_a``, while the same edge reversed and
+    an interior edge are refused. The chord-duplicate half must fire as well -- two consecutive rim
+    edges joined across their shared rim vertex's neighbour -- since that is the failure
+    ``validate`` exists for and ``join_closest_components`` relies on it on every join.
     """
     _, mesh_wp = hemisphere
     vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
-    rim_wp = tw.boundary.oriented_boundary_edges(vertices_wp, faces_wp)
-    rim_np = rim_wp.numpy()
-    edge_a = (int(rim_np[0][0]), int(rim_np[0][1]))
+    rim_np = tw.boundary.oriented_boundary_edges(vertices_wp, faces_wp).numpy()
+    rim = {(int(u), int(v)) for u, v in rim_np}
+    assert len(rim) >= 16
     edge_far = (int(rim_np[len(rim_np) // 2][0]), int(rim_np[len(rim_np) // 2][1]))
-
-    with_table = tw.holes.bridge_edges(
-        vertices_wp, faces_wp, edge_a, edge_far, boundary_edges=rim_wp
+    accepted = 0
+    for u, v in rim_np:
+        edge = (int(u), int(v))
+        if edge == edge_far:
+            continue
+        # A pair near ``edge_far`` may be refused for its chord, never for being off the rim.
+        try:
+            tw.holes.bridge_edges(vertices_wp, faces_wp, edge, edge_far)
+        except ValueError as error:
+            message = str(error)
+        else:
+            message = ""
+            accepted += 1
+        assert message == "" or "non-manifold" in message
+    assert accepted > len(rim) // 2
+    edge_a = (int(rim_np[0][0]), int(rim_np[0][1]))
+    with pytest.raises(ValueError, match=r"edge_a=.*is not a boundary edge"):
+        tw.holes.bridge_edges(vertices_wp, faces_wp, (edge_a[1], edge_a[0]), edge_far)
+    faces_np = faces_wp.numpy().reshape(-1, 3)
+    interior = next(
+        (int(a), int(b))
+        for a, b in faces_np[:, :2]
+        if (int(a), int(b)) not in rim and (int(b), int(a)) not in rim
     )
-    without = tw.holes.bridge_edges(vertices_wp, faces_wp, edge_a, edge_far)
-    assert np.array_equal(with_table.numpy(), without.numpy())
+    with pytest.raises(ValueError, match=r"edge_b=.*is not a boundary edge"):
+        tw.holes.bridge_edges(vertices_wp, faces_wp, edge_a, interior)
 
-    # The chord-duplicate rejection still fires with the table supplied.
     successors = _rim_successors(vertices_wp, faces_wp)
     middle = successors[edge_a[1]]
     edge_next = (middle, successors[middle])
     with pytest.raises(ValueError, match="non-manifold"):
-        tw.holes.bridge_edges(vertices_wp, faces_wp, edge_a, edge_next, boundary_edges=rim_wp)
+        tw.holes.bridge_edges(vertices_wp, faces_wp, edge_a, edge_next)
 
 
 def test_bridge_edges_smooth_opposed_edges_stay_finite(device: str) -> None:

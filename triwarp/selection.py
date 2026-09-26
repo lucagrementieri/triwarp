@@ -11,7 +11,7 @@ import triwarp.typing as twt
 from triwarp._device import read_scalar, require_same_device
 from triwarp.constants import INDEX_RADIX_PAIR
 from triwarp.halfedge import halfedge_twins, require_matching_twins
-from triwarp.kernels import boundary as kernel_boundary
+from triwarp.kernels import adjacency as kernel_adjacency
 from triwarp.kernels import grouping as kernel_grouping
 from triwarp.kernels import scatter as kernel_scatter
 from triwarp.kernels import selection as kernel_selection
@@ -39,8 +39,9 @@ def region_boundary_edges(
     face_mask
         Length-``n_faces`` ``wp.bool`` region mask.
     n_vertices
-        Optional vertex count. Not read: the edge keys pack against
-        [`constants.INDEX_RADIX_PAIR`][triwarp.constants.INDEX_RADIX_PAIR], which needs no vertex
+        Optional exclusive bound on the vertex indices, used as the edge-key radix so the sort
+        orders only the bits a key can occupy. It is trusted, not checked. Without it the keys pack
+        against [`constants.INDEX_RADIX_PAIR`][triwarp.constants.INDEX_RADIX_PAIR], which needs no
         bound and orders them identically.
     oriented
         Return each row as the **directed** pair belonging to its region face, instead of the
@@ -80,15 +81,18 @@ def region_boundary_edges(
     # of exactly two keys whose faces straddle the region, and it is emitted from its region
     # halfedge in ascending key order -- no unique-edge table, and one readback, of the seam size.
     n = 3 * n_faces
+    radix = n_vertices if n_vertices else INDEX_RADIX_PAIR
     keys = wp.empty(2 * n, dtype=wp.uint64, device=device)
     order = wp.empty(2 * n, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_boundary.face_edge_keys_and_order,
+        kernel_adjacency.face_edge_keys_and_order,
         dim=n_faces,
-        inputs=[faces, wp.uint64(INDEX_RADIX_PAIR), keys, order],
+        inputs=[faces, wp.uint64(radix), keys, order],
         device=device,
     )
-    wp.utils.radix_sort_pairs(keys, order, count=n)
+    wp.utils.radix_sort_pairs(
+        keys, order, count=n, end_bit=min(64, max(1, (radix * radix - 1).bit_length()))
+    )
     inclusive = wp.empty(n, dtype=wp.int32, device=device)
     wp.launch(
         kernel_selection.mark_region_seam,
@@ -233,18 +237,22 @@ def faces_left_of_contour(
         inputs=[faces, twins, contour_keys, base, parents],
         device=device,
     )
+    # The root flags overwrite ``seeds``: only a seeded component's root is ever written, and to
+    # ``True``, so a thread reading a written entry is that root reading its own component's
+    # answer, and every entry the gather below reads -- a root's -- ends ``True`` exactly when its
+    # component holds a seed. The labels cannot overwrite ``parents`` the same way: another
+    # thread's path halving may write a stale ancestor over a label already stored.
     labels = wp.empty(n_faces, dtype=wp.int32, device=device)
-    label_seeded = wp.zeros(n_faces, dtype=wp.bool, device=device)
     wp.launch(
         kernel_selection.label_flagged_components,
         dim=n_faces,
-        inputs=[parents, seeds, True, labels, label_seeded],
+        inputs=[parents, seeds, True, labels, seeds],
         device=device,
     )
     # A label names a representative face, so the per-face answer is a gather of the per-label flag,
     # and it writes every entry.
     left = wp.empty(n_faces, dtype=wp.bool, device=device)
-    wp.copy(left, label_seeded[labels])
+    wp.copy(left, seeds[labels])
     return left
 
 
@@ -293,11 +301,6 @@ def exclude_fully_selected_components(
     device = mask.device
     if n_vertices == 0:
         return wp.clone(mask)
-    # The labelling needs the edges, not their deduplication: every component is labelled by its
-    # smallest vertex id whatever order and multiplicity the unions arrive in, so the faces' own
-    # directed edges give the identical labels without the sort. ``validate=False``: the endpoints
-    # are the face buffer's indices, which this function trusts to be below ``n_vertices`` as the
-    # rest of its caller's pipeline does.
     # A union-find labels every component by its smallest vertex whatever the order and
     # multiplicity of the unions, so the faces' own edges, formed in the thread, give the identical
     # labels without an edge table. The endpoints are the face buffer's indices, which this

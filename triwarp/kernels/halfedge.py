@@ -175,10 +175,10 @@ def count_mispaired_twins(
     # different edges, and the endpoint test alone permits a third halfedge on the same edge
     # claiming one of them back. A boundary entry (``-1``) is legal and skipped.
     #
-    # Written as separate ``if``s rather than one ``or`` chain because the range test has to run
-    # *before* the gathers it guards, and kernel-scope ``or`` is not a short-circuit this code
-    # should depend on: an out-of-range twin would otherwise index the face buffer, which on the
-    # CPU device is a host-heap read rather than a fault.
+    # The range test has to run *before* the gathers it guards: an out-of-range twin would
+    # otherwise index the face buffer, which on the CPU device is a host-heap read rather than a
+    # fault. (Kernel-scope ``or`` does short-circuit on Warp 1.17 -- ``emit_BoolOp`` guards each
+    # operand -- but the separate ``if``s keep the order explicit.)
     #
     # That range test is against ``twins.shape[0]`` and **not** ``faces.shape[0]``, which are not
     # the same number: the wrapper defines the halfedge count as ``faces.shape[0] // 3 * 3``, so a

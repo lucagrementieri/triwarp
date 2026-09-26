@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import warp as wp
 
@@ -17,8 +18,10 @@ from triwarp._device import (
 from triwarp.constants import INDEX_RADIX_PAIR
 from triwarp.kernels import adjacency as kernel_adjacency
 from triwarp.kernels import array as kernel_array
+from triwarp.kernels import intersection as kernel_intersection
 from triwarp.kernels import triangles as kernel_triangles
 from triwarp.kernels import validation as kernel_validation
+from triwarp.kernels.algorithms import connected_components as kernel_connected_components
 
 
 def is_edge_manifold(
@@ -81,8 +84,9 @@ def is_edge_manifold(
     corresponds to the ``allow_boundary_edges=True`` case.
 
     Deliberately **not** ``all(edge_manifold_mask(faces))``, unlike the other ``is_*`` / ``*_mask``
-    pairs here: this reduces the per-edge counts directly, where the mask additionally needs
-    ``unique_1d``'s inverse and a per-face gather pass. Delegating would add both to the cheap path.
+    pairs here: this counts the edges in a hash table and reads it in place, where the mask needs
+    each halfedge's own count and so sorts the keys. Delegating would add the sort to the cheap
+    path.
     """
     require_same_device(faces=faces, edges_sorted=edges_sorted)
     n_faces = int(faces.shape[0]) // 3
@@ -108,7 +112,11 @@ def is_edge_manifold(
             device=device,
         )
     else:
-        keys = _manifold_edge_keys(faces, edges_sorted, n_vertices, validate, "is_edge_manifold")
+        keys = _halfedge_keys(
+            faces,
+            edges_sorted,
+            _validated_vertex_bound(faces, n_vertices, validate, "is_edge_manifold"),
+        )
     # Counted with ``grouping.hashed_occurrence_counts``, the table ``grouping.unique_1d`` builds,
     # and tested in place: the answer is
     # order-free and needs no per-edge output, so the compaction, the sort and the host read of
@@ -190,41 +198,39 @@ def edge_manifold_mask(
     if n_faces == 0:
         return wp.empty(0, dtype=wp.bool, device=device)
 
-    keys = _manifold_edge_keys(faces, edges_sorted, n_vertices, validate, "edge_manifold_mask")
-    _, inverse, counts = tw.grouping.unique_1d(keys, return_inverse=True, return_counts=True)
-
-    out_mask = wp.empty(n_faces, dtype=wp.bool, device=device)
+    # The share count of each edge is the length of its run of sorted keys, read in place: no
+    # unique-edge table, inverse or count array, and no host read of the unique count.
+    keys, order = _sorted_halfedge_keys(
+        faces,
+        edges_sorted,
+        _validated_vertex_bound(faces, n_vertices, validate, "edge_manifold_mask"),
+    )
+    out_mask = wp.full(n_faces, True, dtype=wp.bool, device=device)
     wp.launch(
-        kernel_validation.face_edge_manifold_mask,
-        dim=n_faces,
-        inputs=[inverse, counts, wp.bool(allow_boundary_edges), out_mask],
+        kernel_validation.sorted_run_manifold_mask,
+        dim=int(keys.shape[0]),
+        inputs=[keys, order, wp.bool(allow_boundary_edges), out_mask],
         device=device,
     )
     return out_mask
 
 
-def _manifold_edge_keys(
-    faces: wp.array[wp.int32],
-    edges_sorted: twt.Array2dInt32 | None,
-    n_vertices: int | None,
-    validate: bool,
-    name: str,
-) -> wp.array[wp.uint64]:
+def _validated_vertex_bound(
+    faces: wp.array[wp.int32], n_vertices: int | None, validate: bool, name: str
+) -> int | None:
     """
-    Packed undirected key of every halfedge, for the two edge-manifold predicates.
+    Resolve the edge-key radix of the two edge-manifold predicates, checking ``faces`` on request.
 
-    The keys always come straight off the faces (or the caller's ``edges_sorted``) through
-    ``_halfedge_keys``; what ``validate`` adds is one reduction over the face buffer, never over
-    the ``(3F, 2)`` rows. Without ``n_vertices`` that reduction also supplies the radix, and only
-    its negative half is informative; unvalidated and without ``n_vertices`` the radix is
-    ``INDEX_RADIX_PAIR`` and nothing is reduced.
+    What ``validate`` adds is one reduction over the face buffer, never over the ``(3F, 2)`` rows.
+    Without ``n_vertices`` that reduction also supplies the radix, and only its negative half is
+    informative; unvalidated and without ``n_vertices`` the radix stays ``None`` (so the keys pack
+    against ``INDEX_RADIX_PAIR``) and nothing is reduced.
     """
     if validate:
         if n_vertices is None:
-            n_vertices = tw.array.index_bound(faces, require_non_negative=True)
-        else:
-            require_valid_faces(faces, n_vertices, name)
-    return _halfedge_keys(faces, edges_sorted, n_vertices)
+            return tw.array.index_bound(faces, require_non_negative=True)
+        require_valid_faces(faces, n_vertices, name)
+    return n_vertices
 
 
 def is_vertex_manifold(
@@ -307,32 +313,47 @@ def is_vertex_manifold(
         n_vertices = tw.array.index_bound(faces, require_non_negative=face_adjacency is None)
     violation = wp.zeros(1, dtype=wp.int32, device=faces.device)
     if face_adjacency is None:
-        corner_edges = _corner_edges_from_keys(
-            faces, _sorted_halfedge_keys(faces, None, n_vertices), False, violation
+        parents = _corner_parents_from_keys(
+            faces, _sorted_halfedge_keys(faces, None, n_vertices), False, None
         )
     else:
         assert face_adjacency_edges is not None
-        corner_edges = _corner_edges_from_adjacency(faces, face_adjacency, face_adjacency_edges)
-    _flag_vertex_manifold_violation(faces, n_vertices, corner_edges, violation)
+        parents = _corner_parents_from_adjacency(faces, face_adjacency, face_adjacency_edges)
+    _vertex_manifold_check(faces, n_vertices, parents, None, violation)
     return int(read_scalar(violation)) == 0
 
 
-def _corner_edges_from_adjacency(
+def _corner_parents_from_adjacency(
     faces: wp.array[wp.int32],
     face_adjacency: twt.Array2dInt32,
     face_adjacency_edges: twt.Array2dInt32,
-) -> twt.Array2dInt32:
-    """Two corner-graph edges per face-adjacency row, one per shared-edge endpoint."""
+) -> wp.array[wp.int32]:
+    """
+    Union-find forest of the corner graph over a face-adjacency table.
+
+    Two corner-graph edges per adjacency row, one per shared-edge endpoint, hooked by
+    ``connected_components``' edge-list pre-hook and hook: the forest
+    [`connected_component_labels_from_edges`][triwarp.graph.connected_component_labels_from_edges]
+    flattens, left unflattened for the fused labelling pass that follows.
+    """
+    device = faces.device
+    parents = tw.array.arange(int(faces.shape[0]) // 3 * 3, device=device)
     m = int(face_adjacency.shape[0])
-    corner_edges = twt.empty_2d((2 * m, 2), wp.int32, device=faces.device)
-    if m > 0:
-        wp.launch(
-            kernel_validation.build_corner_adjacency_edges,
-            dim=m,
-            inputs=[faces, face_adjacency, face_adjacency_edges, corner_edges],
-            device=faces.device,
-        )
-    return corner_edges
+    if m == 0:
+        return parents
+    corner_edges = twt.empty_2d((2 * m, 2), wp.int32, device=device)
+    wp.launch(
+        kernel_validation.build_corner_adjacency_edges,
+        dim=m,
+        inputs=[faces, face_adjacency, face_adjacency_edges, corner_edges],
+        device=device,
+    )
+    for kernel in (
+        kernel_connected_components.ecl_init_parent_edges,
+        kernel_connected_components.ecl_hook_edges,
+    ):
+        wp.launch(kernel, dim=2 * m, inputs=[corner_edges, parents], device=device)
+    return parents
 
 
 def vertex_manifold_mask(
@@ -375,10 +396,12 @@ def vertex_manifold_mask(
         return wp.zeros(n_vertices, dtype=wp.bool, device=faces.device)
     # The corner graph straight off the sorted halfedge keys, with its pair check off: no thread
     # indexes the violation flag, so none is allocated.
-    corner_edges = _corner_edges_from_keys(
+    parents = _corner_parents_from_keys(
         faces, _sorted_halfedge_keys(faces, None, n_vertices), False, None
     )
-    return _vertex_manifold_flags(faces, n_vertices, corner_edges)[0]
+    mask = wp.zeros(n_vertices, dtype=wp.bool, device=faces.device)
+    _vertex_manifold_check(faces, n_vertices, parents, mask, None)
+    return mask
 
 
 def is_self_intersecting(mesh: wp.Mesh, *, max_triangle_collisions: int = 32) -> bool:
@@ -539,7 +562,7 @@ def _mark_self_intersections(
     targets = wp.empty(n_faces * max_triangle_collisions, dtype=wp.int32, device=device)
     counts = wp.empty(n_faces, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_validation.collect_self_intersection_candidates,
+        kernel_intersection.collect_face_box_candidates,
         dim=n_faces,
         inputs=[mesh.id, lower, upper, max_triangle_collisions],
         outputs=[targets, counts],
@@ -736,11 +759,10 @@ def face_orientation_bits(
     # parity 0. What changes is the cost — the fill ran one launch per graph level, so a mesh whose
     # face adjacency is a long path (a ribbon) paid tens of thousands of launches and thousands of
     # readbacks for work bounded by a few milliseconds of bandwidth.
-    # ``validate=False``: ``signed_edges`` holds face ids this function just built from
-    # ``adjacency`` (itself bounded by ``n_faces`` by construction), so the range check would only
-    # re-derive a bound already guaranteed -- at the cost of a device synchronization.
-    _labels, orient = tw.graph.connected_component_parity_from_edges(
-        signed_edges, signs, n_faces, validate=False
+    # ``signed_edges`` holds face ids this function just built from ``adjacency`` (itself bounded
+    # by ``n_faces`` by construction) and every sign is ``0`` or ``1``, so nothing is range-checked.
+    orient = _solve_orientation(
+        n_faces, kernel_connected_components.ecl_hook_parity, m, [signed_edges, signs], device
     )
     return orient, signed_edges, signs, m
 
@@ -784,13 +806,13 @@ def is_orientable(faces: wp.array[wp.int32]) -> bool:
     if n_faces == 0:
         return True
 
-    orient, signed_edges, signs = _orientation_bits_from_keys(faces)
+    orient, keys, order = _orientation_bits_from_keys(faces)
     device = faces.device
     conflict = wp.zeros(1, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_validation.verify_orientation,
-        dim=int(signs.shape[0]),
-        inputs=[signed_edges, signs, orient, conflict],
+        kernel_validation.sorted_pair_orientation_conflict,
+        dim=int(keys.shape[0]),
+        inputs=[faces, keys, order, orient, conflict],
         device=device,
     )
     return int(read_scalar(conflict, 0)) == 0
@@ -848,9 +870,9 @@ def face_flip_mask(faces: wp.array[wp.int32]) -> wp.array[wp.bool]:
 
 def _orientation_bits_from_keys(
     faces: wp.array[wp.int32],
-) -> tuple[wp.array[wp.int32], twt.Array2dInt32, wp.array[wp.int32]]:
+) -> tuple[wp.array[wp.int32], wp.array[wp.uint64], wp.array[wp.int32]]:
     """
-    Flip bits and signed edges, the signed edges read straight off the sorted halfedge keys.
+    Flip bits, with the signed edges formed straight off the sorted halfedge keys.
 
     The bits [`face_orientation_bits`][triwarp.validation.face_orientation_bits] returns.
 
@@ -859,25 +881,49 @@ def _orientation_bits_from_keys(
     The pair rows keep their adjacency order, so the bits are the ones the adjacency table gives,
     and neither that table nor the host read of its length is built. For callers that consume the
     bits, not the table: [`is_orientable`][triwarp.validation.is_orientable] and
-    [`face_flip_mask`][triwarp.validation.face_flip_mask]. ``faces`` must be non-empty.
+    [`face_flip_mask`][triwarp.validation.face_flip_mask]. ``faces`` must be non-empty. The sorted
+    keys are returned too, so a caller can re-form the same edges.
     """
-    device = faces.device
-    n_faces = int(faces.shape[0]) // 3
     keys, order = _sorted_halfedge_keys(faces, None, None)
-    signed_edges = twt.empty_2d((3 * n_faces, 2), wp.int32, device=device)
-    signs = wp.empty(3 * n_faces, dtype=wp.int32, device=device)
+    # Every endpoint is a face id derived in the thread from a halfedge index, bounded by
+    # ``n_faces`` by construction, and every sign is ``0`` or ``1``.
+    orient = _solve_orientation(
+        int(faces.shape[0]) // 3,
+        kernel_validation.sorted_pair_hook_parity,
+        int(keys.shape[0]),
+        [faces, keys, order],
+        faces.device,
+    )
+    return orient, keys, order
+
+
+def _solve_orientation(
+    n_faces: int, hook: wp.Kernel, n_edges: int, hook_inputs: list[Any], device: wp.Device
+) -> wp.array[wp.int32]:
+    """
+    Z2 potential of a signed face graph: the parity union-find, returning the parity alone.
+
+    [`connected_component_parity_from_edges`][triwarp.graph.connected_component_parity_from_edges]'s
+    three launches with ``hook`` in place of its edge-list hook and no label table, which neither
+    orientation caller reads. ``hook_inputs`` precede the packed words in ``hook``'s signature.
+    """
+    words = wp.empty(n_faces, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_validation.signed_face_edges_from_sorted_keys,
-        dim=3 * n_faces,
-        inputs=[faces, keys, order, signed_edges, signs],
+        kernel_connected_components.ecl_init_parent_parity,
+        dim=n_faces,
+        inputs=[words],
         device=device,
     )
-    # ``validate=False``: every endpoint is a face id the kernel above derived from a halfedge
-    # index, bounded by ``n_faces`` by construction.
-    _labels, orient = tw.graph.connected_component_parity_from_edges(
-        signed_edges, signs, n_faces, validate=False
+    if n_edges > 0:
+        wp.launch(hook, dim=n_edges, inputs=[*hook_inputs, words], device=device)
+    orient = wp.empty(n_faces, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_connected_components.ecl_flatten_parity,
+        dim=n_faces,
+        inputs=[words, None, orient],
+        device=device,
     )
-    return orient, signed_edges, signs
+    return orient
 
 
 def is_watertight(
@@ -951,10 +997,10 @@ def is_watertight(
     # flag and it is read once; only the self-intersection test, which needs a BVH, waits for it.
     n_vertices = int(vertices.shape[0])
     violation = wp.zeros(1, dtype=wp.int32, device=faces.device)
-    corner_edges = _corner_edges_from_keys(
+    parents = _corner_parents_from_keys(
         faces, _sorted_halfedge_keys(faces, edges_sorted, n_vertices), True, violation
     )
-    _flag_vertex_manifold_violation(faces, n_vertices, corner_edges, violation)
+    _vertex_manifold_check(faces, n_vertices, parents, None, violation)
     if int(read_scalar(violation)) != 0:
         return False
     if mesh is None:
@@ -1228,37 +1274,58 @@ def face_defective_mask(
     return out_bad
 
 
-def _flag_vertex_manifold_violation(
+def _corner_parents_from_keys(
     faces: wp.array[wp.int32],
-    n_vertices: int,
-    corner_edges: twt.Array2dInt32,
-    violation: wp.array[wp.int32],
-) -> None:
+    sorted_keys: tuple[wp.array[wp.uint64], wp.array[wp.int32]],
+    require_pairs: bool,
+    violation: wp.array[wp.int32] | None,
+) -> wp.array[wp.int32]:
     """
-    Raise ``violation[0]`` unless every vertex in ``[0, max(faces)]`` is referenced and manifold.
+    Union-find forest of the corner graph, hooked straight off the sorted halfedge keys.
 
-    One verdict over any table at least ``max(faces) + 1`` long, so a caller's vertex count serves
-    as well as the bound and no reduction has to find the bound first. The flag is the caller's, so
-    it can already carry another test's verdict and be read back once for both.
+    The pairs [`face_adjacency`][triwarp.adjacency.face_adjacency] would emit are the runs of
+    exactly two equal keys, so no adjacency table, run scan or host read of its length is needed,
+    and each corner-graph edge is formed inside the pre-hook and the hook rather than written to a
+    table first; every other halfedge links its own corner to itself. With ``require_pairs`` the
+    pre-hook raises ``violation[0]`` on any edge not shared by exactly two faces; without it
+    ``violation`` is never read and may be ``None``.
     """
-    manifold, min_label = _vertex_manifold_flags(faces, n_vertices, corner_edges)
+    keys, order = sorted_keys
+    n = int(keys.shape[0])
+    parents = tw.array.arange(n, device=faces.device)
     wp.launch(
-        kernel_validation.vertex_manifold_violation,
-        dim=n_vertices,
-        inputs=[min_label, manifold, violation],
+        kernel_validation.sorted_corner_prehook,
+        dim=n,
+        inputs=[faces, keys, order, require_pairs, parents, violation],
         device=faces.device,
     )
+    wp.launch(
+        kernel_validation.sorted_corner_hook,
+        dim=n,
+        inputs=[faces, keys, order, parents],
+        device=faces.device,
+    )
+    return parents
 
 
-def _vertex_manifold_flags(
-    faces: wp.array[wp.int32], n_vertices: int, corner_edges: twt.Array2dInt32
-) -> tuple[wp.array[wp.bool], wp.array[wp.int32]]:
+def _vertex_manifold_check(
+    faces: wp.array[wp.int32],
+    n_vertices: int,
+    parents: wp.array[wp.int32],
+    mask: wp.array[wp.bool] | None,
+    violation: wp.array[wp.int32] | None,
+) -> None:
     """
-    Per-vertex manifold flags shared by the predicate and the mask.
+    Per-vertex manifold test over a hooked corner-graph forest, shared by the predicate and mask.
 
-    Labels the corner graph (node ``3 * f + k`` per face corner) whose ``corner_edges`` link the
-    corresponding corners of edge-adjacent faces, and flags a vertex when all of its corners land
-    in one component.
+    Labels the corner graph (node ``3 * f + k`` per face corner) from ``parents`` and flags a
+    vertex unless all of its corners land in one component. Exactly one of ``mask`` and
+    ``violation`` is given. A ``mask`` arrives zeroed, length ``n_vertices``, and leaves ``True``
+    at every referenced vertex whose corners share one component. A ``violation`` flag is raised
+    unless every vertex in ``[0, max(faces)]`` is referenced and manifold -- libigl's predicate --
+    which holds over any ``n_vertices`` at least ``max(faces) + 1``, so a caller's vertex count
+    serves as well as the bound. The flag is the caller's, so it can already carry another test's
+    verdict and be read back once for both.
 
     ``n_vertices`` is a parameter rather than derived because the two public callers size their
     answer differently on purpose:
@@ -1266,75 +1333,23 @@ def _vertex_manifold_flags(
     convention, so unreferenced vertices in that range count as non-manifold) while
     [`vertex_manifold_mask`][triwarp.validation.vertex_manifold_mask] uses the caller's vertex
     buffer length.
-
-    Parameters
-    ----------
-    faces
-        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer, non-empty.
-    n_vertices
-        Output length.
-    corner_edges
-        ``(k, 2)`` corner-graph edges, from ``_corner_edges_from_keys`` or
-        ``_corner_edges_from_adjacency``.
-
-    Returns
-    -------
-    manifold : wp.array[wp.bool]
-        Length ``n_vertices`` on ``faces.device``.
-    min_label : wp.array[wp.int32]
-        Length ``n_vertices``: each vertex's smallest corner-component label, ``INT32_MAX`` for a
-        vertex no corner references.
     """
     device = faces.device
     n_corners = int(faces.shape[0]) // 3 * 3
-
-    # ``validate=False``: both endpoints of every edge are corner ids its builder wrote, bounded
-    # by ``n_corners`` by construction.
-    labels = tw.graph.connected_component_labels_from_edges(
-        corner_edges, node_count=n_corners, validate=False
-    )
-
+    labels = wp.empty(n_corners, dtype=wp.int32, device=device)
     min_label = wp.full(n_vertices, twt.dtype_max(wp.int32), dtype=wp.int32, device=device)
-    manifold = wp.zeros(n_vertices, dtype=wp.bool, device=device)
     wp.launch(
-        kernel_validation.corner_vertex_reduce,
+        kernel_validation.corner_labels_and_vertex_min,
         dim=n_corners,
-        inputs=[faces, labels, min_label, manifold],
+        inputs=[faces, parents, labels, min_label, mask],
         device=device,
     )
     wp.launch(
         kernel_validation.corner_vertex_check,
         dim=n_corners,
-        inputs=[faces, labels, min_label, manifold],
+        inputs=[faces, labels, min_label, mask, violation],
         device=device,
     )
-    return manifold, min_label
-
-
-def _corner_edges_from_keys(
-    faces: wp.array[wp.int32],
-    sorted_keys: tuple[wp.array[wp.uint64], wp.array[wp.int32]],
-    require_pairs: bool,
-    violation: wp.array[wp.int32] | None,
-) -> twt.Array2dInt32:
-    """
-    One corner-graph edge per halfedge, read straight off the sorted halfedge keys.
-
-    The pairs [`face_adjacency`][triwarp.adjacency.face_adjacency] would emit are the runs of
-    exactly two equal keys, so no adjacency table, run scan or host read of its length is needed;
-    every other halfedge links its own corner to itself. With ``require_pairs`` the same pass raises
-    ``violation[0]`` on any edge not shared by exactly two faces; without it ``violation`` is never
-    read and may be ``None``.
-    """
-    keys, order = sorted_keys
-    corner_edges = twt.empty_2d((int(keys.shape[0]), 2), wp.int32, device=faces.device)
-    wp.launch(
-        kernel_validation.corner_edges_from_sorted_keys,
-        dim=int(keys.shape[0]),
-        inputs=[faces, keys, order, require_pairs, corner_edges, violation],
-        device=faces.device,
-    )
-    return corner_edges
 
 
 def _sorted_halfedge_keys(

@@ -1,6 +1,7 @@
 import warp as wp
 
 from triwarp.kernels.array import unpack_edge_key
+from triwarp.kernels.halfedge import halfedge_endpoints
 from triwarp.kernels.predicates import segment_aabb, side_lengths
 
 
@@ -53,6 +54,18 @@ def edge_lengths(
 ) -> None:
     i = wp.int32(wp.tid())
     out_lengths[i] = wp.length(vertices[edges[i, 1]] - vertices[edges[i, 0]])
+
+
+@wp.kernel
+def halfedge_lengths(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_lengths: wp.array[wp.float32]
+) -> None:
+    # ``edge_lengths`` over the ``faces_to_edges`` rows, read straight off the faces: row ``h`` of
+    # that table is halfedge ``h``, so the ``(3 * n_faces, 2)`` table is never written only to be
+    # gathered through once.
+    h = wp.int32(wp.tid())
+    tail, tip = halfedge_endpoints(faces, h)
+    out_lengths[h] = wp.length(vertices[tip] - vertices[tail])
 
 
 @wp.kernel

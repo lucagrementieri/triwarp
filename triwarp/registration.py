@@ -371,17 +371,16 @@ def icp(
 
     # Every buffer is allocated once and rewritten in place by every round. The fit lands in
     # ``fitted`` and is copied into ``total`` only once ``point_to_point_round`` has seen that it
-    # carried weight; ``state`` is the shared round / condition word; ``cost`` is the kept fit's
-    # cost and, seeded ``inf``, the "previous cost" the convergence test reads.
+    # carried weight; ``state`` is the shared round / condition word; ``acc`` is the fit's moments
+    # plus the kept fit's cost, which is also the "previous cost" the convergence test reads.
     closest = wp.empty(n, dtype=wp.vec3, device=device)
     weights = (
         wp.empty(n, dtype=wp.float32, device=device)
         if max_distance is not None
         else _zero_length(wp.float32, device)
     )
-    acc = wp.zeros(kernel_registration.PROCRUSTES_ACC_SIZE, dtype=wp.float32, device=device)
+    acc = wp.zeros(kernel_registration.ICP_POINT_ACC_SIZE, dtype=wp.float32, device=device)
     fitted = wp.empty(1, dtype=wp.mat44, device=device)
-    cost = wp.full(1, math.inf, dtype=wp.float32, device=device)
     state = wp.zeros(kernel_array.LOOP_STATE_SIZE, dtype=wp.int32, device=device)
 
     blocks = kernel_reduce.blocks_1d(n)
@@ -400,7 +399,7 @@ def icp(
     matrix_inputs = [a, closest, acc, reflection, translation, scale, fitted]
     cost_inputs = [a, closest, weights, fitted, acc, _zero_length(wp.vec3, device)]
     round_inputs = [wp.float64(threshold), wp.int32(max_iterations), fitted]
-    round_outputs = [acc, total, cost, state]
+    round_outputs = [acc, total, state]
 
     def iterate() -> None:
         wp.launch(
@@ -452,7 +451,7 @@ def icp(
         replay()
     _apply_transform(a, total, transformed)
     # The kept fit's cost, ``inf`` if every fit was weightless: a pinned call's one readback.
-    return total, transformed, float(read_scalar(cost, 0))
+    return total, transformed, float(read_scalar(acc, int(kernel_registration.ACC_KEPT_COST)))
 
 
 _ZERO_LENGTH: dict[tuple[str, type], wp.array[Any]] = {}
@@ -513,8 +512,10 @@ def icp_point_to_plane(
         built ``wp.Mesh`` aliases ``target_vertices`` and ``target_faces`` rather than copying
         them; do not mutate them for the duration of the call.
     target_normals
-        Per-vertex unit normals for a point-cloud target, shape ``(m,)``. Required
-        (and only used) when ``target_faces`` is ``None``. Estimate them with
+        Per-vertex normals for a point-cloud target, shape ``(m,)``. They need not be unit
+        length: each is normalized where it is read, by the fit and by the robust scale alike (a
+        zero normal contributes nothing). Required (and only used) when ``target_faces`` is
+        ``None``. Estimate them with
         [`estimate_normals`][triwarp.points.estimate_normals] if absent.
     initial
         Initial transform, as a ``(1,)`` ``wp.mat44`` array or scalar ``wp.mat44``.
@@ -628,20 +629,17 @@ def icp_point_to_plane(
 
     # All buffers are allocated once and the loop rewrites them in place: the step is applied to
     # ``current`` by the next correspondence search, the solve composes into ``total`` and zeroes
-    # the accumulators it has just read. ``total`` is ``_resolve_initial``'s own copy, so composing
-    # into it never touches a caller's array.
+    # the moments it has just read. ``total`` is ``_resolve_initial``'s own copy, so composing into
+    # it never touches a caller's array. ``acc`` is the normal equations, the two scalars and the
+    # previous kept cost in one buffer (``kernel_registration.ICP_ACC_SIZE``); ``state`` the shared
+    # round and condition slots.
     closest = wp.empty(n, dtype=wp.vec3, device=device)
     distance = wp.empty(n, dtype=wp.float32, device=device)
     triangle_id = wp.empty(n, dtype=wp.int32, device=device)
-    jtj = wp.zeros(1, dtype=wp.spatial_matrix, device=device)
-    jtr = wp.zeros(1, dtype=wp.spatial_vector, device=device)
-    scalar_acc = wp.zeros(kernel_registration.ICP_SCALAR_ACC_SIZE, dtype=wp.float32, device=device)
+    acc = wp.zeros(kernel_registration.ICP_ACC_SIZE, dtype=wp.float32, device=device)
     step = wp.empty(1, dtype=wp.mat44, device=device)
     total = initial_matrix
-    # The loop's state: the shared round and condition slots, and the previous kept cost, seeded
-    # ``inf`` so the first round never reads as converged.
     state = wp.zeros(kernel_array.LOOP_STATE_SIZE, dtype=wp.int32, device=device)
-    old_cost = wp.full(1, math.inf, dtype=wp.float64, device=device)
 
     # The correspondence step is one launch: the step applied to each point, and its match on the
     # target -- the closest point on a mesh, or the nearest vertex of a cloud through the hoisted
@@ -687,9 +685,7 @@ def icp_point_to_plane(
                 wp.float32(max_d),
                 wp.int32(kind),
                 wp.float32(scale_value if scale_value is not None else 0.0),
-                jtj,
-                jtr,
-                scalar_acc,
+                acc,
             ],
             block_dim=TILE_1D,
             device=device,
@@ -705,7 +701,7 @@ def icp_point_to_plane(
         )
 
     round_inputs = [wp.float32(damping), wp.float64(threshold), wp.int32(max_iterations)]
-    round_outputs = [jtj, jtr, scalar_acc, total, old_cost, step, state]
+    round_outputs = [acc, total, step, state]
 
     def close_round() -> None:
         wp.launch(
@@ -770,7 +766,7 @@ def icp_point_to_plane(
     search(stepped)
     resolve_scale()
     accumulate()
-    scalars = scalar_acc.numpy()
+    scalars = acc.numpy()
     if float(scalars[kernel_registration.ICP_WEIGHT_SUM]) <= 0.0:
         return total, current, math.inf
     return total, current, float(scalars[kernel_registration.ICP_COST])

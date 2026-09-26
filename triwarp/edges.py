@@ -379,10 +379,19 @@ def edges_length(
         If ``vertices``, ``faces`` and ``edges_in`` are not all on one device.
     """
     require_same_device(vertices=vertices, faces=faces, edges_in=edges_in)
-    if edges_in is None:
-        edges_in = faces_to_edges(faces)
-
-    return _edge_lengths(vertices, edges_in, "edges_in")
+    if edges_in is not None:
+        return _edge_lengths(vertices, edges_in, "edges_in")
+    # Without a table the rows are the halfedges, so the lengths come straight off ``faces``.
+    n_halfedges = int(faces.shape[0]) // 3 * 3
+    out = wp.empty(n_halfedges, dtype=wp.float32, device=vertices.device)
+    if n_halfedges > 0:
+        wp.launch(
+            kernel_edges.halfedge_lengths,
+            dim=n_halfedges,
+            inputs=[vertices, faces, out],
+            device=vertices.device,
+        )
+    return out
 
 
 def _edge_lengths(

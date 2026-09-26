@@ -635,6 +635,59 @@ def test_pooled_solver_state_follows_each_operator(
         assert np.array_equal(pooled._cycle.owner._steps.numpy(), fresh)
 
 
+def test_pooled_squared_laplacian_state_follows_each_system(
+    device: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Class A, against ``numpy.linalg.solve``: a squared-Laplacian pooled state follows its callers.
+
+    It must follow both the operator and the caller's preconditioner.
+    The preconditioner is built fresh per call against each fresh system, as the region solves do,
+    so a kept state is only reached through the pool, which copies the operator *and* the
+    preconditioner into the state's own arrays (``_BatchedCg.refresh``). Three systems alternating
+    through it must each get their own answer, no solve after the first two may record a graph, and
+    -- since a stale preconditioner changes only the rate, which no answer can see -- the pooled
+    copy of the polynomial must be bit-for-bit the last caller's. The one-block gate is lowered so
+    these small systems reach the pool.
+    """
+    monkeypatch.setattr(tw.linalg, "CG_ONE_BLOCK_MAX_ROWS", 0)
+    systems = [_spd_system(device, n_rhs=2, seed=seed) for seed in (41, 42, 43)]
+    preconditioners = []
+
+    def solve(matrix_wp: wps.BsrMatrix, rhs_wp: twt.Array2dFloat64) -> np.ndarray:
+        weights_wp = wp.full(int(matrix_wp.nrow), 2.0, dtype=wp.float64, device=device)
+        preconditioner = tw.linalg.squared_laplacian_preconditioner(matrix_wp, weights_wp)
+        preconditioners.append(preconditioner)
+        solution_wp = twt.as_array2d(wp.zeros_like(rhs_wp), wp.float64)
+        tw.linalg.solve_spd_columns(matrix_wp, rhs_wp, solution_wp, preconditioner=preconditioner)
+        return solution_wp.numpy()
+
+    for matrix_wp, rhs_wp, _dense_np, _rhs_np in systems[:2]:
+        solve(matrix_wp, rhs_wp)
+    captures = 0
+    enter = wp.ScopedCapture.__enter__
+
+    def counting_enter(self: wp.ScopedCapture) -> wp.ScopedCapture:
+        nonlocal captures
+        captures += 1
+        return enter(self)
+
+    monkeypatch.setattr(wp.ScopedCapture, "__enter__", counting_enter)
+    for matrix_wp, rhs_wp, dense_np, rhs_np in systems + systems:
+        expected_np = np.linalg.solve(dense_np, rhs_np.T).T
+        assert np.allclose(solve(matrix_wp, rhs_wp), expected_np, rtol=1e-6, atol=1e-6)
+    if wp.get_device(device).is_cuda and wp.is_conditional_graph_supported():
+        assert captures == 0
+    pooled = list(tw.linalg._SOLVER_POOL.values())[-1]
+    assert isinstance(pooled._cycle, tw.linalg._SquaredLaplacianApply)
+    owned, last = pooled._cycle.owner, preconditioners[-1]
+    assert owned is not last
+    assert np.array_equal(owned._steps.numpy(), last._steps.numpy())
+    for mine, theirs in ((owned._factor, last._factor), (owned._factor_t, last._factor_t)):
+        for field in ("offsets", "columns", "values"):
+            assert np.array_equal(getattr(mine, field).numpy(), getattr(theirs, field).numpy())
+
+
 def test_solver_cache_does_not_outlive_its_operator(
     device: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

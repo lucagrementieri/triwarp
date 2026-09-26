@@ -400,6 +400,48 @@ def read_scalar(arr: wp.array[Any], index: int = -1) -> Any:
     return _detached(scratch.numpy()[0])
 
 
+def read_values(arr: wp.array[Any], start: int, count: int) -> list[Any]:
+    """
+    ``count`` consecutive elements of a scalar ``arr`` from ``start``, read back in one copy.
+
+    The several-value counterpart of [`read_scalar`][triwarp._device.read_scalar], for a function
+    that writes a few small device values side by side and reads them once: a cached pageable
+    scratch per ``(dtype, count)`` and an offset copy, rather than a slice view plus ``.numpy()``'s
+    fresh host array, which costs over twice as much. Same pageable-scratch rule and the same
+    non-reentrancy as ``read_scalar``. ``count`` must be positive -- ``wp.copy`` reads
+    ``count=0`` as "the whole source".
+
+    Parameters
+    ----------
+    arr
+        Contiguous rank-1 Warp array of a scalar dtype.
+    start
+        First element to read.
+    count
+        Number of elements to read.
+
+    Returns
+    -------
+    list[Any]
+        The elements as Python scalars.
+    """
+    if count <= 0:
+        return []
+    device = arr.device
+    if device is None or not device.is_cuda:
+        return arr.numpy()[start : start + count].tolist()
+    key = (arr.dtype, count)
+    scratch = _VALUES_SCRATCH.get(key)
+    if scratch is None:
+        scratch = wp.empty(count, dtype=arr.dtype, device="cpu")
+        _VALUES_SCRATCH[key] = scratch
+    wp.copy(scratch, arr, src_offset=start, count=count)
+    return scratch.numpy().tolist()
+
+
+_VALUES_SCRATCH: dict[tuple[type, int], wp.array[Any]] = {}
+
+
 def _detached(value: Any) -> Any:
     """Copy ``value`` when it is a view, so a vector or matrix element outlives the next read."""
     return value.copy() if isinstance(value, np.ndarray) else value

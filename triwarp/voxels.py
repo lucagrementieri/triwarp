@@ -410,8 +410,7 @@ def _pool_by_voxel(
 
     The rows are the probe the pooling runs on anyway, and
     [`voxel_down_sample`][triwarp.voxels.voxel_down_sample]'s inverse is exactly them. ``None``
-    when nothing was probed (an empty grid or cloud), or when ``return_slots`` is ``False`` and
-    the pooling did not need them (``"mean"`` / ``"sum"`` sort by bucket instead).
+    when nothing was probed (an empty grid or cloud) or when ``return_slots`` is ``False``.
     """
     if pooling not in ("mean", "min", "max", "sum"):
         raise ValueError(f"pooling must be 'mean', 'sum', 'min' or 'max', got {pooling!r}")
@@ -429,65 +428,58 @@ def _pool_by_voxel(
     if n_points == 0:
         return wp.zeros(n_voxels, dtype=wp.vec3, device=device), None
 
-    # The min/max atomics read the slots; the mean/sum branch only returns them.
-    keeps_slots = return_slots or pooling in ("min", "max")
-    slots = wp.empty(n_points if keeps_slots else 0, dtype=wp.int32, device=device)
+    # Only a caller asking for the inverse gets the slots written; neither branch reads them back.
+    slots = wp.empty(n_points, dtype=wp.int32, device=device) if return_slots else None
     # One sentinel bucket past the last voxel collects the points that fall outside the grid.
     counts = wp.zeros(n_voxels + 1, dtype=wp.int32, device=device)
-    # Only the mean/sum branch sorts by bucket, and it gets the sort's two double buffers seeded
-    # by the launch itself; the min/max branch reads nothing from this launch but the slots and
-    # ``counts``, so it asks for no per-point buckets and allocates none.
-    sorts_by_bucket = pooling not in ("min", "max")
-    sort_length = 2 * n_points if sorts_by_bucket else 0
-    buckets = wp.empty(sort_length, dtype=wp.int32, device=device)
-    order = wp.empty(sort_length, dtype=wp.int32, device=device)
+    if pooling in ("min", "max"):
+        largest = pooling == "max"
+        limit = -math.inf if largest else math.inf
+        # The atomics reduce from +-inf in the probe launch itself; the voxels no point reached are
+        # reset to zero afterwards, once ``counts`` is final.
+        pooled = wp.full(n_voxels, wp.vec3(limit, limit, limit), dtype=wp.vec3, device=device)
+        wp.launch(
+            kernel_voxels.pool_extremum_points,
+            dim=n_points,
+            inputs=[grid.id, points, values, wp.int32(n_voxels), largest],
+            outputs=[slots, counts, pooled],
+            device=device,
+        )
+        wp.launch(
+            kernel_voxels.zero_empty_voxels,
+            dim=n_voxels,
+            inputs=[counts],
+            outputs=[pooled],
+            device=device,
+        )
+        return pooled, slots
+
+    # The launch seeds the sort's two double buffers, keys and identity payload.
+    buckets = wp.empty(2 * n_points, dtype=wp.int32, device=device)
+    order = wp.empty(2 * n_points, dtype=wp.int32, device=device)
     wp.launch(
         kernel_voxels.bucket_point_slots,
         dim=n_points,
-        inputs=[grid.id, points, wp.int32(n_voxels), sorts_by_bucket],
+        inputs=[grid.id, points, wp.int32(n_voxels)],
         outputs=[slots, buckets, order, counts],
         device=device,
     )
-
-    if pooling in ("min", "max"):
-        largest = pooling == "max"
-        limit = -float("inf") if largest else float("inf")
-        # Seeded from ``counts``, which is already final: an empty voxel starts at the zero it must
-        # end at, since the atomic min/max below never touches its slot, and every other voxel at
-        # the +-inf the atomics reduce from. The mean/sum branch below needs no seed at all
-        # (``segment_reduce_vec3`` initializes its running sum to zero and its loop is a no-op over
-        # an empty segment).
-        pooled = wp.empty(n_voxels, dtype=wp.vec3, device=device)
-        wp.launch(
-            kernel_voxels.seed_extremum_voxels,
-            dim=n_voxels,
-            inputs=[counts, wp.vec3(limit, limit, limit), pooled],
-            device=device,
-        )
-        wp.launch(
-            kernel_voxels.pool_extremum_vec3,
-            dim=n_points,
-            inputs=[slots, values, largest, pooled],
-            device=device,
-        )
-    else:
-        # Stable, so each voxel's segment lists its points in index order.
-        # Every bucket is at most ``n_voxels`` (the sentinel), so only those low bits are sorted.
-        wp.utils.radix_sort_pairs(
-            buckets, order, count=n_points, end_bit=max(1, int(n_voxels).bit_length())
-        )
-        # Only the offsets are wanted -- the total is ``n_points`` minus the sentinel bucket and
-        # nothing reads it -- so an exclusive scan with no readback.
-        offsets = wp.empty(n_voxels + 1, dtype=wp.int32, device=device)
-        wp.utils.array_scan(counts, out_array=offsets, inclusive=False)
-        pooled = wp.empty(n_voxels, dtype=wp.vec3, device=device)
-        wp.launch(
-            kernel_voxels.segment_reduce_vec3,
-            dim=n_voxels,
-            inputs=[order, values, offsets, counts, pooling == "mean", pooled],
-            device=device,
-        )
-    return pooled, slots if keeps_slots else None
+    # Stable, so each voxel's segment lists its points in index order.
+    # Every bucket is at most ``n_voxels`` (the sentinel), so only those low bits are sorted.
+    wp.utils.radix_sort_pairs(
+        buckets, order, count=n_points, end_bit=max(1, int(n_voxels).bit_length())
+    )
+    # Scanned in place: the inclusive scan carries each segment's start and length together.
+    wp.utils.array_scan(counts, out_array=counts, inclusive=True)
+    pooled = wp.empty(n_voxels, dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_voxels.segment_reduce_vec3,
+        dim=n_voxels,
+        inputs=[order, values, counts, pooling == "mean"],
+        outputs=[pooled],
+        device=device,
+    )
+    return pooled, slots
 
 
 def cells(grid: wp.Volume, *, order: Literal["grid", "sorted"] = "grid") -> twt.Array2dInt32:

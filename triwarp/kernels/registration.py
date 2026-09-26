@@ -36,13 +36,25 @@ ACC_MASK_N = wp.constant(24)  # count of w > 0
 PROCRUSTES_MOMENT_SLOTS = wp.constant(25)
 ACC_COST = wp.constant(25)  # weighted mean squared residual
 PROCRUSTES_ACC_SIZE = 26
+# ``icp``'s loop carries one slot more: the cost of the fit it has kept so far, which
+# ``point_to_point_round`` writes and never zeroes (``inf`` if round 0 was weightless).
+ACC_KEPT_COST = wp.constant(26)
+ICP_POINT_ACC_SIZE = 27
 
-# Point-to-plane accumulator's two scalars, in one buffer for the same reason the moments above
-# share one: ``icp_point_to_plane`` reads both back every iteration, ``accumulate_point_to_plane``
-# writes both, and one buffer is one host sync instead of two.
-ICP_COST = wp.constant(0)  # sum robust_loss(r); see ``robust_weight_and_loss``
-ICP_WEIGHT_SUM = wp.constant(1)  # sum w
-ICP_SCALAR_ACC_SIZE = 2
+# Point-to-plane accumulator, one ``float32`` buffer for the same reason the moments above share
+# one: the normal matrix, its right-hand side and the two scalars ``accumulate_point_to_plane``
+# folds as **one** packed block reduction and commits, then the previous kept cost the round's
+# convergence test reads. One allocation and one zero-fill for the whole loop state.
+ICP_JTJ = wp.constant(0)  # spatial_matrix, slots 0..35, row-major
+ICP_JTR = wp.constant(36)  # spatial_vector, slots 36..41
+ICP_COST = wp.constant(42)  # sum robust_loss(r); see ``robust_weight_and_loss``
+ICP_WEIGHT_SUM = wp.constant(43)  # sum w
+# What one block of ``accumulate_point_to_plane`` folds, ``ICP_JTJ`` through ``ICP_WEIGHT_SUM``.
+ICP_MOMENT_SLOTS = wp.constant(44)
+# The previous kept fit's cost, the ``float32`` it was read from. Never zeroed and never read before
+# the first kept fit: ``point_to_plane_round`` reads ``inf`` while the round counter is 0.
+ICP_OLD_COST = wp.constant(44)
+ICP_ACC_SIZE = 45
 
 
 @wp.func
@@ -331,6 +343,21 @@ def residual_valid(
 
 
 @wp.func
+def target_unit_normal(normals: wp.array[wp.vec3], index: wp.int32) -> wp.vec3:
+    """
+    Return the target's normal at correspondence ``index``, normalized, or zero for a zero entry.
+
+    The one reading of the normal table both the point-to-plane fit and its robust scale use, so
+    the two cannot measure residuals differently: a caller's ``target_normals`` need not be unit.
+    A mesh target's normals come from ``face_normals_and_areas``, which writes an exact zero vector
+    for a degenerate face (CLAUDE.md section 12.4) -- a plain ``wp.normalize`` there is ``0/0``,
+    and one poisoned lane's NaN would spread to a whole block through a tile reduction. Same guard,
+    same zero tolerance, as ``transform.transform_normal_mat33``'s identical hazard.
+    """
+    return normalize_or_zero(normals[index], wp.float32(0.0))
+
+
+@wp.func
 def distance_threshold_weight(
     distance: wp.float32, triangle_id: wp.int32, max_distance: wp.float32
 ) -> wp.float32:
@@ -450,7 +477,6 @@ def point_to_point_round(
     fitted: wp.array[wp.mat44],
     out_acc: wp.array[wp.float32],
     out_total: wp.array[wp.mat44],
-    out_cost: wp.array[wp.float32],
     out_state: wp.array[wp.int32],
 ) -> None:
     """
@@ -464,24 +490,32 @@ def point_to_point_round(
       The host loop broke before rebinding its result, which is what this reproduces without a
       ping-pong of the fit's buffers: the fit lands in ``fitted`` and only an accepted one is
       copied into ``out_total``;
-    - otherwise ``fitted`` becomes ``out_total``, its cost ``out_cost[0]``, and the loop continues
-      while fewer than ``max_iterations`` have run and the cost fell by at least ``threshold``.
+    - otherwise ``fitted`` becomes ``out_total``, its cost ``out_acc[ACC_KEPT_COST]``, and the loop
+      continues while fewer than ``max_iterations`` have run and the cost fell by at least
+      ``threshold``.
 
-    ``out_cost[0]`` doubles as the previous iteration's cost: seeded ``inf``, it is exactly the
-    host loop's ``old_cost`` whenever ``continue_icp_loop`` reads it. The accumulator is zeroed
-    after it is read, by this one thread, so no memset precedes the next round's fit.
+    ``ACC_KEPT_COST`` doubles as the previous iteration's cost. The round counter advances exactly
+    when a fit is kept, so while it reads 0 there is no previous cost and the test reads ``inf``,
+    the host loop's seed -- and a weightless round 0 writes ``inf`` there, the answer of a call
+    that kept nothing. The moments are zeroed after they are read, by this one thread, so no memset
+    precedes the next round's fit.
     """
     w_sum = out_acc[ACC_W_SUM]
     cost = out_acc[ACC_COST]
     for slot in range(PROCRUSTES_ACC_SIZE):
         out_acc[slot] = wp.float32(0.0)
+    first = out_state[LOOP_ROUND] == 0
     if w_sum == wp.float32(0.0):
+        if first:
+            out_acc[ACC_KEPT_COST] = wp.float32(FLOAT32_INF_CONSTANT)
         out_state[LOOP_CONDITION] = 0
         return
-    old_cost = out_cost[0]
+    old_cost = wp.float64(FLOAT32_INF_CONSTANT)
+    if not first:
+        old_cost = wp.float64(out_acc[ACC_KEPT_COST])
     out_total[0] = fitted[0]
-    out_cost[0] = cost
-    continue_icp_loop(wp.float64(old_cost), wp.float64(cost), threshold, max_iterations, out_state)
+    out_acc[ACC_KEPT_COST] = cost
+    continue_icp_loop(old_cost, wp.float64(cost), threshold, max_iterations, out_state)
 
 
 @wp.func
@@ -525,14 +559,14 @@ def robust_residual_keys(
     out_keys: wp.array[wp.float32],
 ) -> None:
     # Each correspondence's point-to-plane residual where it is in range, ``+inf`` where it is not.
-    # ``normals`` is the target's normal table, read at the correspondence's index as
-    # ``point_to_plane_tile`` reads it -- behind the range test, which is what keeps a miss's
-    # ``-1`` from indexing it (a ``wp.where`` evaluates both arms).
+    # ``normals`` is the target's normal table, read at the correspondence's index through
+    # ``target_unit_normal`` exactly as ``point_to_plane_tile`` reads it -- behind the range test,
+    # which is what keeps a miss's ``-1`` from indexing it (a ``wp.where`` evaluates both arms).
     i = wp.int32(wp.tid())
     key = wp.float32(FLOAT32_INF_CONSTANT)
     index = triangle_id[i]
     if residual_valid(index, distance[i], max_distance):
-        key = point_to_plane_residual(current[i], closest[i], normals[index])
+        key = point_to_plane_residual(current[i], closest[i], target_unit_normal(normals, index))
     out_keys[i] = key
 
 
@@ -660,12 +694,7 @@ def point_to_plane_tile(
         idx = offset + k
         if not residual_valid(triangle_id[idx], distance[idx], max_distance):
             continue
-        # A mesh target's ``normals`` come from ``face_normals_and_areas``, which writes an exact
-        # zero vector for a degenerate face (CLAUDE.md section 12.4) rather than raising -- a plain
-        # ``wp.normalize`` on that entry is ``0/0``, and one poisoned lane's NaN spreads to the
-        # whole block through the ``wp.tile_sum`` commit below. Same guard, same zero tolerance,
-        # as ``transform.transform_normal_mat33``'s identical hazard.
-        nrm = normalize_or_zero(normals[triangle_id[idx]], wp.float32(0.0))
+        nrm = target_unit_normal(normals, triangle_id[idx])
         x = source[idx]
         r = point_to_plane_residual(x, target[idx], nrm)
         w, loss = robust_weight_and_loss(r, robust_scale, robust_kind)
@@ -688,25 +717,23 @@ def accumulate_point_to_plane(
     max_distance: wp.float32,
     robust_kind: wp.int32,
     robust_scale: wp.float32,
-    out_jtj: wp.array[wp.spatial_matrix],
-    out_jtr: wp.array[wp.spatial_vector],
-    out_scalars: wp.array[wp.float32],
+    out_acc: wp.array[wp.float32],
 ) -> None:
     # Launched ``wp.launch_tiled(dim=blocks_1d(n), block_dim=TILE_1D)``: one block per
-    # ``ITEMS_PER_BLOCK_1D`` correspondences, lanes striding that block's own chunk, and three
-    # block reductions (the normal matrix, the right-hand side, the two scalars) committing one
-    # atomic set per block.
+    # ``ITEMS_PER_BLOCK_1D`` correspondences, lanes striding that block's own chunk, and one packed
+    # block reduction of all 44 moment slots (the normal matrix, the right-hand side, the two
+    # scalars) committing one atomic set per block.
     #
     # It was every lane walking a ``TILE_1D`` chunk with lane 0 publishing, which put one add per
-    # block on each of 43 hot addresses (36 for the normal matrix, 6 for the right-hand side, 1 for
-    # the cost) at ``n / TILE_1D`` blocks. Same finding as ``accumulate_procrustes_moments``: the
-    # redundant lanes were nearly free and the atomic contention was the cost, worth an order of
-    # magnitude at a million correspondences. 43 reductions is a much larger fixed cost per block
-    # than the moments kernel's 25, which is why this trails it at small ``n`` and catches up once
-    # the fold has enough to amortize.
+    # block on each of 44 hot addresses at ``n / TILE_1D`` blocks. Same finding as
+    # ``accumulate_procrustes_moments``: the redundant lanes were nearly free and the atomic
+    # contention was the cost, worth an order of magnitude at a million correspondences.
     #
-    # The tree is the *more* accurate arm on every component, which matters here because ``out_jtj``
-    # is the matrix ``point_to_plane_round`` factorizes.
+    # One packed fold rather than three (matrix, vector, scalar pair): ``block_sum`` of a vector is
+    # componentwise the per-quantity sums, bit for bit, so this is two barriers per block fewer and
+    # the three accumulators are one buffer. The tree is the *more* accurate arm on every
+    # component, which matters here because the normal matrix is what ``point_to_plane_round``
+    # factorizes.
     i, lane = wp.tid()
     offset, remaining = block_chunk_1d(source.shape[0], i)
     if remaining <= 0:
@@ -727,23 +754,15 @@ def accumulate_point_to_plane(
         wp.block_dim(),
     )
 
-    # Block-collective, so every lane runs all three and only the commit is guarded.
-    total_jtj = block_sum(tile_jtj)
-    total_jtr = block_sum(tile_jtr)
-    scalars = block_sum(wp.vec2(tile_cost, tile_weight_sum))
-    total_cost = scalars[0]
-    total_weight_sum = scalars[1]
-
-    if lane == 0:
-        wp.atomic_add(out_jtj, 0, total_jtj)
-        wp.atomic_add(out_jtr, 0, total_jtr)
-        # One length-2 buffer, not two length-1 ones: ``icp_point_to_plane`` reads both of these
-        # scalars back per iteration and they are written by this one launch, so sharing a buffer
-        # lets it take one host sync rather than two -- a second read placed further downstream
-        # drains a pipeline the first had already drained.
-        # ``ICP_COST`` = 0, ``ICP_WEIGHT_SUM`` = 1.
-        wp.atomic_add(out_scalars, ICP_COST, total_cost)
-        wp.atomic_add(out_scalars, ICP_WEIGHT_SUM, total_weight_sum)
+    # The default constructor, not a zero-fill: every slot is written just below.
+    packed = wp.vector(length=ICP_MOMENT_SLOTS, dtype=wp.float32)
+    for r in range(6):
+        packed[ICP_JTR + r] = tile_jtr[r]
+        for c in range(6):
+            packed[ICP_JTJ + r * 6 + c] = tile_jtj[r, c]
+    packed[ICP_COST] = tile_cost
+    packed[ICP_WEIGHT_SUM] = tile_weight_sum
+    commit_block_sum(lane, packed, out_acc, 0)
 
 
 @wp.func
@@ -817,11 +836,8 @@ def point_to_plane_round(
     damping: wp.float32,
     threshold: wp.float64,
     max_iterations: wp.int32,
-    out_jtj: wp.array[wp.spatial_matrix],
-    out_jtr: wp.array[wp.spatial_vector],
-    out_scalars: wp.array[wp.float32],
+    out_acc: wp.array[wp.float32],
     out_total: wp.array[wp.mat44],
-    out_old_cost: wp.array[wp.float64],
     out_step: wp.array[wp.mat44],
     out_state: wp.array[wp.int32],
 ) -> None:
@@ -835,15 +851,18 @@ def point_to_plane_round(
     - **weightless**: no correspondence carried weight, so nothing is solved; the step is set to
       the identity and the loop stops, and the host reports ``inf``;
     - otherwise the damped system is solved, ``out_step`` written, ``out_total`` composed in place
-      (``step * total``, the product and order the host ping-pong formed) and the accumulators
-      zeroed for the next iteration -- after they are read, by this one thread, so no memset;
-    - the loop continues by ``continue_icp_loop``, the point-to-point loop's own rule, against
-      ``out_old_cost``: seeded ``inf``, so the first round never reads as converged.
+      (``step * total``, the product and order the host ping-pong formed) and the accumulated
+      moments zeroed for the next iteration -- after they are read, by this one thread, so no
+      memset;
+    - the loop continues by ``continue_icp_loop``, the point-to-point loop's own rule, against the
+      previous kept cost in ``ICP_OLD_COST`` -- ``inf`` while the round counter is 0, i.e. before
+      the first kept fit, so the first round never reads as converged. The counter advances
+      exactly when a fit is kept, so a zero-initialized slot needs no ``inf`` seed.
 
     Every ``out_`` argument but ``out_step`` is loop state, read *and* rewritten every round; they
     wear the prefix as ``kernels/array.loop_advance``'s ``out_state`` does.
     """
-    if out_scalars[ICP_WEIGHT_SUM] <= wp.float32(0.0):
+    if out_acc[ICP_WEIGHT_SUM] <= wp.float32(0.0):
         # The step becomes the identity so the host's closing correspondence pass, which applies
         # ``out_step`` like every other search, leaves the pose where the weightless search found
         # it; its accumulation then sums zero weight again and the host reports ``inf``. That is
@@ -851,9 +870,21 @@ def point_to_plane_round(
         out_step[0] = wp.identity(n=4, dtype=wp.float32)
         out_state[LOOP_CONDITION] = 0
         return
-    cost = wp.float64(out_scalars[ICP_COST])
-    a = out_jtj[0]
-    b = out_jtr[0]
+    cost = out_acc[ICP_COST]
+    a = wp.spatial_matrix(wp.float32(0.0))
+    # Longhand for the reason ``solve_spd6`` gives: ``wp.spatial_vector`` has no broadcast fill.
+    b = wp.spatial_vector(
+        wp.float32(0.0),
+        wp.float32(0.0),
+        wp.float32(0.0),
+        wp.float32(0.0),
+        wp.float32(0.0),
+        wp.float32(0.0),
+    )
+    for r in range(6):
+        b[r] = out_acc[ICP_JTR + r]
+        for c in range(6):
+            a[r, c] = out_acc[ICP_JTJ + r * 6 + c]
 
     # Levenberg-style diagonal damping, scaled by the mean diagonal magnitude,
     # keeps the system positive-definite for planar / rank-deficient targets.
@@ -874,19 +905,11 @@ def point_to_plane_round(
     out_step[0] = step
     out_total[0] = wp.mul(step, out_total[0])
 
-    out_jtj[0] = wp.spatial_matrix(wp.float32(0.0))
-    # Longhand for the reason ``solve_spd6`` gives: ``wp.spatial_vector`` has no broadcast fill.
-    out_jtr[0] = wp.spatial_vector(
-        wp.float32(0.0),
-        wp.float32(0.0),
-        wp.float32(0.0),
-        wp.float32(0.0),
-        wp.float32(0.0),
-        wp.float32(0.0),
-    )
-    for slot in range(ICP_SCALAR_ACC_SIZE):
-        out_scalars[slot] = wp.float32(0.0)
+    for slot in range(ICP_MOMENT_SLOTS):
+        out_acc[slot] = wp.float32(0.0)
 
-    old_cost = out_old_cost[0]
-    out_old_cost[0] = cost
-    continue_icp_loop(old_cost, cost, threshold, max_iterations, out_state)
+    old_cost = wp.float64(FLOAT32_INF_CONSTANT)
+    if out_state[LOOP_ROUND] > 0:
+        old_cost = wp.float64(out_acc[ICP_OLD_COST])
+    out_acc[ICP_OLD_COST] = cost
+    continue_icp_loop(old_cost, wp.float64(cost), threshold, max_iterations, out_state)

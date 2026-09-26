@@ -1,7 +1,7 @@
 import warp as wp
 
 from triwarp.constants import PI, TOLERANCE_ZERO_CONSTANT, TWO_PI
-from triwarp.kernels.array import to_vec3, wrap_index
+from triwarp.kernels.array import loop_point, to_vec3, wrap_index
 from triwarp.kernels.halfedge import halfedge_destination
 from triwarp.kernels.predicates import project_out_normal, unit_tangent, world_to_tangent
 from triwarp.kernels.tangent_space import corner_angle
@@ -700,7 +700,7 @@ def shorten_loop_counts(
         return  # the link of a boundary vertex is a path, not a cycle: there is no way round
 
     a = loop_vertices[begin + wrap_index(p - 1, n)]
-    c = loop_vertices[begin + wrap_index(p + 1, n)]
+    c = loop_vertices[begin + loop_point(p + 1, n)]
     if a == c:
         # The loop doubles back through b. Dropping b leaves the duplicate that the compaction pass
         # removes, and both together contract the spur.

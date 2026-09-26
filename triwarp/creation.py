@@ -1636,13 +1636,12 @@ def sweep_polygon(
                 f"edges for {stride} vertices"
             )
 
-    # Two 12-byte endpoint reads decide whether the path closes; the rest of it never leaves the
-    # device. ``read_scalar`` avoids allocating a fresh host array per call the way
-    # ``path[k : k + 1].numpy()[0]`` would.
-    first = read_scalar(path, 0)
-    last = read_scalar(path, n_path - 1)
-    closed = math.dist(first, last) < TOLERANCE_MERGE
-    connect_closed = closed and connect
+    # Two 12-byte endpoint reads decide whether the path closes, and only ``connect`` asks; the rest
+    # of it never leaves the device. ``read_scalar`` avoids allocating a fresh host array per call
+    # the way ``path[k : k + 1].numpy()[0]`` would.
+    connect_closed = (
+        connect and math.dist(read_scalar(path, 0), read_scalar(path, n_path - 1)) < TOLERANCE_MERGE
+    )
 
     # A connected closed path drops its duplicate final slice and wraps onto the first instead.
     n_slices = n_path - 1

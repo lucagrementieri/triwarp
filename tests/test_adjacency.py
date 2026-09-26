@@ -68,11 +68,11 @@ def test_face_adjacency_radix_is_invariant_to_an_oversized_base(
     """
     Class A: the edge grouping is unchanged by any base above ``max(faces)``.
 
-    ``_edge_groups`` asserts the partition is invariant to a sufficiently large radix, which is what
-    lets a caller holding a vertex buffer with *unreferenced* vertices pass ``vertices.shape[0]``
-    rather than pay the ``reduce.minmax`` that infers ``max(faces) + 1``. Both spellings are
-    exercised: ``edges_sorted=None`` hashes off ``faces`` in one launch, supplying it hashes the
-    edge rows.
+    ``_sorted_pair_offsets`` asserts the partition is invariant to a sufficiently large radix,
+    which is what lets a caller holding a vertex buffer with *unreferenced* vertices pass
+    ``vertices.shape[0]`` rather than pay the ``reduce.minmax`` that infers ``max(faces) + 1``.
+    Both spellings are exercised: ``edges_sorted=None`` hashes off ``faces`` in one launch,
+    supplying it hashes the edge rows.
     """
     _, mesh_wp = request.getfixturevalue(mesh_name)
     tight = tw.array.index_bound(mesh_wp.indices)

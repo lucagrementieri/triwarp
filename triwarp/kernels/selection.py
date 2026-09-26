@@ -1,6 +1,6 @@
 import warp as wp
 
-from triwarp.kernels.adjacency import write_face_edge_keys
+from triwarp.kernels.adjacency import write_edge_row, write_face_edge_keys
 from triwarp.kernels.algorithms.connected_components import (
     ecl_hook_pair,
     ecl_prehook_pair,
@@ -289,10 +289,10 @@ def mark_region_seam(
     out_flags: wp.array[wp.int32],
 ) -> None:
     # One thread per position of the radix-sorted halfedge keys, whose payload is each halfedge's
-    # index (``boundary.face_edge_keys_and_order``): 1 where a run of *exactly two* halfedges starts
-    # -- an interior edge -- whose two faces sit on opposite sides of the region. That is the seam
-    # rule, read off the sort with no unique-edge table and no per-edge counts. The flags are the
-    # ``int32`` the caller scans in place.
+    # index (``adjacency.face_edge_keys_and_order``): 1 where a run of *exactly two* halfedges
+    # starts -- an interior edge -- whose two faces sit on opposite sides of the region. That is
+    # the seam rule, read off the sort with no unique-edge table and no per-edge counts. The flags
+    # are the ``int32`` the caller scans in place.
     i = wp.int32(wp.tid())
     flag = wp.int32(0)
     if sorted_run_of_length(sorted_keys, n, i, 2):
@@ -320,13 +320,12 @@ def emit_region_seam(
     h = order[i]
     if not face_mask[h // 3]:
         h = order[i + 1]
-    a, b = halfedge_endpoints(faces, h)
     if oriented:
+        a, b = halfedge_endpoints(faces, h)
         out_edges[g, 0] = a
         out_edges[g, 1] = b
     else:
-        out_edges[g, 0] = wp.min(a, b)
-        out_edges[g, 1] = wp.max(a, b)
+        write_edge_row(faces, h, g, out_edges)
 
 
 @wp.kernel
@@ -364,6 +363,10 @@ def label_flagged_components(
     # equals ``value`` flags its root in the zeroed ``out_root_flagged``. The per-node answer is
     # then a read through the node's own label. ``exclude_fully_selected_components`` flags a
     # component holding an *unselected* vertex; ``faces_left_of_contour`` one holding a seed face.
+    # ``out_labels`` must not alias ``parents``: another thread's path halving can write a stale
+    # ancestor over a label already stored. ``out_root_flagged`` may alias ``flags`` when ``value``
+    # is ``True``, as ``faces_left_of_contour`` passes it -- only a flagged component's root is
+    # written, and to ``True``, so a root reading its own written entry flags itself again.
     v = wp.int32(wp.tid())
     root = find_representative(parents, v)
     out_labels[v] = root

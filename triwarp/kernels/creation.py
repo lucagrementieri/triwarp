@@ -7,7 +7,7 @@ from triwarp.kernels.array import lift_vec2
 from triwarp.kernels.polyline import segment_displacement
 from triwarp.kernels.predicates import orient2d
 from triwarp.kernels.reduce import block_sum, tile_chunk
-from triwarp.kernels.triangles import corner_triple, write_corner_triple_reversible
+from triwarp.kernels.triangles import corner_triple, face_vertices, write_corner_triple_reversible
 
 SQRT3 = wp.constant(wp.float32(math.sqrt(3.0)))
 PI_F = wp.constant(wp.float32(math.pi))
@@ -502,8 +502,8 @@ def lift_layers_and_signed_area(
             out_vertices[i] = lift_vec2(vertices[i], wp.float32(0.0))
             out_vertices[n + i] = lift_vec2(vertices[i], height)
         if i < n_faces:
-            a, b, c = corner_triple(faces, i)
-            area += orient2d(vertices[a], vertices[b], vertices[c])
+            p0, p1, p2 = face_vertices(vertices, faces, i)
+            area += orient2d(p0, p1, p2)
     total = block_sum(area)
     if lane == 0:
         wp.atomic_add(out_area, 0, total)
@@ -704,9 +704,7 @@ def truncated_prism_geometry(
     # the truncation plane, and the six side triangles bridging them. Vertices 0-2 are the source
     # triangle and 3-5 its projection.
     f = wp.int32(wp.tid())
-    v0 = vertices[faces[f * 3 + 0]]
-    v1 = vertices[faces[f * 3 + 1]]
-    v2 = vertices[faces[f * 3 + 2]]
+    v0, v1, v2 = face_vertices(vertices, faces, f)
     t0 = wp.transform_point(transform, v0)
     t1 = wp.transform_point(transform, v1)
     t2 = wp.transform_point(transform, v2)
@@ -1271,16 +1269,10 @@ def revolve_uniform(
     # --- the vertex this thread owns ---------------------------------------------------------
     # An on-axis column is one shared slot, written by slice 0 alone: ``revolution_point`` returns
     # the same value for every slice there, and a single writer keeps it deterministic.
+    here = revolve_uniform_slot(c, s, n_columns, n_slices, ring_base, axis_first, axis_last)
     if not on_axis_c or s == 0:
         point = profile[c]
-        slot = wp.int32(0)
-        if c == 0 and axis_first != 0:
-            slot = 0
-        elif c == n_columns - 1 and axis_last != 0:
-            slot = ring_base + (n_columns - 1 - ring_base) * n_slices
-        else:
-            slot = ring_base + (c - ring_base) * n_slices + s
-        out_vertices[slot] = revolution_point(point[0], point[1], s, n_slices, angle)
+        out_vertices[here] = revolution_point(point[0], point[1], s, n_slices, angle)
 
     # --- the faces of the segment leaving this column ------------------------------------------
     n_segments = n_columns - 1 + wrap
@@ -1290,7 +1282,6 @@ def revolve_uniform(
     on_axis_next = (nxt == 0 and axis_first != 0) or (nxt == n_columns - 1 and axis_last != 0)
 
     slice_next = (s + 1) % n_slices
-    here = revolve_uniform_slot(c, s, n_columns, n_slices, ring_base, axis_first, axis_last)
     here_next = revolve_uniform_slot(
         c, slice_next, n_columns, n_slices, ring_base, axis_first, axis_last
     )

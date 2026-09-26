@@ -1400,6 +1400,86 @@ def test_robust_scale_matches_the_host_mad(device: str, n_valid: int) -> None:
     assert scale == expected
 
 
+def test_robust_scale_ignores_the_length_of_the_target_normals(device: str) -> None:
+    """
+    Not a library comparison: the MAD scale reads the target normals as unit, as the fit does.
+
+    ``target_normals`` need not be unit length, and the point-to-plane fit normalizes each one
+    where it reads it. The robust scale must measure the same residuals, so scaling every normal
+    by an arbitrary positive factor may not move it. The normals here are ``k * z`` with ``k`` in
+    ``[0.2, 5]``, which normalize back to exactly ``z``, so the scale must be the same double.
+    Reading the table raw -- what ``robust_residual_keys`` did -- scales each residual by its own
+    ``k`` and fails.
+    """
+    rng = np.random.default_rng(37)
+    n = 301
+    closest_np = np.zeros((n, 3), dtype=np.float32)
+    closest_np[:, :2] = rng.standard_normal((n, 2))
+    current_np = closest_np.copy()
+    current_np[:, 2] = rng.standard_normal(n).astype(np.float32)
+    unit_np = np.tile(np.array([0.0, 0.0, 1.0], dtype=np.float32), (n, 1))
+    lengths_np = rng.uniform(0.2, 5.0, size=(n, 1)).astype(np.float32)
+    distance_wp = wp.full(n, 0.5, dtype=wp.float32, device=device)
+    index_wp = tw.array.arange(n, device=device)
+
+    def scale(normals_np: np.ndarray) -> float:
+        return tw.registration._robust_scale_from_residuals(
+            points_to_warp(current_np, device),
+            points_to_warp(closest_np, device),
+            points_to_warp(normals_np, device),
+            distance_wp,
+            index_wp,
+            1.0,
+            1,
+        )
+
+    unit = scale(unit_np)
+    assert unit > 0.0
+    assert scale(unit_np * lengths_np) == unit
+
+
+@pytest.mark.parametrize("robust_kernel", ["huber", "tukey"])
+def test_icp_point_to_plane_accepts_non_unit_target_normals(
+    half_torus: tuple[tm.Trimesh, wp.Mesh], device: str, robust_kernel: str
+) -> None:
+    """
+    Triwarp against triwarp: a fit with non-unit target normals against one with unit normals.
+
+    The target is a point cloud and the robust scale is the default MAD one. Scaling each target
+    normal by a factor in ``[0.2, 5]`` changes neither the fit nor the scale once both normalize the
+    table where they read it, so the pose and the cost must agree to float rounding (the normalized
+    normals differ from the unit ones in their last bits). A tenth of the source is displaced so the
+    robust kernel has outliers to weigh. With the raw table in the scale, the scale follows the
+    normals' lengths and the two fits weigh different correspondences.
+    """
+    rng = np.random.default_rng(41)
+    mesh_tm, mesh_wp = half_torus
+    device_wp = mesh_wp.device
+    vertices_np, _ = _mesh_vertices_faces(mesh_tm)
+    normals_np = np.asarray(mesh_tm.vertex_normals, dtype=np.float32)
+    rotation_np, translation_np = _rigid_transform(0.06, [0.1, 0.5, 0.3], [0.02, -0.01, 0.03])
+    source_np = (vertices_np @ rotation_np.T + translation_np).astype(np.float32)
+    outliers = rng.choice(len(source_np), size=len(source_np) // 10, replace=False)
+    source_np[outliers] += 0.5 * rng.standard_normal((len(outliers), 3)).astype(np.float32)
+    lengths_np = rng.uniform(0.2, 5.0, size=(len(normals_np), 1)).astype(np.float32)
+
+    def fit(target_normals_np: np.ndarray) -> tuple[np.ndarray, float]:
+        matrix_wp, _, cost = tw.registration.icp_point_to_plane(
+            points_to_warp(source_np, device_wp),
+            points_to_warp(vertices_np, device_wp),
+            None,
+            target_normals=points_to_warp(target_normals_np, device_wp),
+            max_iterations=30,
+            robust_kernel=robust_kernel,
+        )
+        return np.asarray(matrix_wp.numpy()[0]), cost
+
+    matrix_unit, cost_unit = fit(normals_np)
+    matrix_scaled, cost_scaled = fit(normals_np * lengths_np)
+    assert np.allclose(matrix_scaled, matrix_unit, rtol=1e-5, atol=1e-5)
+    assert np.isclose(cost_scaled, cost_unit, rtol=1e-4, atol=1e-8)
+
+
 def test_correspondence_pass_matches_query_nearest(device: str) -> None:
     """
     Triwarp against triwarp: the ICP loops' cloud correspondence search against ``query_nearest``.

@@ -136,8 +136,8 @@ def commit_sum_and_count(
     # The commit of a fused "mean over the entries that qualify" block fold: each lane's register
     # sum and count, as one ``commit_block_sum`` pair into the two-slot buffer the caller reads
     # once. Shared by ``heat.upper_edge_length_sum_and_count``, ``heat.source_and_global_sums``,
-    # ``points.accumulate_counted_mean`` and ``reconstruction.positive_finite_sum_and_count``, which
-    # differ only in what qualifies.
+    # ``points.neighbor_distance_moments`` and ``reconstruction.positive_finite_sum_and_count``,
+    # which differ only in what qualifies.
     commit_block_sum(lane, wp.vec2d(total, count), out_sum_and_count, 0)
 
 
@@ -990,23 +990,17 @@ def outer_sum_chunk(
     return m
 
 
-# The "componentwise ``wp.tile_sum`` reductions, then one lane-0-guarded atomic commit" skeleton
-# that reads ``tile_chunk``/``outer_sum_chunk``'s partial sums out is itself hand-written at seven
-# call sites with no shared helper: ``points.centered_covariance`` (9 scalars, above),
-# ``points.accumulate_counted_mean`` (2), ``measures.moment_integrals`` (10),
-# ``registration.accumulate_procrustes_moments`` (25), ``accumulate_point_to_plane`` (43),
-# ``homology.count_reached_and_referenced`` (2) and ``homology.dual_candidate_mask`` (1).
-#
-# Deliberately unmerged. Each loop is over a different fixed component count with no common shape
-# cheap to generalize over -- Warp has no variadic tile reduction, so a shared helper would have to
-# take an arbitrary tuple of scalar/vector/matrix quantities -- and the *bodies* differ in more than
-# the count: ``moment_integrals`` needs its chunk width as a launch argument because its
-# per-element arithmetic is heavy enough to have a real occupancy crossover, and
-# ``homology.dual_candidate_mask`` takes ``TILE_1D`` rather than ``ITEMS_PER_BLOCK_1D`` because it
-# *also* writes one mask entry per element, so the wide fold would throw its per-element dimension
-# away. A helper general over both would be more speculative machinery than the call sites justify
-# (CLAUDE.md section 4.2). What *is* shared is already factored: ``tile_chunk`` and the clamp rule
-# it documents, which is the part that goes wrong.
+# The chunked-fold skeleton -- walk ``tile_chunk``/``outer_sum_chunk``'s share, then commit the
+# packed block sum -- recurs at several call sites (``points.centered_covariance``,
+# ``points.neighbor_distance_moments``, ``measures.moment_integrals``,
+# ``registration.accumulate_procrustes_moments`` / ``accumulate_point_to_plane``, ``homology``'s
+# two counters). The commit tail is shared (``commit_block_sum``, one packed reduction per block);
+# the loops are deliberately not. Each folds a different fixed component count, and the bodies
+# differ in more than the count: ``moment_integrals`` takes its chunk width as a launch argument
+# because its per-element arithmetic has a real occupancy crossover, and
+# ``homology.dual_candidate_mask`` and ``points.neighbor_distance_moments`` fold narrower than
+# ``ITEMS_PER_BLOCK_1D`` because they also write per element. What *is* shared is already
+# factored: ``tile_chunk`` and the clamp rule it documents, which is the part that goes wrong.
 
 
 @wp.kernel

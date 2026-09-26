@@ -656,14 +656,14 @@ def test_bridge_edges(bench_case: BenchCase) -> None:
 
     Deliberately so: the patch is a fixed six integers whatever the mesh, and everything that
     scales is the check that both edges are on the rim and that the patch would not duplicate an
-    edge -- a boundary-edge build, one membership scan and a readback of four flags. The row is
-    therefore the price of ``validate=True``, which is the only decision a caller of this function
-    has to make, and it should be read against ``boundary_edges``.
+    edge -- one face-parallel census of the queried pairs' undirected and directed matches, and one
+    readback. The row is therefore the price of ``validate=True``, which is the only decision a
+    caller of this function has to make.
 
     That check was host-side Python when it landed -- a ``set`` comprehension over every mesh edge
-    -- which made this row **minutes** on ``lucy`` and is what this benchmark existed to find. It is
-    a device scan now: 0.035 s on ``lucy``'s 28M faces against 0.022 on ``bunny``, i.e. the boundary
-    build rather than the query.
+    -- which made this row **minutes** on ``lucy`` and is what this benchmark existed to find. It
+    became a boundary-edge build plus a membership scan, and is now a single scan of the faces with
+    no edge table, roughly an order of magnitude cheaper again on ``lucy``.
 
     meshlib's ``makeBridge`` works on a halfedge structure that already knows which edges are on the
     boundary, so its row is the patch alone and is expected to win by a wide margin at every size;

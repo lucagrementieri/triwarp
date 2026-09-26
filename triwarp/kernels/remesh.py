@@ -2,7 +2,7 @@ from typing import Any
 
 import warp as wp
 
-from triwarp.constants import INT32_MAX_CONSTANT, TOLERANCE_ZERO_CONSTANT
+from triwarp.constants import INT32_MAX_CONSTANT, TOLERANCE_ZERO_CONSTANT, UINT64_MAX_CONSTANT
 from triwarp.kernels.adjacency import edge_pair_topology, write_edge_row, write_face_edge_keys
 from triwarp.kernels.array import (
     LOOP_CONDITION,
@@ -19,6 +19,7 @@ from triwarp.kernels.grouping import (
     hash_find_or_insert,
     hash_slot,
     key_set_remove,
+    sorted_run_of_length,
     sorted_run_start,
 )
 from triwarp.kernels.predicates import (
@@ -826,10 +827,10 @@ def mark_edge_pair_starts(
     out_starts: wp.array[wp.int32],
     out_halfedge_row: wp.array[wp.int32],
 ) -> None:
-    # ``grouping.mark_group_starts`` specialized to ``length=2``. Both emit ``int32`` for the same
-    # reason: the flag feeds ``warp.utils.array_scan``, which has no bool overload. Flags the
-    # position that starts a run of *exactly* two equal keys, i.e. an edge shared by exactly two
-    # face corners.
+    # ``grouping.mark_group_starts`` at ``length=2`` (the same ``sorted_run_of_length`` rule). Both
+    # emit ``int32`` for the same reason: the flag feeds ``warp.utils.array_scan``, which has no
+    # bool overload. Flags the position that starts a run of *exactly* two equal keys, i.e. an edge
+    # shared by exactly two face corners.
     #
     # Differs from ``mark_unique_edge_starts`` below only in requiring the run to be exactly two:
     # that one takes every run whatever its length, because the decimation pass wants all unique
@@ -842,20 +843,9 @@ def mark_edge_pair_starts(
     i = wp.int32(wp.tid())
     if out_halfedge_row.shape[0] > 0:
         out_halfedge_row[order[i]] = -1
-    run_start = sorted_run_start(sorted_keys, i)
-    if run_start and edge_set_mask >= 0:
+    if edge_set_mask >= 0 and sorted_run_start(sorted_keys, i):
         hash_find_or_insert(sorted_keys[i], edge_set, edge_set_mask)
-    start = wp.int32(0)
-    # Nested rather than one ``and``: a kernel-scope ``and`` does not short-circuit, and each read
-    # is valid only under its own bound.
-    if i + 2 <= n:
-        if run_start:
-            if sorted_keys[i] == sorted_keys[i + 1]:
-                start = wp.int32(1)
-                if i + 2 < n:
-                    if sorted_keys[i] == sorted_keys[i + 2]:
-                        start = wp.int32(0)  # run longer than two
-    out_starts[i] = start
+    out_starts[i] = wp.where(sorted_run_of_length(sorted_keys, n, i, 2), wp.int32(1), wp.int32(0))
 
 
 @wp.func
@@ -936,12 +926,23 @@ def refresh_flip_rows(
     out_adjacency: wp.array2d[wp.int32],
     out_adjacency_edges: wp.array2d[wp.int32],
     out_unshared: wp.array2d[wp.int32],
+    out_face_claim: wp.array[wp.uint64],
+    out_edge_claim: wp.array[wp.uint64],
 ) -> None:
     # Every row of the flip tables again, from the halfedges ``commit_flips`` kept current: the
     # rows ``emit_flip_topology`` would write after a full regroup, row for row, except that each
     # edge keeps the row it had instead of moving to its new key's rank -- which the flip loop does
     # not depend on, since ``claim_flips`` ranks candidates by key rather than by row.
+    #
+    # Also re-arms the next round's two claim tables, which this round's commit was the last to
+    # read and the next round's candidates never read: two memsets fewer per round, the row threads
+    # striding over tables longer than the row count.
     k = wp.int32(wp.tid())
+    rows = row_halfedges.shape[0]
+    for f in range(k, out_face_claim.shape[0], rows):
+        out_face_claim[f] = UINT64_MAX_CONSTANT
+    for s in range(k, out_edge_claim.shape[0], rows):
+        out_edge_claim[s] = UINT64_MAX_CONSTANT
     write_flip_row(
         faces,
         row_halfedges[k, 0],
@@ -1224,6 +1225,15 @@ def flip_priority(
 
 
 @wp.func
+def new_diagonal_claim_slot(
+    quad: wp.array2d[wp.int32], key_base: wp.uint64, edge_claim_mask: wp.int32, k: wp.int32
+) -> wp.int32:
+    # The edge-claim slot of candidate ``k``'s new diagonal ``b-d``: the one address ``claim_flips``
+    # writes and ``flip_claim_won`` reads it back from, so the two cannot disagree on it.
+    return hash_slot(pack_edge_key(quad[k, 1], quad[k, 3], key_base), edge_claim_mask)
+
+
+@wp.func
 def flip_claim_won(
     flip: wp.array[wp.bool],
     quad: wp.array2d[wp.int32],
@@ -1245,8 +1255,7 @@ def flip_claim_won(
     priority = flip_priority(adjacency_edges, key_base, k)
     if face_claim[f0] != priority or face_claim[f1] != priority:
         return f0, f1, False
-    slot = hash_slot(pack_edge_key(quad[k, 1], quad[k, 3], key_base), edge_claim_mask)
-    if edge_claim[slot] != priority:
+    if edge_claim[new_diagonal_claim_slot(quad, key_base, edge_claim_mask, k)] != priority:
         return f0, f1, False
     return f0, f1, True
 
@@ -1268,8 +1277,9 @@ def claim_flips(
     priority = flip_priority(adjacency_edges, key_base, k)
     wp.atomic_min(out_face_claim, adjacency[k, 0], priority)
     wp.atomic_min(out_face_claim, adjacency[k, 1], priority)
-    slot = hash_slot(pack_edge_key(quad[k, 1], quad[k, 3], key_base), edge_claim_mask)
-    wp.atomic_min(out_edge_claim, slot, priority)
+    wp.atomic_min(
+        out_edge_claim, new_diagonal_claim_slot(quad, key_base, edge_claim_mask, k), priority
+    )
 
 
 @wp.func
@@ -1663,12 +1673,24 @@ def collapse_candidates(
     out_survivor: wp.array[wp.int32],
     out_removed: wp.array[wp.int32],
     out_pos: wp.array[wp.vec3],
+    out_claim: wp.array[wp.int64],
+    out_remap: wp.array[wp.int32],
+    out_positions: wp.array[wp.vec3],
 ) -> None:
     # ``low`` and ``high`` are per *vertex* rather than scalars so that one code path serves both
     # the uniform target and an adaptive sizing field; the uniform case fills them with a constant.
     # An edge's own band is the mean of its endpoints', matching ``mark_long_edges``. The length is
     # computed here: this is its only reader, and it reads it at its own edge.
+    #
+    # The edge threads also seed the per-vertex state the claim and the commit start from -- the
+    # unclaimed keys, the identity collapse map and the working positions -- striding over the
+    # vertices: this kernel reads none of it, and the next two launches are its only readers. That
+    # is a fill, an ``arange`` and a clone fewer per pass.
     k = wp.int32(wp.tid())
+    for t in range(k, out_remap.shape[0], unique_edges.shape[0]):
+        out_claim[t] = UNCLAIMED_KEY
+        out_remap[t] = t
+        out_positions[t] = vertices[t]
     out_survivor[k] = -1
     u = unique_edges[k, 0]
     v = unique_edges[k, 1]

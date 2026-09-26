@@ -1510,27 +1510,38 @@ def extend_rim_to_ring(
 
 
 @wp.kernel
-def directed_edge_opposites(
-    faces: wp.array[wp.int32], edges: wp.array2d[wp.int32], out_opposites: wp.array[wp.int32]
+def bridge_edge_census(
+    faces: wp.array[wp.int32], queries: wp.array2d[wp.int32], out_census: wp.array2d[wp.int32]
 ) -> None:
-    # For each queried directed edge ``(u, v)``, the third corner of the one face that winds
-    # ``u -> v``. A boundary edge occurs in exactly one face, so at most one thread writes each
-    # slot and the scatter needs no atomic; ``out_opposites`` arrives filled with -1, which is what
-    # survives when the edge is not a directed edge of the mesh at all.
+    # Everything a bridge asks of the mesh about a handful of vertex pairs ``(u, v)``, from one
+    # scan of the faces' edges: ``out_census[q, 0]`` counts the face edges joining ``u`` and ``v``
+    # in either direction, ``[q, 1]`` those wound ``u -> v``, and ``[q, 2]`` is one plus the third
+    # corner of a face winding ``u -> v`` (``0`` when none does). ``out_census`` arrives zeroed.
+    #
+    # The first two answer both halves of ``holes.bridge_edges``' validation with no edge table.
+    # A row of ``boundary.oriented_boundary_edges`` is a face edge whose undirected key occurs
+    # exactly once, so ``(u, v)`` is on the rim wound as its face winds it exactly when both counts
+    # are 1; and the patch would duplicate an edge exactly when the first is nonzero -- a row of
+    # ``edges.faces_to_edges(sorted=True)``. The third is the corner ``bridge_edges_smooth``'s
+    # spline needs, for a boundary edge the one face's, so at most one thread stores it.
     #
     # The corners go into a ``wp.vec3i`` rather than staying the tuple ``corner_triple`` returns,
     # because ``k`` is a *runtime* index and a tuple cannot be subscripted by one in kernel scope.
-    # A vector can (verified on Warp 1.17), which is what keeps this off the flat-slice spelling
-    # ``faces[f * 3 : (f + 1) * 3]`` that the rest of the tree no longer uses: the rule is not "no
-    # slices", it is "no slice where an index form exists", and here one does.
     f, q = wp.tid()
-    u = edges[q, 0]
-    v = edges[q, 1]
+    u = queries[q, 0]
+    v = queries[q, 1]
+    low = wp.min(u, v)
+    high = wp.max(u, v)
     c0, c1, c2 = corner_triple(faces, f)
     corner = wp.vec3i(c0, c1, c2)
     for k in range(3):
-        if corner[k] == u and corner[_wrap(k + 1, 3)] == v:
-            out_opposites[q] = corner[_wrap(k + 2, 3)]
+        a = corner[k]
+        b = corner[_wrap(k + 1, 3)]
+        if wp.min(a, b) == low and wp.max(a, b) == high:
+            wp.atomic_add(out_census, q, 0, 1)
+            if a == u and b == v:
+                wp.atomic_add(out_census, q, 1, 1)
+                out_census[q, 2] = corner[_wrap(k + 2, 3)] + 1
 
 
 @wp.kernel

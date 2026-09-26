@@ -1,6 +1,6 @@
 import warp as wp
 
-from triwarp.constants import ALLCLOSE_ATOL_CONSTANT, ALLCLOSE_RTOL_CONSTANT
+from triwarp.constants import ALLCLOSE_ATOL_CONSTANT, ALLCLOSE_RTOL_CONSTANT, FLOAT32_INF_CONSTANT
 from triwarp.kernels.array import (
     LOOP_CONDITION,
     LOOP_ROUND,
@@ -8,6 +8,7 @@ from triwarp.kernels.array import (
     cross2,
     is_close_vec3,
     lift_vec2,
+    loop_point,
     lowbias32,
     scanned_count,
 )
@@ -19,7 +20,14 @@ from triwarp.kernels.predicates import (
     project_out_normal,
     vector_angle,
 )
-from triwarp.kernels.reduce import block_barrier, block_chunk_1d, block_sum, commit_block_sum
+from triwarp.kernels.reduce import (
+    block_barrier,
+    block_chunk_1d,
+    block_max,
+    block_min,
+    block_sum,
+    commit_block_sum,
+)
 
 
 @wp.func
@@ -85,14 +93,6 @@ def closing_segment_flag(polyline: wp.array[wp.vec3], wrap_open: wp.int32) -> wp
     return wp.int32(1) - ring_closing_flag(polyline[0], polyline[n - 1])
 
 
-@wp.func
-def loop_point(k: wp.int32, n: wp.int32) -> wp.int32:
-    # Point index of entry ``k`` in ``[0, n]`` of a closed polyline's ``n + 1`` entries, the last
-    # being the first point again: what ``polyline_close``'s copy held at slot ``n``. A select
-    # rather than ``k % n``, which is an integer division per sample on the hot gathers.
-    return wp.where(k < n, k, wp.int32(0))
-
-
 @wp.kernel
 def vertex_turning_angles(
     polyline: wp.array[wp.vec3], wrap_open: wp.int32, out_angles: wp.array[wp.float32]
@@ -128,6 +128,18 @@ def vertex_turning_angles(
     out_angles[j] = angle
 
 
+@wp.func
+def segment_range_distance(
+    polyline: wp.array[wp.vec3], p: wp.vec3, begin: wp.int32, end: wp.int32, best: wp.float32
+) -> wp.float32:
+    # ``best`` lowered by the distance from ``p`` to each open segment ``begin .. end - 1``, in
+    # order. The one segment loop of ``distance_to_segments`` and its sliced sibling: a minimum is
+    # order-free, so however the segments are split over threads the answer is the same float.
+    for i in range(begin, end):
+        best = wp.min(best, point_to_segment_distance(polyline[i], polyline[i + 1], p))
+    return best
+
+
 @wp.kernel
 def distance_to_segments(
     points: wp.array[wp.vec3],
@@ -135,19 +147,55 @@ def distance_to_segments(
     wrap_open: wp.int32,
     out_distances: wp.array[wp.float32],
 ) -> None:
-    # The closing segment ``closed=True`` adds is tested *after* the open ones rather than by
-    # wrapping the loop index, so the ``points x segments`` loop carries no modulo, and in the
-    # same order the ``polyline_close`` copy put it in -- last.
+    # One thread per query over every segment. The closing segment ``closed=True`` adds is tested
+    # *after* the open ones rather than by wrapping the loop index, so the ``points x segments``
+    # loop carries no modulo, and in the same order the ``polyline_close`` copy put it in -- last.
+    # ``distance_to_segment_slices`` is the same test with the segments split over a second grid
+    # dimension, for a query count too small to fill the device.
     tid = wp.int32(wp.tid())
     p = points[tid]
     n = polyline.shape[0]
-    closes = closing_segment_flag(polyline, wrap_open)
-    best = point_to_segment_distance(polyline[0], polyline[1], p)
-    for i in range(1, n - 1):
-        best = wp.min(best, point_to_segment_distance(polyline[i], polyline[i + 1], p))
-    if closes != 0:
+    best = segment_range_distance(polyline, p, 0, n - 1, wp.float32(FLOAT32_INF_CONSTANT))
+    if closing_segment_flag(polyline, wrap_open) != 0:
         best = wp.min(best, point_to_segment_distance(polyline[n - 1], polyline[0], p))
     out_distances[tid] = best
+
+
+# ``polyline_point_distance``'s slicing on CUDA: enough ``(query, slice)`` threads to fill the
+# device, and slices no shorter than this many segments. Swept on this box over 272 to 65 536
+# segments and 1 to 65 536 queries, answers byte-identical: 24x at 4 096 queries against 65 536
+# segments, 1.6x at 65 536 against 65 536, 2.4x on a 272-segment loop at 4 096 queries, never
+# slower.
+# The lanes of a warp are consecutive *queries* in one slice, so they read the same segment and
+# its loads broadcast; ordered the other way, lanes on different slices, it was 2-6x slower.
+POINT_DISTANCE_THREADS = 1 << 22
+POINT_DISTANCE_MIN_SLICE = 32
+
+
+@wp.kernel
+def distance_to_segment_slices(
+    points: wp.array[wp.vec3],
+    polyline: wp.array[wp.vec3],
+    wrap_open: wp.int32,
+    slice_length: wp.int32,
+    out_distances: wp.array[wp.float32],
+) -> None:
+    # ``distance_to_segments`` with the open segments split into slices of ``slice_length``, one
+    # thread per ``(query, slice)`` and an ``atomic_min`` into the query's slot, which the caller
+    # seeds with ``inf``; the last slice also tests the closing segment. A query count below the
+    # device's width leaves one thread walking every segment serially -- a few thousand threads on
+    # a 170-SM part -- and the slices are what fill it. The minimum is order-free and every
+    # distance is the same expression on the same operands, so the answer is the unsliced one bit
+    # for bit.
+    slice_index, tid = wp.tid()
+    p = points[tid]
+    n = polyline.shape[0]
+    begin = slice_index * slice_length
+    end = wp.min(begin + slice_length, n - 1)
+    best = segment_range_distance(polyline, p, begin, end, wp.float32(FLOAT32_INF_CONSTANT))
+    if end == n - 1 and closing_segment_flag(polyline, wrap_open) != 0:
+        best = wp.min(best, point_to_segment_distance(polyline[n - 1], polyline[0], p))
+    wp.atomic_min(out_distances, tid, best)
 
 
 @wp.kernel
@@ -870,8 +918,9 @@ def radius_segment_distances(
     return wp.length(closest_point_on_segment(a, b, center) - center)
 
 
-# Slot layout of ``accumulate_radius_frame``'s buffer: ``polyline_weighted_midpoint_sums``' four
-# sums, then Newell's normal.
+# Slot layout of ``accumulate_radius_frame``'s buffer: the length-weighted midpoint sums
+# ``polyline_centroid`` divides -- ``sum(midpoint * length)`` in slots 0..2, ``sum(length)`` in slot
+# 3 -- then Newell's normal.
 RADIUS_FRAME_LENGTH = wp.constant(wp.int32(3))
 RADIUS_FRAME_NORMAL = wp.constant(wp.int32(4))
 RADIUS_FRAME_SIZE = 7
@@ -879,19 +928,25 @@ RADIUS_FRAME_SIZE = 7
 
 @wp.kernel
 def accumulate_radius_frame(
-    polyline: wp.array[wp.vec3], n_segments: wp.int32, out_frame: wp.array[wp.float32]
+    polyline: wp.array[wp.vec3],
+    n_segments: wp.int32,
+    wrap_open: wp.int32,
+    with_normal: wp.int32,
+    out_frame: wp.array[wp.float32],
 ) -> None:
-    # ``polyline_radius``'s default plane in one pass: the length-weighted midpoint sums
-    # ``polyline_centroid`` takes over the ``n_segments`` segments -- ``n - 1``, or ``n`` for a
-    # ``closed=True`` loop whose closing segment is reached by wrapping the index -- and Newell's
-    # sum ``polyline_normal`` takes over the loop -- ``n - 1`` pairs when the last point repeats the
+    # A polyline's plane frame in one pass, for ``polyline_centroid``, ``polyline_normal`` and
+    # ``polyline_radius``'s defaults: the length-weighted midpoint sums over ``n_segments`` segments
+    # plus the closing one ``closing_segment_flag`` adds for ``wrap_open`` -- ``n - 1``, or ``n``
+    # for a ``closed=True`` loop whose closing segment is reached by wrapping the index -- and, with
+    # ``with_normal``, Newell's sum over the loop -- ``n - 1`` pairs when the last point repeats the
     # first (``ring_closing_flag``, decided here rather than by a launch of its own), ``n`` with the
     # index wrapped otherwise. The two ranges share their chunks and their lane stride, so each
-    # lane accumulates every term in the order the two separate kernels did, and one
+    # lane accumulates every term in the order a kernel of either alone would, and one
     # ``block_sum`` over the packed seven is componentwise the two block sums: the sums are the
-    # ones those kernels produce, bit for bit. Neither result crosses to the host.
-    # ``polyline_normal`` launches it with ``n_segments = 0``, which leaves the midpoint sums at
-    # zero and the Newell vector the same.
+    # ones two separate kernels produce, bit for bit. ``polyline_centroid`` asks for the midpoint
+    # sums alone and ``polyline_normal`` (``n_segments = 0``) for the Newell sum alone.
+    #
+    # Launch it over ``blocks_1d(n)``, which covers both ranges: neither exceeds ``n``.
     #
     # This kernel, ``accumulate_loop_frame`` and ``accumulate_turning_angle`` are the lane-strided
     # single-slot reduction of CLAUDE.md section 13.2: ``wp.launch_tiled(dim=blocks_1d(n),
@@ -905,8 +960,11 @@ def accumulate_radius_frame(
     # are ``loop_point``'s, so the sums are the copy's bit for bit.
     chunk, lane = wp.tid()
     n = polyline.shape[0]
-    n_pairs = n - ring_closing_flag(polyline[0], polyline[n - 1])
-    offset, count = block_chunk_1d(wp.max(n_segments, n_pairs), chunk)
+    segments = n_segments + closing_segment_flag(polyline, wrap_open)
+    n_pairs = wp.where(
+        with_normal != 0, n - ring_closing_flag(polyline[0], polyline[n - 1]), wp.int32(0)
+    )
+    offset, count = block_chunk_1d(wp.max(segments, n_pairs), chunk)
     if count <= 0:
         return
     weighted = wp.vec3(0.0, 0.0, 0.0)
@@ -915,7 +973,7 @@ def accumulate_radius_frame(
     for k in range(lane, count, wp.block_dim()):
         i = offset + k
         start = polyline[i]
-        if i < n_segments:
+        if i < segments:
             midpoint, length = segment_midpoint_and_length(start, polyline[loop_point(i + 1, n)])
             weighted += midpoint * length
             total += length
@@ -929,22 +987,18 @@ def accumulate_radius_frame(
     )
 
 
-@wp.kernel
-def radius_distances(
-    polyline: wp.array[wp.vec3],
+@wp.func
+def radius_plane(
     frame: wp.array[wp.float32],
     center: wp.vec3,
     normal: wp.vec3,
     frame_center: wp.int32,
     frame_normal: wp.int32,
-    out_distances: wp.array[wp.float32],
-) -> None:
-    # dim == n_segments (``accumulate_radius_frame``'s, the closing one wrapping its index).
-    # ``radius_segment_distances`` per segment, with the centre and the normal each
-    # taken either from the caller or, where it left them to default, from
-    # ``accumulate_radius_frame``'s sums: the centroid is the sums' quotient and the normal the
-    # normalized Newell vector, the values ``polyline_centroid`` / ``polyline_normal`` return.
-    i = wp.int32(wp.tid())
+) -> tuple[wp.vec3, wp.vec3]:
+    # ``polyline_radius``'s plane: the centre and the normal each taken either from the caller or,
+    # where it left them to default, from ``accumulate_radius_frame``'s sums -- the centroid is the
+    # sums' quotient and the normal the normalized Newell vector, the values ``polyline_centroid``
+    # / ``polyline_normal`` return.
     plane_center = center
     if frame_center != 0:
         plane_center = wp.vec3(frame[0], frame[1], frame[2]) / frame[RADIUS_FRAME_LENGTH]
@@ -957,9 +1011,91 @@ def radius_distances(
                 frame[RADIUS_FRAME_NORMAL + 2],
             )
         )
+    return plane_center, plane_normal
+
+
+@wp.kernel
+def radius_distances(
+    polyline: wp.array[wp.vec3],
+    frame: wp.array[wp.float32],
+    center: wp.vec3,
+    normal: wp.vec3,
+    frame_center: wp.int32,
+    frame_normal: wp.int32,
+    out_distances: wp.array[wp.float32],
+) -> None:
+    # dim == n_segments (``accumulate_radius_frame``'s, the closing one wrapping its index):
+    # ``radius_segment_distances`` per segment about ``radius_plane``. ``polyline_radius``'s median,
+    # which needs every distance; ``radius_reduce`` below folds the other reductions instead.
+    i = wp.int32(wp.tid())
+    plane_center, plane_normal = radius_plane(frame, center, normal, frame_center, frame_normal)
     out_distances[i] = radius_segment_distances(
         polyline[i], polyline[loop_point(i + 1, polyline.shape[0])], plane_center, plane_normal
     )
+
+
+# ``radius_reduce``'s reductions, and its two-slot result: the reduced value, then the segment
+# count ``closing_segment_flag`` decided -- the mean's divisor, which the host does not know.
+RADIUS_MIN = wp.constant(wp.int32(0))
+RADIUS_MAX = wp.constant(wp.int32(1))
+RADIUS_SUM = wp.constant(wp.int32(2))
+RADIUS_RESULT_COUNT = wp.constant(wp.int32(1))
+RADIUS_RESULT_SIZE = 2
+
+
+@wp.kernel
+def radius_reduce(
+    polyline: wp.array[wp.vec3],
+    frame: wp.array[wp.float32],
+    center: wp.vec3,
+    normal: wp.vec3,
+    frame_center: wp.int32,
+    frame_normal: wp.int32,
+    wrap_open: wp.int32,
+    kind: wp.int32,
+    out_result: wp.array[wp.float32],
+) -> None:
+    # ``radius_distances`` folded where it is computed, for ``polyline_radius``'s ``min`` / ``max``
+    # / ``mean``: no ``(n_segments,)`` buffer, no reduction launch over it, and the segment count
+    # decided per thread (``closing_segment_flag``, the closure ``is_closed`` would read back), so
+    # a ``closed=True`` call asks the host nothing. ``kind`` is warp-uniform, which keeps each block
+    # reduction below it block-uniform. Launched ``wp.launch_tiled(dim=blocks_1d(n),
+    # block_dim=TILE_1D)``, the lane-strided single-slot shape of ``accumulate_radius_frame``;
+    # ``out_result[0]`` is seeded with the reduction's identity by the caller. A minimum or a
+    # maximum is order-free, so those answers are the reduction over the buffer's exactly; the sum
+    # is the tree ``reduce.sum`` forms from 64 elements up.
+    chunk, lane = wp.tid()
+    n = polyline.shape[0]
+    n_segments = n - 1 + closing_segment_flag(polyline, wrap_open)
+    if chunk == 0 and lane == 0:
+        out_result[RADIUS_RESULT_COUNT] = wp.float32(n_segments)
+    offset, count = block_chunk_1d(n_segments, chunk)
+    if count <= 0:
+        return
+    plane_center, plane_normal = radius_plane(frame, center, normal, frame_center, frame_normal)
+    low = wp.float32(FLOAT32_INF_CONSTANT)
+    high = -low
+    total = wp.float32(0.0)
+    for k in range(lane, count, wp.block_dim()):
+        i = offset + k
+        d = radius_segment_distances(
+            polyline[i], polyline[loop_point(i + 1, n)], plane_center, plane_normal
+        )
+        low = wp.min(low, d)
+        high = wp.max(high, d)
+        total += d
+    if kind == RADIUS_MIN:
+        block_low = block_min(low)
+        if lane == 0:
+            wp.atomic_min(out_result, 0, block_low)
+    elif kind == RADIUS_MAX:
+        block_high = block_max(high)
+        if lane == 0:
+            wp.atomic_max(out_result, 0, block_high)
+    else:
+        block_total = block_sum(total)
+        if lane == 0:
+            wp.atomic_add(out_result, 0, block_total)
 
 
 # --- polygon triangulation (parallel ear clipping); port of libigl ear_clipping.cpp ---
@@ -1050,7 +1186,10 @@ def accumulate_loop_frame(polyline: wp.array[wp.vec3], out_sums: wp.array[wp.flo
     # function has always used.
     #
     # Lane-strided single-slot reduction -- see ``accumulate_radius_frame`` for the shape and why
-    # no device branch is needed.
+    # no device branch is needed. The two are not one kernel: this one wraps its Newell pairs over
+    # the ``n_ring`` distinct vertices, so a repeated closing point's pair ends on ``polyline[0]``,
+    # where that one ends on the repeated point itself -- equal only within ``allclose``'s
+    # tolerance, so the sums differ -- and it also publishes the closing flag.
     chunk, lane = wp.tid()
     n = polyline.shape[0]
     closing = ring_closing_flag(polyline[0], polyline[n - 1])
@@ -1507,37 +1646,6 @@ def packed_closed_loop_lengths(
     length = block_sum(total)
     if lane == 0:
         out_lengths[loop] = length
-
-
-@wp.kernel
-def polyline_weighted_midpoint_sums(
-    points: wp.array[wp.vec3], n_segments: wp.int32, out_sums: wp.array[wp.float32]
-) -> None:
-    # Both sums a length-weighted centroid needs, in one launch: ``sum(midpoint * length)`` in
-    # slots 0..2 and ``sum(length)`` in slot 3.
-    #
-    # ``polyline_centroid`` ran a two-output ``wp.map`` into an ``(n - 1,)`` midpoint buffer and an
-    # ``(n - 1,)`` length buffer, then ``reduce.weighted_sum`` over the pair and ``reduce.sum`` over
-    # the lengths -- three launches, three allocations and **two** host readbacks for four numbers,
-    # of which the second readback drained a pipeline the first had already drained. One buffer,
-    # one readback. The same lane-strided shape and the same closed-polyline index wrap as
-    # ``polyline_total_length``; see it for both, including why the last bits of the sums move.
-    i, lane = wp.tid()
-    offset, remaining = block_chunk_1d(n_segments, i)
-    if remaining <= 0:
-        return
-    n_points = points.shape[0]
-    weighted = wp.vec3(0.0, 0.0, 0.0)
-    total = wp.float32(0.0)
-    for k in range(lane, remaining, wp.block_dim()):
-        start = offset + k
-        midpoint, length = segment_midpoint_and_length(
-            points[start], points[loop_point(start + 1, n_points)]
-        )
-        weighted += midpoint * length
-        total += length
-    # Block-collective, so every lane runs it and only the commit is guarded.
-    commit_block_sum(lane, wp.vec4(weighted[0], weighted[1], weighted[2], total), out_sums, 0)
 
 
 @wp.kernel

@@ -64,7 +64,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from typing import Literal, cast, overload
+from typing import Literal, overload
 
 import numpy as np
 import warp as wp
@@ -78,7 +78,6 @@ import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import read_scalar, require_same_device
 from triwarp.constants import TOLERANCE_ZERO
-from triwarp.kernels import array as kernel_array
 from triwarp.kernels import holes as kernel_holes
 from triwarp.kernels import scatter as kernel_scatter
 
@@ -2666,7 +2665,6 @@ def bridge_edges(
     edge_a: tuple[int, int],
     edge_b: tuple[int, int],
     validate: bool = True,
-    boundary_edges: twt.Array2dInt32 | None = None,
 ) -> wp.array[wp.int32]:
     """
     Join two boundary edges with a two-triangle patch, leaving the rest of both rims open.
@@ -2695,18 +2693,10 @@ def bridge_edges(
         The second boundary edge, in the same direction convention.
     validate
         Check that both edges are boundary edges of ``faces`` and that the patch would not
-        duplicate an existing edge. Costs one pass over the mesh edges and one readback; pass
-        ``False`` when the edges came from
+        duplicate an existing edge. Costs one pass over the faces and one readback, and builds no
+        edge table; pass ``False`` when the edges came from
         [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges] and the pairing is
         known good.
-    boundary_edges
-        The rim table of ``faces``, when the caller already has one — as any caller that picked
-        ``edge_a`` and ``edge_b`` out of
-        [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges] does. Read only under
-        ``validate``, and only for the on-rim half of it: the chord-duplicate half always runs.
-        Trusted, not checked, so it must have been built from this same ``faces``; ``None``
-        rebuilds it. This is the middle setting between paying for the whole check and turning it
-        off — it keeps the half a rim-derived pair cannot satisfy by construction.
 
     Returns
     -------
@@ -2723,7 +2713,7 @@ def bridge_edges(
         between a pair of vertices that already share one (which would leave the mesh
         non-manifold).
     RuntimeError
-        If ``vertices``, ``faces`` and ``boundary_edges`` are not all on one device.
+        If ``vertices`` and ``faces`` are not all on one device.
 
     Examples
     --------
@@ -2745,18 +2735,22 @@ def bridge_edges(
     [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges]
         Produces the edges this takes, already in the right direction.
     """
-    require_same_device(vertices=vertices, faces=faces, boundary_edges=boundary_edges)
+    require_same_device(vertices=vertices, faces=faces)
     edge_a = (int(edge_a[0]), int(edge_a[1]))
     edge_b = (int(edge_b[0]), int(edge_b[1]))
-    _check_bridge_edges(
-        vertices,
-        faces,
-        edge_a,
-        edge_b,
-        _bridge_joined_pairs(edge_a, edge_b),
-        validate,
-        boundary_edges,
-    )
+    _require_distinct_edges(edge_a, edge_b)
+    if validate:
+        joined = _bridge_joined_pairs(edge_a, edge_b)
+        census = _bridge_census(faces, [edge_a, edge_b, *joined])
+        _require_rim_edges(edge_a, edge_b, census)
+        _require_new_chords(edge_a, edge_b, joined, census[2:])
+    return _append_bridge_patch(faces, edge_a, edge_b)
+
+
+def _append_bridge_patch(
+    faces: wp.array[wp.int32], edge_a: tuple[int, int], edge_b: tuple[int, int]
+) -> wp.array[wp.int32]:
+    """Append the flat patch's one or two triangles to ``faces``."""
     triangles = _bridge_triangles(edge_a, edge_b)
     patch = wp.array(
         np.asarray(triangles, dtype=np.int32).reshape(-1), dtype=wp.int32, device=faces.device
@@ -2866,29 +2860,20 @@ def bridge_edges_smooth(
     device = faces.device
     a0, a1 = int(edge_a[0]), int(edge_a[1])
     b0, b1 = int(edge_b[0]), int(edge_b[1])
-    # A strip with interior samples joins nothing but its own new vertices, so it has no pair to
-    # check; the one-segment case falls through to the flat patch below, which checks its own.
-    #
-    # The rim table is built here rather than inside each check so the one-segment path does not
-    # rebuild it: nothing between the two calls touches ``faces``, and that rebuild is most of a
-    # quarter of that path, flat in the mesh size.
-    rim = tw.boundary.oriented_boundary_edges(vertices, faces) if validate else None
-    _check_bridge_edges(vertices, faces, (a0, a1), (b0, b1), (), validate, rim)
-
-    # One launch to find each edge's opposite corner, then one gather of the six positions the
-    # spline needs. Both are here so the host never reads back a buffer that scales with the mesh.
-    query = wp.array(np.array([[a0, a1], [b0, b1]], dtype=np.int32), dtype=wp.int32, device=device)
-    opposites = wp.full(2, -1, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_holes.directed_edge_opposites,
-        dim=(int(faces.shape[0]) // 3, 2),
-        inputs=[faces, query, opposites],
-        device=device,
-    )
-    opposites_np = opposites.numpy()
-    if int(opposites_np[0]) < 0 or int(opposites_np[1]) < 0:
+    _require_distinct_edges((a0, a1), (b0, b1))
+    # One scan of the faces answers the whole validation and finds each edge's opposite corner: a
+    # strip with interior samples joins nothing but its own new vertices, so only the one-segment
+    # case -- the flat patch -- reads the chord half, which is asked for up front so that case needs
+    # no second scan. Then one gather of the six positions the spline needs. Both are here so the
+    # host never reads back a buffer that scales with the mesh.
+    joined = _bridge_joined_pairs((a0, a1), (b0, b1)) if validate else []
+    census = _bridge_census(faces, [(a0, a1), (b0, b1), *joined])
+    if validate:
+        _require_rim_edges((a0, a1), (b0, b1), census)
+    opposite_a, opposite_b = int(census[0, 2]) - 1, int(census[1, 2]) - 1
+    if opposite_a < 0 or opposite_b < 0:
         raise ValueError("both edges must be directed edges of faces, wound as their face winds")
-    corners = np.array([a0, a1, b0, b1, int(opposites_np[0]), int(opposites_np[1])], dtype=np.int32)
+    corners = np.array([a0, a1, b0, b1, opposite_a, opposite_b], dtype=np.int32)
     gathered = wp.empty(6, dtype=wp.vec3, device=device)
     wp.copy(gathered, vertices[wp.array(corners, dtype=wp.int32, device=device)])
     positions_np = gathered.numpy().astype(np.float64)
@@ -2896,9 +2881,11 @@ def bridge_edges_smooth(
     n_vertices = int(vertices.shape[0])
     interior_np, strip_np = _bridge_strip(positions_np, corners, n_vertices, sampling_step)
     if interior_np.shape[0] == 0:
-        # One segment: the strip *is* the flat patch, so hand it over with the caller's own
-        # ``validate`` -- that path adds edges between existing vertices and has its own check.
-        return wp.clone(vertices), bridge_edges(vertices, faces, (a0, a1), (b0, b1), validate, rim)
+        # One segment: the strip *is* the flat patch, which adds edges between existing vertices,
+        # so the chord half of the check applies to it as it does in ``bridge_edges``.
+        if validate:
+            _require_new_chords((a0, a1), (b0, b1), joined, census[2:])
+        return wp.clone(vertices), _append_bridge_patch(faces, (a0, a1), (b0, b1))
 
     bridged_vertices = wp.empty(n_vertices + interior_np.shape[0], dtype=wp.vec3, device=device)
     wp.copy(bridged_vertices[:n_vertices], vertices)
@@ -3124,11 +3111,7 @@ def join_closest_components(
         pair = _closest_cross_component_edges(vertices, current, max_distance_sq)
         if pair is None:
             break
-        # The rim table the pair was chosen from is the one ``bridge_edges`` would rebuild to check
-        # it against, over the same unchanged ``current``. Handing it over keeps the docstring's
-        # "recomputes ... the boundary edges ... each round" true at one rebuild per round rather
-        # than two -- a seventh or so of this call, and the share does not fall with mesh size.
-        current = bridge_edges(vertices, current, pair[0], pair[1], boundary_edges=pair[2])
+        current = bridge_edges(vertices, current, pair[0], pair[1])
         joins += 1
 
     return wp.clone(faces) if joins == 0 else current
@@ -3141,7 +3124,7 @@ _NEAREST_KEY_SEED = (1 << 63) - 1
 
 def _closest_cross_component_edges(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], max_distance_sq: wp.float32
-) -> tuple[tuple[int, int], tuple[int, int], twt.Array2dInt32] | None:
+) -> tuple[tuple[int, int], tuple[int, int]] | None:
     """
     Pick the two oriented boundary edges to bridge next, or ``None`` when nothing is left to join.
 
@@ -3157,9 +3140,7 @@ def _closest_cross_component_edges(
     index array's stride.
 
     One small buffer comes back: whether a pair was found, and the two rows it names. The boundary
-    table itself never leaves the device, and is handed back alongside the pair so the caller can
-    give it to [`bridge_edges`][triwarp.holes.bridge_edges] rather than have it rebuilt to check a
-    pair that came out of it.
+    table itself never leaves the device.
     """
     device = faces.device
     boundary = tw.boundary.oriented_boundary_edges(vertices, faces)
@@ -3203,76 +3184,72 @@ def _closest_cross_component_edges(
     found, a0, a1, b0, b1 = (int(value) for value in rows.numpy())
     if not found:
         return None
-    return ((a0, a1), (b0, b1), boundary)
+    return ((a0, a1), (b0, b1))
 
 
-def _check_bridge_edges(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    edge_a: tuple[int, int],
-    edge_b: tuple[int, int],
-    joined: Sequence[tuple[int, int]],
-    validate: bool,
-    boundary_edges: twt.Array2dInt32 | None = None,
-) -> None:
-    """
-    Reject a bridge that is degenerate, not on the boundary, or would duplicate an edge.
-
-    Both membership tests run on device against a handful of query rows, so the only readback is
-    those few flags -- an earlier version built Python sets over every mesh edge, which is one
-    interpreter pass per edge and made ``validate=True`` unusable on a scan mesh.
-
-    ``boundary_edges`` is the rim table when the caller already built one from the same ``faces``;
-    the on-rim half of the check reads it instead of rebuilding it. Only the *rim* half is skipped
-    -- the chord-duplicate half always runs, because a bridge can create a duplicate edge no matter
-    where its two rim edges came from.
-    """
+def _require_distinct_edges(edge_a: tuple[int, int], edge_b: tuple[int, int]) -> None:
+    """Reject a bridge from an edge to itself, the one check ``validate=False`` keeps."""
     if tuple(edge_a) == tuple(edge_b):
         raise ValueError("edge_a and edge_b must be different edges")
-    if not validate:
-        return
 
-    if boundary_edges is None:
-        boundary_edges = tw.boundary.oriented_boundary_edges(vertices, faces)
-    on_rim = _rows_present(boundary_edges, [edge_a, edge_b], faces.device)
-    for name, edge, present in (("edge_a", edge_a, on_rim[0]), ("edge_b", edge_b, on_rim[1])):
-        if not present:
+
+def _bridge_census(faces: wp.array[wp.int32], pairs: Sequence[tuple[int, int]]) -> np.ndarray:
+    """
+    ``kernels/holes.bridge_edge_census`` over a handful of vertex pairs, read back as ``(q, 3)``.
+
+    One launch over the faces and one readback of the ``3 q`` counts, where the rim table and the
+    mesh's edge table this answers for are each a pass that scales with the mesh.
+    """
+    device = faces.device
+    census = wp.zeros((len(pairs), 3), dtype=wp.int32, device=device)
+    n_faces = int(faces.shape[0]) // 3
+    if n_faces > 0:
+        queries = wp.array(np.asarray(pairs, dtype=np.int32), dtype=wp.int32, device=device)
+        wp.launch(
+            kernel_holes.bridge_edge_census,
+            dim=(n_faces, len(pairs)),
+            inputs=[faces, queries, census],
+            device=device,
+        )
+    return census.numpy()
+
+
+def _require_rim_edges(
+    edge_a: tuple[int, int], edge_b: tuple[int, int], census: np.ndarray
+) -> None:
+    """
+    Reject a bridge edge that is not on the boundary wound as its face winds it.
+
+    ``census`` is ``_bridge_census``' rows for ``edge_a`` and ``edge_b`` first. A row of
+    [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges] is a face edge whose
+    undirected key occurs once, so on the rim both of its counts are exactly one.
+    """
+    for row, (name, edge) in enumerate((("edge_a", edge_a), ("edge_b", edge_b))):
+        if int(census[row, 0]) != 1 or int(census[row, 1]) != 1:
             raise ValueError(
                 f"{name}={edge} is not a boundary edge of faces, wound as its face winds it"
             )
 
-    if not joined:
-        return
-    # ``joined`` is what the patch adds *between vertices that already exist*; an interior vertex it
-    # invents cannot collide with anything. The lookup is over the mesh's own edges rather than the
-    # rim's, since a chord across a thin neck is usually an interior edge.
-    sorted_pairs = [(min(u, v), max(u, v)) for u, v in joined]
-    collides = _rows_present(
-        tw.edges.faces_to_edges(faces, sorted=True), sorted_pairs, faces.device
-    )
-    for (u, v), present in zip(joined, collides, strict=True):
-        if present:
+
+def _require_new_chords(
+    edge_a: tuple[int, int],
+    edge_b: tuple[int, int],
+    joined: Sequence[tuple[int, int]],
+    census: np.ndarray,
+) -> None:
+    """
+    Reject a flat patch whose new edges duplicate an existing one.
+
+    ``joined`` is what the patch adds *between vertices that already exist*, and ``census`` its
+    ``_bridge_census`` rows. The lookup is over the mesh's own edges rather than the rim's, since a
+    chord across a thin neck is usually an interior edge.
+    """
+    for (u, v), row in zip(joined, census, strict=True):
+        if int(row[0]) > 0:
             raise ValueError(
                 f"bridging {tuple(edge_a)} to {tuple(edge_b)} would add a second edge between "
                 f"{u} and {v}, leaving the mesh non-manifold; pick a different pair"
             )
-
-
-def _rows_present(
-    rows: twt.Array2dInt32, queries: Sequence[tuple[int, int]], device: wp.DeviceLike
-) -> list[bool]:
-    """Test a handful of index rows for membership in a table of them, on device."""
-    if int(rows.shape[0]) == 0:
-        return [False] * len(queries)
-    query_wp = wp.array(np.asarray(queries, dtype=np.int32), dtype=wp.int32, device=device)
-    present = wp.zeros(len(queries), dtype=wp.bool, device=device)
-    wp.launch(
-        kernel_array.mark_rows_present,
-        dim=(int(rows.shape[0]), len(queries)),
-        inputs=[rows, query_wp, present],
-        device=device,
-    )
-    return cast("list[bool]", present.list())
 
 
 def _bridge_triangles(

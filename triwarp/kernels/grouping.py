@@ -31,9 +31,10 @@ def sorted_run_of_length(
     sorted_values: wp.array[wp.Int], n: wp.int32, i: wp.int32, length: wp.int32
 ) -> wp.bool:
     # Does position ``i`` begin a run of *exactly* ``length`` equal values among the first ``n``?
-    # ``mark_group_starts``' rule as a function, for the kernels that read the verdict at a sorted
-    # position without materializing a flag array first (``boundary``'s halfedge masks,
-    # ``selection``'s region seam).
+    # ``mark_group_starts`` materializes it as flags; ``remesh.mark_edge_pair_starts`` asks it at
+    # ``length == 2``; ``boundary``'s halfedge masks and ``selection``'s region seam read the
+    # verdict at a sorted position directly. Each ``and`` short-circuits in kernel scope, so the
+    # last test reads ``i + length`` only when it is inside the data.
     if i + length > n:
         return False  # run would extend past the data
     if not sorted_run_start(sorted_values, i):
@@ -55,15 +56,7 @@ def mark_group_starts(
     # ``wp.utils.array_scan``, which has no bool overload -- the same reason
     # ``remesh.mark_edge_pair_starts``, this rule specialised to ``length == 2``, emits ``int32``.
     tid = wp.int32(wp.tid())
-    is_start = True
-    if tid + length > n:
-        is_start = False  # run would extend past the data
-    elif not sorted_run_start(sorted_values, tid):
-        is_start = False  # not the start of a run
-    elif sorted_values[tid] != sorted_values[tid + length - 1]:
-        is_start = False  # run shorter than ``length``
-    elif tid + length < n and sorted_values[tid] == sorted_values[tid + length]:
-        is_start = False  # run longer than ``length``
+    is_start = sorted_run_of_length(sorted_values, n, tid, length)
     out_flags[tid] = wp.where(is_start, wp.int32(1), wp.int32(0))
 
 

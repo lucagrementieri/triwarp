@@ -35,7 +35,7 @@ import warp.sparse as wps
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import read_scalar, require_nonempty_mesh, require_same_device
-from triwarp.constants import INT64_MAX, TOLERANCE_MOLLIFY, UINT64_MAX
+from triwarp.constants import TOLERANCE_MOLLIFY, UINT64_MAX
 from triwarp.kernels import adjacency as kernel_adjacency
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import remesh as kernel_remesh
@@ -519,13 +519,13 @@ def _collapse_pass(
     and ``None`` otherwise, so the next stage can classify the same faces without regrouping them.
     """
     device = vertices.device
-    # One pass-scoped commit counter for the whole loop, zeroed per pass: reallocating a four-byte
-    # buffer every pass is an allocation where a memset does.
+    # One commit counter for the whole loop, never reset: it accumulates across passes and a pass
+    # committed nothing exactly when it did not move.
     count = wp.zeros(1, dtype=wp.int32, device=device)
+    committed = 0
     current: _EdgeIncidence | None = None
     for _ in range(max_passes):
         current = None
-        count.zero_()
         n_vertices = int(vertices.shape[0])
         n_faces = int(faces.shape[0]) // 3
         if n_faces == 0:
@@ -547,9 +547,15 @@ def _collapse_pass(
             faces, n_vertices=n_vertices
         )
 
-        survivor = wp.full(m, -1, dtype=wp.int32, device=device)
+        survivor = wp.empty(m, dtype=wp.int32, device=device)
         removed = wp.empty(m, dtype=wp.int32, device=device)
         target_pos = wp.empty(m, dtype=wp.vec3, device=device)
+        # Seeded by ``collapse_candidates``: unclaimed keys (64-bit, because the lock key is -- see
+        # ``kernel_remesh.scramble_index`` for why it has to be injective), the identity map and the
+        # working positions.
+        claim = wp.empty(n_vertices, dtype=wp.int64, device=device)
+        remap = wp.empty(n_vertices, dtype=wp.int32, device=device)
+        positions = wp.empty(n_vertices, dtype=wp.vec3, device=device)
         wp.launch(
             kernel_remesh.collapse_candidates,
             dim=m,
@@ -568,28 +574,25 @@ def _collapse_pass(
                 survivor,
                 removed,
                 target_pos,
+                claim,
+                remap,
+                positions,
             ],
             device=device,
         )
 
-        # 64-bit because the lock key is: see ``kernel_remesh.scramble_index`` for why it has to
-        # be injective, and what committing two collapses into overlapping 1-rings costs.
-        #
         # **Folding this launch into the candidate kernel above is declined**, on the same
         # measurement as the flip engine's equivalent in ``_flip_interior_edges``: the claim reads
-        # ``survivor[k]`` / ``removed[k]`` at its own thread and the ``wp.full`` between them is
-        # sized by a host-known count, so it would fuse -- but a pass is a topology rebuild plus a
+        # ``survivor[k]`` / ``removed[k]`` at its own thread and its claim table is seeded by the
+        # candidate kernel itself, so it would fuse -- but a pass is a topology rebuild plus a
         # handful of launches around one readback, and this is one of them. The claim/commit pair
         # after it is not fusible at all.
-        claim = wp.full(n_vertices, INT64_MAX, dtype=wp.int64, device=device)
         wp.launch(
             kernel_remesh.claim_collapse_key,
             dim=m,
             inputs=[survivor, removed, csr.offsets, csr.columns, claim],
             device=device,
         )
-        remap = tw.array.arange(n_vertices, device=device)
-        positions = wp.clone(vertices)
         wp.launch(
             kernel_remesh.commit_collapses,
             dim=m,
@@ -606,9 +609,11 @@ def _collapse_pass(
             ],
             device=device,
         )
-        if int(read_scalar(count, 0)) == 0:
+        total = int(read_scalar(count, 0))
+        if total == committed:
             current = incidence
             break
+        committed = total
 
         # Drop the faces the collapses degenerated and the vertices no face names any more, in one
         # scan: the positions and both length bands are compacted together, so neither band is
@@ -842,8 +847,10 @@ def _flip_interior_edges(
         # code where a mistake silently changes which edges flip -- for one launch of a round's
         # dozen. The claim/commit pair below is not fusible at all (a commit must see every
         # claim).
-        topology.face_claim.fill_(UINT64_MAX)
-        topology.edge_claim.fill_(UINT64_MAX)
+        #
+        # A refresh re-arms both claim tables for the round after it, so only a round that follows
+        # a build or another issued round fills them itself.
+        topology.arm_claims()
         wp.launch(
             kernel_remesh.claim_flips,
             dim=m,
@@ -881,6 +888,7 @@ def _flip_interior_edges(
             ],
             device=device,
         )
+        topology.claims_armed = False
         # The commit kept the halfedge <-> row maps, the duplicate-edge set and the valences
         # current, so the rows are rebuilt in place from them: one launch over the rows instead of
         # a whole-mesh regroup (a key launch, a radix sort, a mark, a scan and an emit). An issued
@@ -888,6 +896,8 @@ def _flip_interior_edges(
         if refresh:
             topology.refresh()
 
+    # The commits accumulate across rounds and are never reset: a round's flips are what the
+    # running total moved by.
     count = wp.zeros(1, dtype=wp.int32, device=device)
     graph = None
     capturable = wp.get_device(device).is_cuda
@@ -899,20 +909,20 @@ def _flip_interior_edges(
             # Every round is the same launch sequence over the same buffers -- only the face
             # buffer's contents change -- so a long call records one round and replays it, and a
             # round costs one graph launch rather than a dozen launches' worth of Python. Replayed
-            # from the host rather than under ``wp.capture_while``, because the host reads each
-            # round's count anyway: it is what tells ``topology.flipped`` when the duplicate-edge
-            # set's tombstones call for a rebuild.
+            # from the host, which reads each round's count: it is what tells
+            # ``topology.flipped`` when the duplicate-edge set's tombstones call for a rebuild.
+            # The claim tables are armed before recording, so the recorded round -- whose refresh
+            # re-arms them -- carries no fill.
+            topology.arm_claims()
             with wp.ScopedCapture(device) as capture:
-                count.zero_()
                 flip_round(count)
             graph = capture.graph
             wp.capture_launch(graph)
         else:
             # An issued round reads its count before refreshing, so a round that flipped nothing --
             # the common last round, and the only one a call at the fixpoint runs -- skips it.
-            count.zero_()
             flip_round(count, refresh=False)
-            n = int(read_scalar(count, 0))
+            n = int(read_scalar(count, 0)) - total
             total += n
             if n == 0:
                 break
@@ -925,12 +935,11 @@ def _flip_interior_edges(
                 # run on. A call that flips at most once never pays for it.
                 topology.rebuild(read_count=False, incremental=True)
             continue
-        n = int(read_scalar(count, 0))
+        n = int(read_scalar(count, 0)) - total
         total += n
         if n == 0:
             break
         topology.flipped(n)
-    return total
     return total
 
 
@@ -1006,6 +1015,8 @@ class _FlipTopology:
         Open-addressed claim table over the new edges, one slot per hashed key.
     edge_claim_mask : int
         Power-of-two mask for ``edge_claim`` slots.
+    claims_armed : bool
+        Whether ``face_claim`` and ``edge_claim`` currently hold the unclaimed key everywhere.
     valence : wp.array[wp.int32] | None
         Per-vertex unique-edge count a build seeds and ``commit_flips`` keeps current, when the
         loop's caller asked for one.
@@ -1033,6 +1044,9 @@ class _FlipTopology:
         self._ranks_tail = self._ranks[n - 1 :]
         self.sorted_keys = self._keys[:n]
         self.face_claim = wp.empty(self._n_faces, dtype=wp.uint64, device=self._device)
+        # Whether both claim tables hold the unclaimed key: a refresh arms them for the next round,
+        # a commit spends them.
+        self.claims_armed = False
         # The incremental state is allocated by the first incremental build; a plain build passes
         # ``None`` for it (a null descriptor, which the kernels read as "no incremental state").
         self.incremental = False
@@ -1163,7 +1177,11 @@ class _FlipTopology:
         self._sorted_stale = False
 
     def refresh(self) -> None:
-        """Rewrite every row from the halfedges ``commit_flips`` kept current, in one launch."""
+        """
+        Rewrite every row from the halfedges ``commit_flips`` kept current, in one launch.
+
+        The same launch re-arms both claim tables for the next round.
+        """
         wp.launch(
             kernel_remesh.refresh_flip_rows,
             dim=self._rows,
@@ -1173,9 +1191,19 @@ class _FlipTopology:
                 self.adjacency,
                 self.adjacency_edges,
                 self.unshared,
+                self.face_claim,
+                self.edge_claim,
             ],
             device=self._device,
         )
+        self.claims_armed = True
+
+    def arm_claims(self) -> None:
+        """Fill both claim tables with the unclaimed key, unless a refresh already did."""
+        if not self.claims_armed:
+            self.face_claim.fill_(UINT64_MAX)
+            self.edge_claim.fill_(UINT64_MAX)
+            self.claims_armed = True
 
     @property
     def active_edge_set_mask(self) -> int:
@@ -1241,6 +1269,7 @@ class _FlipTopology:
             table <<= 1
         self.edge_claim = wp.empty(table, dtype=wp.uint64, device=self._device)
         self.edge_claim_mask = table - 1
+        self.claims_armed = False
 
 
 def cluster_decimate(

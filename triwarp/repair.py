@@ -390,10 +390,9 @@ def remove_duplicated_vertices(
         The inverse operation: welding coincident positions back together closes every cut it makes.
     """
     require_same_device(vertices=vertices, faces=faces)
-    inverse = duplicate_vertex_inverse(vertices, epsilon)
-    # No ``n_unique`` to pass: ``duplicate_vertex_inverse`` discards the unique array internally,
-    # so the class count genuinely is not available here and the reduction is the only way to it.
-    unique_indices = tw.grouping.first_occurrence_indices(inverse)
+    # The class count comes with the inverse, so the representatives need no reduction to size them.
+    n_unique, inverse = _vertex_classes(vertices, epsilon)
+    unique_indices = tw.grouping.first_occurrence_indices(inverse, n_unique)
     unique_vertices = tw.array.gather(vertices, unique_indices)
     unique_faces = tw.array.remap_indices(faces, inverse)
     return unique_vertices, unique_indices, inverse, unique_faces
@@ -438,17 +437,20 @@ def duplicate_vertex_inverse(vertices: wp.array[wp.vec3], epsilon: float) -> wp.
     [`grouping.first_occurrence_indices`][triwarp.grouping.first_occurrence_indices]
         The geometry-free counterpart: the same class-to-representative reduction over any key.
     """
-    device = vertices.device
-    n = int(vertices.shape[0])
-    if n == 0:
-        return wp.empty(0, dtype=wp.int32, device=device)
+    return _vertex_classes(vertices, epsilon)[1]
 
+
+def _vertex_classes(vertices: wp.array[wp.vec3], epsilon: float) -> tuple[int, wp.array[wp.int32]]:
+    """Return the coincident-vertex class count and each vertex's class, as ``unique_1d`` does."""
+    device = vertices.device
+    if int(vertices.shape[0]) == 0:
+        return 0, wp.empty(0, dtype=wp.int32, device=device)
     # One key per vertex and one ``unique_1d`` over it, at either tolerance: ``hash_vector_rows``
     # quantizes at ``epsilon > 0`` and packs the relative float buckets at ``0`` -- the same key
     # ``unique_rows`` would hash the vertices to, without the representative gather it would then
-    # compute and this discards.
-    _, inverse = unique_1d(hash_vector_rows(vertices, epsilon=epsilon), return_inverse=True)
-    return inverse
+    # compute.
+    unique, inverse = unique_1d(hash_vector_rows(vertices, epsilon=epsilon), return_inverse=True)
+    return int(unique.shape[0]), inverse
 
 
 def resolve_duplicated_faces(
@@ -1144,8 +1146,9 @@ def collapse_small_triangles(
         )
 
         unique_labels, inverse = unique_1d(labels, return_inverse=True, max_value=n_vertices - 1)
-        unique_indices = tw.grouping.first_occurrence_indices(inverse, int(unique_labels.shape[0]))
-        class_vertices = tw.array.gather(current_vertices, unique_indices)
+        # Each label is its class's smallest vertex, so the sorted labels are already every class's
+        # first occurrence in ``inverse``: the representatives, with no scatter to find them.
+        class_vertices = tw.array.gather(current_vertices, unique_labels)
         remapped_faces = tw.array.remap_indices(current_faces, inverse)
 
         keep_mask = tw.triangles.face_nondegenerate_mask(class_vertices, remapped_faces)

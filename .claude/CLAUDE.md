@@ -201,6 +201,10 @@ Not supported inside `@wp.kernel` / `@wp.func`:
   whose annotated dtype is one of those, a module-level integer `wp.constant`, an integer literal, a
   `.shape[...]`, `wp.tid()`, an integer constructor, or an integer-preserving expression over those
   — because a scan that misfires on float division gets switched off by the first person it annoys.
+- **Kernel-scope `and` / `or` short-circuit (Warp 1.17).** `codegen.emit_BoolOp` guards each
+  later operand behind an `if` on the result so far, so `i + 1 < n and a[i + 1] == v` never reads
+  past the end. A comment or a nested-`if` shape justified by "`and` does not short-circuit" is
+  stale; two such comments were corrected in the 2026-09-26 pass (§16.25).
 - **Spell the remainder `%`, not `i - (i // stride) * stride`.** The long form is the same operation
   but reads as though it is *avoiding* `%` for a reason a reader then goes looking for.
 - **A conditional value is `wp.where(cond, a, b)`, not a Python ternary** (check 20). A ternary
@@ -1046,6 +1050,9 @@ found them: §12.1.
   escape hatch nothing uses is not an optimization.
 - **A readback costs ~0.1 ms; an extra device pass costs 0.9-2.4 ms.** Trading one readback for an
   extra pass is usually a *loss* (§13.1, §14.6).
+- **Several adjacent small values: `triwarp._device.read_values(arr, start, count)`**, a cached
+  pageable scratch and one offset copy. A slice view plus `.numpy()` of three `int32`s measured
+  26 us against 10 for `read_scalar`, which was most of a closed-mesh regression in §16.25.
 - **Use `triwarp._device.read_scalar(arr, index=-1)` for a tail read**, not a hand-rolled spelling —
   the fast path is device-split and a pinned scratch is a **race** (§12.1). It takes any index and
   any dtype, so `arr[k : k + 1].numpy()[0]` and `arr.numpy()[k]` are both it, spelled slower.
@@ -6860,3 +6867,95 @@ pre-existing cycle, not this change; `test_flip_topology_incremental_state_match
 uses `icosphere(3)` at the same jitter (79, 28, 9, 1 flips past the plain round), which is the
 smallest fixture found that exercises the incremental rounds at all -- at a jitter of 0.02 every
 flip happens in the plain round and the test passed a no-op `refresh`.
+
+### 16.25 The round-19/20 kernel de-duplication pass (2026-09-26)
+
+Every kernel changed in `e34051f..158af32` read against the rest of `kernels/`, by seven reviewers
+with disjoint file ownership (counts as evidence, CPU byte-identity against a detached `158af32`
+worktree), then a harness A/B, one pytest process per module, min of 2 rounds, triwarp rows only
+(`plans/benchmark-round-21-data/ab23_*.txt`): **923 cells, median 1.01x, geometric mean 1.06x,
+32 cells at 1.5x or better.** Every cell under 0.93x was re-run alone; the ones that stayed
+there had identical call counts in both arms, except the three traced below, all fixed. CPU
+byte-identity held over every probed output (~20 000) except `polyline_radius(reduction="mean")`,
+9.4e-08 relative (summation order).
+
+Largest wins: `polyline_point_distance` / `distance_to_closed_polyline` 24x at 4 096 queries over
+65 536 segments, `bridge_edges` 21x and `bridge_edges_smooth` 13x on `lucy`, `edges_length` 5.7x
+on `lucy`, `mean_edge_length` 2.4x, `crease_edges` 1.9-2.2x, `face_adjacency*` 1.6x on the large
+meshes, `edge_manifold_mask` 1.8-1.9x. What generalises:
+
+- **A starved brute-force grid whose reduction is a min or max slices its inner loop over a
+  second grid dimension and commits with `atomic_min`** -- order-free, so byte-identical (§2.3's
+  occupancy rule without a rewrite; `polyline.distance_to_segment_slices`). **The lanes must be the
+  outer items**: `dim=(slice, query)` broadcasts each segment load across the warp, and
+  `(query, slice)` measured 2-6x slower at large slice counts.
+- **Validating a handful of vertex pairs needs no edge table.** One face-parallel census of each
+  queried pair's undirected and directed matches answers "on the rim, wound as its face" (both
+  counts 1) and "edge exists" (`holes.bridge_edge_census`); the boundary-edge build it replaced
+  was 11x on `lucy`. `bridge_edges(boundary_edges=)` went with it -- nothing needed it any more.
+- **The run of equal sorted keys answers "is this edge manifold"**: 1, 2 or 3+ is decidable from
+  a sorted position's neighbours, so a per-face or per-halfedge manifold mask is one kernel after
+  the sort, not `unique_1d` plus inverse plus counts plus a gather (1.8-1.9x).
+- **§16.23's union-find edges formed in the thread generalise** -- to the vertex-manifold corner
+  graph and to the orientation parity graph, byte-identical, device time flat or lower. libigl's
+  "every vertex below `max(faces)` is referenced" half then runs in corner space: vertex `v - 1`'s
+  corner minimum still at the `int32` seed.
+- **A union-find flatten must never write into `parents`.** Writing labels over `parents` to save
+  an allocation was byte-identical on CPU and wrong on CUDA (1-140 entries per mesh): another
+  thread's path halving writes `parents[child] = grandparent` from a stale read, over a root
+  already stored. A serial device cannot show it.
+- **The two-mesh broad phase is the self-intersection one.** `intersection.collect_face_box_candidates`
+  (moved from `validation`) serves both, with `candidate_slot_query` as the shared prologue. The
+  fixed-stride table removes the count pass, the scan and the readback, and pays where the
+  consumer is cheap (a verdict or a mask: 1.16-1.24x); where it is heavy `float64` work the
+  sparse slots roughly double that kernel, so the segment compaction launches over the kept count
+  (`wp.lower_bound` on the scan) instead of over the slots. Storing per-slot segments to skip the
+  recompute was 0.8x: a 26 MB `wp.empty` per call cost far more than §13.1's flat 6 us (unmeasured
+  why; the cold-pool reading of §13.1 is a guess).
+- **The narrow fold's width is rows per block when the fold commits `float64` to constant slots.**
+  Fusing a `(count, total)` fold into `points.neighbor_distance_moments` at one row per lane was
+  1.4x the unfused pair at 1 M rows (15 625 blocks contending on two slots); 1 024 rows starved the
+  grid at 41 k; 256 won at both (§13.2's narrow-fold rule, with its limit).
+- **`wps.bsr_zeros` then field assignment wastes three allocations and a memset per matrix**;
+  `wps.bsr_matrix_t(dtype)()` plus field assignment and `notify_nnz_changed` works on both devices
+  (`linalg._bsr_over`). And a fresh squared-Laplacian operator of a seen shape now takes a pooled
+  solver state, as §16.19's scalar solves do (`smooth_region[bunny]` 67 -> 21 launches, 1.14x).
+- **A mask-then-scan compaction is deterministic where an atomic cursor is not**: `boundary.ears`
+  now returns ascending face order on CUDA too.
+- **Turning a loop-bound `if` into `wp.where` can move CPU results** by ~2e-7
+  (`accumulate_radius_frame`): the CPU oracle is sensitive to control-flow shape, not only to
+  arithmetic.
+
+**Three regressions the integration introduced, each found by re-running the slow cell alone:**
+
+- **A shared helper that returns trimmed views is not free to callers that pass `n`.**
+  `adjacency.sorted_face_edge_keys` now writes keys and payload in one launch (1.3x), but routing
+  the three internal sorters through it added ~14 us of view construction; they launch the shared
+  `adjacency.face_edge_keys_and_order` kernel themselves and keep the double-width buffers.
+- **A census that rides in a counting launch is paid by the inputs where the count is zero.**
+  `boundary_loops_batched`'s seam/pinch census cost a closed mesh (which the baseline returned from
+  early) two zeroed allocations and a 26 us slice readback: 0.83x. One zeroed buffer holding the
+  flags, the two bits and the degree table, read through `read_values`, made it 1.02x.
+- **REFUTED -- the flip loop under `wp.capture_while`** (an `end_flip_round` kernel keeping the
+  running total and the tombstone budget on the device, one state read per entry). CUDA flips were
+  identical and readbacks fell (102 -> 4 on a 100-round call), but a conditional round costs more
+  than a host-replayed one and recording it costs a couple of dozen per-round reads:
+  `delaunay_triangulation` 0.86-0.97x at 2 000 and 20 000 points (many flips per round, so the
+  tombstone budget keeps sending it back to the host), `remove_t_vertices[saddle_graded]` 0.86x at
+  a switch after 4 replays, and only a 100-round, few-flips call gained (1.08-1.13x). Reverted;
+  §16.24's host-replayed rounds stand. The per-round read is not the lever there.
+
+Also landed: the flip claim tables are re-armed by `refresh_flip_rows` (a recorded round 7 -> 4
+nodes, ~1.02x -- the round is device-bound); the collapse pass seeds its claim/remap/positions in
+`collapse_candidates`; `voxel_down_sample` max 5 -> 4 launches and 8 -> 5 allocations;
+`statistical_outlier_mask` 4 -> 3 launches; `crease_edges` 7 -> 3 launches and 2 -> 1 readbacks;
+`face_adjacency` compacts straight off `sorted_face_edge_keys`; `is_orientable` 1.17-1.47x;
+`remove_duplicated_vertices` drops a readback; both ICPs keep their costs in the moments
+accumulator (1-3 allocations fewer per call). Declines are at their sites.
+
+**Fixed after the pass:** `icp_point_to_plane`'s MAD robust scale read the target normal table raw
+(`robust_residual_keys`) while the fit normalized it, so non-unit `target_normals` put the scale
+on residuals scaled by each normal's length. Both now read through one
+`kernels/registration.target_unit_normal`, and the docstring states that normals need not be unit.
+`test_robust_scale_ignores_the_length_of_the_target_normals` (same double under per-normal
+rescaling) and `test_icp_point_to_plane_accepts_non_unit_target_normals` fail on the raw read.

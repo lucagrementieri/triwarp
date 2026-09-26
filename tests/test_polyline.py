@@ -555,6 +555,32 @@ def test_distance_to_empty_polyline_is_infinite(device: str) -> None:
     assert np.array_equal(distances_wp.numpy(), np.full(5, np.inf, dtype=np.float32))
 
 
+@pytest.mark.parametrize("closed", [False, True])
+def test_polyline_point_distance_slices_match_one_thread_per_query(
+    device: str, closed: bool
+) -> None:
+    """
+    The segment-sliced search answers what one thread walking every segment does, bit for bit.
+
+    Triwarp against triwarp: the parity tests above carry the oracle, this pins the two schedules
+    ``polyline_point_distance`` chooses between. Fifty queries against a 3 000-point walk slice the
+    segments on CUDA (and not on the CPU device, where both sides are the one-thread kernel); a
+    minimum is order-free, so any split of the segments must give the same floats.
+    """
+    rng = np.random.default_rng(43)
+    polyline_wp = points_to_warp(np.cumsum(rng.standard_normal((3000, 3)), axis=0), device)
+    queries_wp = points_to_warp(rng.standard_normal((50, 3)) * 20.0, device)
+    unsliced_wp = wp.empty(50, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_polyline.distance_to_segments,
+        dim=50,
+        inputs=[queries_wp, polyline_wp, wp.int32(closed), unsliced_wp],
+        device=device,
+    )
+    distances_wp = tw.polyline.polyline_point_distance(queries_wp, polyline_wp, closed=closed)
+    assert np.array_equal(distances_wp.numpy(), unsliced_wp.numpy())
+
+
 # --- upsample (NumPy reference) ---
 
 
@@ -1039,6 +1065,25 @@ def test_polyline_radius_closed_default_plane_differs_from_open(device: str) -> 
         tw.polyline.polyline_radius(polyline_wp, "mean", closed=True),
         tw.polyline.polyline_radius(polyline_wp, "mean"),
         rtol=1e-3,
+    )
+
+
+@pytest.mark.parametrize("reduction", ["min", "max", "mean", "median"])
+def test_polyline_radius_closed_on_a_closed_input_adds_no_segment(
+    device: str, reduction: str
+) -> None:
+    """
+    ``closed=True`` on a loop already ending on its first point is the open call, bit for bit.
+
+    Triwarp against triwarp: ``test_polyline_radius_closed_matches_reference`` carries the oracle
+    for the loop stored open. Past three points the fused reductions decide on the device whether
+    the closing segment is already there, so this is the branch where a wrong decision would add
+    a stand-in segment and move the reduction and the default plane.
+    """
+    pts_np = _planar_circle(24, radius=2.0) + np.array([0.0, 0.0, 0.3]) * np.arange(24)[:, None]
+    polyline_wp = points_to_warp(np.concatenate([pts_np, pts_np[:1]]), device)
+    assert tw.polyline.polyline_radius(polyline_wp, reduction, closed=True) == (
+        tw.polyline.polyline_radius(polyline_wp, reduction)
     )
 
 

@@ -798,34 +798,28 @@ def statistical_outlier_mask(
 
     device = neighbor_distance.device
     n = int(neighbor_distance.shape[0])
-    # `wp.empty`, not `wp.zeros`: every branch below (the `n == 0` return aside) fills every slot
-    # of `out_mask` via a `wp.map` over the full `n`-length row, so nothing ever reads the
-    # zero-fill.
+    # `wp.empty`, not `wp.zeros`: the mask launch below writes every slot of `out_mask`.
     out_mask = wp.empty(n, dtype=wp.bool, device=device)
     if n == 0:
         return out_mask
 
-    mean_distance, _rms, count = _neighbor_distance_moments(
-        neighbor_distance, mean_and_count=True, rms=False
-    )
     # Cloud mean and (ddof=1) deviation over the *counted* rows only, exactly as Open3D divides by
     # its ``valid_distances``. Empty rows contribute zero to every sum, so plain reductions work.
     # The three slots -- counted rows, distance total, squared deviation -- stay on the device:
-    # the deviation pass reads the mean from the first two and the mask launch the threshold from
-    # all three, so nothing is read back.
+    # the moments pass folds the first two, the deviation pass reads the mean from them and the
+    # mask launch the threshold from all three, so nothing is read back.
     totals = wp.zeros(3, dtype=wp.float64, device=device)
-    for kernel in (
-        kernel_points.accumulate_counted_mean,
+    mean_distance, _rms, count = _neighbor_distance_moments(
+        neighbor_distance, mean_and_count=True, rms=False, totals=totals
+    )
+    wp.launch_tiled(
         kernel_points.accumulate_counted_deviation,
-    ):
-        wp.launch_tiled(
-            kernel,
-            dim=[kernel_reduce.blocks_1d(n)],
-            inputs=[count, mean_distance],
-            outputs=[totals],
-            block_dim=TILE_1D,
-            device=device,
-        )
+        dim=[kernel_reduce.blocks_1d(n)],
+        inputs=[count, mean_distance],
+        outputs=[totals],
+        block_dim=TILE_1D,
+        device=device,
+    )
     wp.launch(
         kernel_points.statistical_outlier_from_totals,
         dim=n,
@@ -837,23 +831,30 @@ def statistical_outlier_mask(
 
 
 def _neighbor_distance_moments(
-    neighbor_distance: twt.Array2dFloat32, *, mean_and_count: bool, rms: bool
-) -> tuple[wp.array[wp.float32], wp.array[wp.float32], wp.array[wp.int32]]:
+    neighbor_distance: twt.Array2dFloat32,
+    *,
+    mean_and_count: bool,
+    rms: bool,
+    totals: wp.array[wp.float64] | None = None,
+) -> tuple[wp.array[wp.float32] | None, wp.array[wp.float32] | None, wp.array[wp.int32] | None]:
     """
     Per-row ``(mean, rms, count)`` of a neighbour-distance table, ignoring ``inf`` slots.
 
-    A moment a caller does not ask for comes back as a length-zero array and is never written.
+    A moment a caller does not ask for comes back as ``None`` and is never written. ``totals``,
+    when given, receives ``(rows with a neighbour, sum of their means)`` in its first two slots.
     """
     device = neighbor_distance.device
     n = int(neighbor_distance.shape[0])
-    n_mean = n if mean_and_count else 0
-    out_mean = wp.empty(n_mean, dtype=wp.float32, device=device)
-    out_rms = wp.empty(n if rms else 0, dtype=wp.float32, device=device)
-    out_count = wp.empty(n_mean, dtype=wp.int32, device=device)
-    wp.launch(
+    out_mean = wp.empty(n, dtype=wp.float32, device=device) if mean_and_count else None
+    out_rms = wp.empty(n, dtype=wp.float32, device=device) if rms else None
+    out_count = wp.empty(n, dtype=wp.int32, device=device) if mean_and_count else None
+    rows_per_block = kernel_points.MOMENT_ROWS_PER_BLOCK
+    wp.launch_tiled(
         kernel_points.neighbor_distance_moments,
-        dim=n,
-        inputs=[neighbor_distance, out_mean, out_rms, out_count],
+        dim=[(n + rows_per_block - 1) // rows_per_block],
+        inputs=[neighbor_distance],
+        outputs=[out_mean, out_rms, out_count, totals],
+        block_dim=TILE_1D,
         device=device,
     )
     return out_mean, out_rms, out_count

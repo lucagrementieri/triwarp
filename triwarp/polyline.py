@@ -61,6 +61,14 @@ from triwarp.kernels import reduce as kernel_reduce
 _DOWNSAMPLE_DOUBLING_FROM = 8192
 
 
+# ``polyline_radius``'s folded reductions: the kernel's selector and the result slot's seed.
+_RADIUS_REDUCTIONS: dict[str, tuple[wp.int32, float]] = {
+    "min": (kernel_polyline.RADIUS_MIN, math.inf),
+    "max": (kernel_polyline.RADIUS_MAX, -math.inf),
+    "mean": (kernel_polyline.RADIUS_SUM, 0.0),
+}
+
+
 def is_closed(polyline: wp.array[wp.vec3]) -> bool:
     """
     Whether a polyline is closed (its first and last points coincide).
@@ -254,26 +262,15 @@ def polyline_centroid(polyline: wp.array[wp.vec3], *, closed: bool = False) -> w
     [`polyline_radius`][triwarp.polyline.polyline_radius]
         Both default their plane to this centroid.
     """
-    device = polyline.device
     n_points = int(polyline.shape[0])
     # ``closed`` is the wrap-around segment, which the kernel reaches by index rather than by a
     # ``polyline_close`` copy of the whole buffer -- as in ``polyline_length``.
     n_segments = n_points if closed else n_points - 1
     if n_segments < 1:
         raise ValueError("polyline_centroid requires at least two points")
-    # One launch and one readback for all four sums, rather than a two-output ``wp.map`` into two
-    # scratch buffers followed by a weighted reduction and a plain one over them. See
-    # ``kernels/polyline.polyline_weighted_midpoint_sums``.
-    sums = wp.zeros(4, dtype=wp.float32, device=device)
-    wp.launch_tiled(
-        kernel_polyline.polyline_weighted_midpoint_sums,
-        dim=kernel_reduce.blocks_1d(n_segments),
-        inputs=[polyline, wp.int32(n_segments)],
-        outputs=[sums],
-        block_dim=TILE_1D,
-        device=device,
-    )
-    sums_np = sums.numpy()
+    # One launch and one readback for all four sums: ``polyline_radius``'s frame pass with no
+    # Newell sum, whose first four slots are the weighted midpoints and the total length.
+    sums_np = _accumulate_frame(polyline, n_segments, 0, with_normal=False).numpy()
     # A NumPy float32 quotient: the same IEEE division per component, without Warp's Python-scope
     # dispatch of a ``wp.vec3`` operator.
     return wp.vec3(*(sums_np[:3] / sums_np[3]))
@@ -304,7 +301,6 @@ def polyline_normal(polyline: wp.array[wp.vec3]) -> wp.vec3:
     ValueError
         If the polyline has fewer than three points.
     """
-    device = polyline.device
     n = int(polyline.shape[0])
     # A non-degenerate loop normal needs three distinct vertices, and a polyline whose last vertex
     # duplicates its first has only ``n - 1`` of them.
@@ -317,14 +313,7 @@ def polyline_normal(polyline: wp.array[wp.vec3]) -> wp.vec3:
     if n == 3 and is_closed(polyline):
         raise ValueError("polyline_normal requires at least three points")
     # ``polyline_radius``'s frame pass with no segments: only its Newell sum, in its slots.
-    frame = wp.zeros(kernel_polyline.RADIUS_FRAME_SIZE, dtype=wp.float32, device=device)
-    wp.launch_tiled(
-        kernel_polyline.accumulate_radius_frame,
-        dim=kernel_reduce.blocks_1d(n),
-        inputs=[polyline, wp.int32(0), frame],
-        block_dim=TILE_1D,
-        device=device,
-    )
+    frame = _accumulate_frame(polyline, 0, 0, with_normal=True)
     # Normalized on the host, in float32 as ``wp.normalize`` does, rather than by a ``wp.map``
     # launch before the readback: the three components cross either way.
     normal_slot = int(kernel_polyline.RADIUS_FRAME_NORMAL)
@@ -371,10 +360,10 @@ def polyline_point_distance(
     m = int(polyline.shape[0])
     if m == 0:
         return wp.full(n_points, float("inf"), dtype=wp.float32, device=device)
-    out_distances = wp.empty(n_points, dtype=wp.float32, device=device)
     if n_points == 0:
-        return out_distances
+        return wp.empty(0, dtype=wp.float32, device=device)
     if m == 1:
+        out_distances = wp.empty(n_points, dtype=wp.float32, device=device)
         wp.launch(
             kernel_polyline.distance_to_first_point,
             dim=n_points,
@@ -383,11 +372,32 @@ def polyline_point_distance(
         )
         return out_distances
     # ``closed`` adds the closing segment inside the kernel, which decides per thread whether the
-    # input already repeats its first point -- no ``polyline_close`` readback or copy.
+    # input already repeats its first point -- no ``polyline_close`` readback or copy. On CUDA the
+    # segments are split into slices when the queries alone would leave the device mostly idle,
+    # each slice folding its minimum into the query's slot; a minimum is order-free, so the answer
+    # is the same. The CPU device runs a launch grid as one loop, where slicing buys nothing.
+    n_open = m - 1
+    n_slices = 1
+    if wp.get_device(device).is_cuda:
+        n_slices = min(
+            -(-kernel_polyline.POINT_DISTANCE_THREADS // n_points),
+            -(-n_open // kernel_polyline.POINT_DISTANCE_MIN_SLICE),
+        )
+    if n_slices <= 1:
+        out_distances = wp.empty(n_points, dtype=wp.float32, device=device)
+        wp.launch(
+            kernel_polyline.distance_to_segments,
+            dim=n_points,
+            inputs=[points, polyline, wp.int32(closed), out_distances],
+            device=device,
+        )
+        return out_distances
+    out_distances = wp.full(n_points, math.inf, dtype=wp.float32, device=device)
     wp.launch(
-        kernel_polyline.distance_to_segments,
-        dim=n_points,
-        inputs=[points, polyline, wp.int32(closed), out_distances],
+        kernel_polyline.distance_to_segment_slices,
+        dim=(n_slices, n_points),
+        inputs=[points, polyline, wp.int32(closed), wp.int32(-(-n_open // n_slices))],
+        outputs=[out_distances],
         device=device,
     )
     return out_distances
@@ -966,14 +976,16 @@ def polyline_radius(
         raise ValueError(f"unsupported reduction {reduction!r}")
     device = polyline.device
     n = int(polyline.shape[0])
+    if n < 2:
+        raise ValueError("polyline_radius requires at least two points")
     # ``closed`` adds the segment back to the first point when the input does not already end
     # there. The kernels reach it by wrapping the index rather than through a ``polyline_close``
-    # copy, but its presence sizes the distances -- a stand-in segment would move every reduction
-    # -- so that question is read back once.
-    wrap_open = closed and n >= 2 and not is_closed(polyline)
-    n_segments = n if wrap_open else n - 1
-    if n_segments < 1:
-        raise ValueError("polyline_radius requires at least two points")
+    # copy, and decide whether it is there themselves (``closing_segment_flag``), so the host asks
+    # only where the answer decides something on the host: an error below, for fewer than four
+    # points, or the size of the distances the median sorts -- a stand-in segment would move it.
+    n_segments = n - 1
+    if closed and (n <= 3 or reduction == "median") and not is_closed(polyline):
+        n_segments = n
 
     if (center is None or normal is None) and n_segments < 2:
         # ``polyline_centroid`` has no such floor, but ``polyline_normal`` needs three distinct
@@ -993,36 +1005,74 @@ def polyline_radius(
         raise ValueError("polyline_normal requires at least three points")
     frame = None
     if center is None or normal is None:
-        frame = wp.zeros(kernel_polyline.RADIUS_FRAME_SIZE, dtype=wp.float32, device=device)
-        wp.launch_tiled(
-            kernel_polyline.accumulate_radius_frame,
-            dim=kernel_reduce.blocks_1d(n_segments + 1),
-            inputs=[polyline, wp.int32(n_segments), frame],
-            block_dim=TILE_1D,
+        # The midpoint sums only for a defaulted centre, the Newell sum only for a defaulted normal.
+        n_open = n - 1 if center is None else 0
+        wrap_open = int(closed) if center is None else 0
+        frame = _accumulate_frame(polyline, n_open, wrap_open, with_normal=normal is None)
+    plane = [
+        polyline,
+        frame,
+        wp.vec3() if center is None else center,
+        wp.vec3() if normal is None else normal,
+        wp.int32(1 if center is None else 0),
+        wp.int32(1 if normal is None else 0),
+    ]
+    if reduction == "median":
+        distances = twt.empty_1d(n_segments, wp.float32, device=device)
+        wp.launch(
+            kernel_polyline.radius_distances,
+            dim=n_segments,
+            inputs=plane,
+            outputs=[distances],
             device=device,
         )
-    distances = twt.empty_1d(n_segments, wp.float32, device=device)
-    wp.launch(
-        kernel_polyline.radius_distances,
-        dim=n_segments,
-        inputs=[
-            polyline,
-            frame,
-            wp.vec3() if center is None else center,
-            wp.vec3() if normal is None else normal,
-            wp.int32(1 if center is None else 0),
-            wp.int32(1 if normal is None else 0),
-        ],
-        outputs=[distances],
+        return tw.reduce.median(distances)
+    # ``min`` / ``max`` / ``mean`` are folded where the distances are computed
+    # (``kernels/polyline.radius_reduce``): no distance buffer, no reduction launch over it, and one
+    # readback of the value and, for the mean, the segment count the kernel decided.
+    kind, identity = _RADIUS_REDUCTIONS[reduction]
+    result = wp.full(kernel_polyline.RADIUS_RESULT_SIZE, identity, dtype=wp.float32, device=device)
+    wp.launch_tiled(
+        kernel_polyline.radius_reduce,
+        dim=kernel_reduce.blocks_1d(n),
+        inputs=[*plane, wp.int32(closed), kind, result],
+        block_dim=TILE_1D,
         device=device,
     )
-    if reduction == "min":
-        return float(tw.reduce.min(distances))
-    if reduction == "max":
-        return float(tw.reduce.max(distances))
-    if reduction == "mean":
-        return float(tw.reduce.mean(distances))
-    return tw.reduce.median(distances)
+    if reduction != "mean":
+        return float(read_scalar(result, 0))
+    total, count = result.numpy()
+    return float(total) / float(count)
+
+
+def _accumulate_frame(
+    polyline: wp.array[wp.vec3], n_segments: int, wrap_open: int, *, with_normal: bool
+) -> wp.array[wp.float32]:
+    """
+    Launch ``kernels/polyline.accumulate_radius_frame`` into a fresh ``RADIUS_FRAME_SIZE`` buffer.
+
+    The shared frame pass of [`polyline_centroid`][triwarp.polyline.polyline_centroid],
+    [`polyline_normal`][triwarp.polyline.polyline_normal] and
+    [`polyline_radius`][triwarp.polyline.polyline_radius]: the length-weighted midpoint sums over
+    ``n_segments`` segments plus the closing one ``wrap_open`` asks for, and, with
+    ``with_normal``, Newell's sum over the loop.
+    """
+    device = polyline.device
+    frame = wp.zeros(kernel_polyline.RADIUS_FRAME_SIZE, dtype=wp.float32, device=device)
+    wp.launch_tiled(
+        kernel_polyline.accumulate_radius_frame,
+        dim=kernel_reduce.blocks_1d(int(polyline.shape[0])),
+        inputs=[
+            polyline,
+            wp.int32(n_segments),
+            wp.int32(wrap_open),
+            wp.int32(1 if with_normal else 0),
+            frame,
+        ],
+        block_dim=TILE_1D,
+        device=device,
+    )
+    return frame
 
 
 def polyline_angles(polyline: wp.array[wp.vec3], *, closed: bool = False) -> wp.array[wp.float32]:

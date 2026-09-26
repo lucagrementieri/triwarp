@@ -2325,10 +2325,16 @@ def _csr_matrix(
     ``columns`` and ``values`` may run past the last row; the stored-entry count is their length,
     a capacity, and every reader walks rows through ``offsets``.
     """
-    matrix = wps.bsr_zeros(n, n, wp.float64, device=values.device)
+    # The typed class directly, not ``wps.bsr_zeros``, whose three placeholder arrays and offsets
+    # memset would all be replaced; ``notify_nnz_changed`` is Warp's entry point for storage
+    # assigned from outside ``warp.sparse``.
+    matrix = wps.bsr_matrix_t(wp.float64)()
+    matrix.nrow = n
+    matrix.ncol = n
     matrix.offsets = offsets
     matrix.columns = columns
     matrix.values = values
+    matrix.row_counts = None
     matrix.notify_nnz_changed(nnz=int(values.shape[0]))
     return matrix
 

@@ -3,6 +3,7 @@ import warp as wp
 from triwarp.constants import FLOAT32_INF_CONSTANT
 from triwarp.kernels.algorithms.connected_components import ecl_hook_pair, ecl_prehook_pair
 from triwarp.kernels.array import pack_edge_key
+from triwarp.kernels.halfedge import halfedge_endpoints
 from triwarp.kernels.predicates import vector_angle
 from triwarp.kernels.triangles import corner_triple
 
@@ -43,6 +44,22 @@ def face_edge_keys(
     write_face_edge_keys(faces, f, 3 * f, base, out_keys)
 
 
+@wp.kernel
+def face_edge_keys_and_order(
+    faces: wp.array[wp.int32],
+    base: wp.uint64,
+    out_keys: wp.array[wp.uint64],
+    out_order: wp.array[wp.int32],
+) -> None:
+    # ``face_edge_keys`` plus the identity payload ``radix_sort_pairs`` carries, written
+    # straight into the first half of the sort's double-width buffers: no key copy, and no
+    # separate identity fill. The upper halves are sort scratch and are never initialized.
+    f = wp.int32(wp.tid())
+    write_face_edge_keys(faces, f, 3 * f, base, out_keys)
+    for k in range(3):
+        out_order[3 * f + k] = 3 * f + k
+
+
 @wp.func
 def sorted_pair_slot(sorted_keys: wp.array[wp.uint64], i: wp.int32) -> tuple[wp.int32, wp.bool]:
     """
@@ -54,8 +71,8 @@ def sorted_pair_slot(sorted_keys: wp.array[wp.uint64], i: wp.int32) -> tuple[wp.
     otherwise; ``unpaired_start`` is ``True`` on the first position of every other run (a boundary
     edge, or one shared by three or more faces), so a kernel can flag a non-paired edge exactly
     once. A kernel launched over every sorted position can therefore act on each adjacency pair
-    with no compacted pair table and no host read of its length. Every neighbour read is guarded
-    by its own branch, because a kernel-scope ``and`` does not short-circuit.
+    with no compacted pair table and no host read of its length. Every neighbour read sits behind
+    its own bounds test.
     """
     n = sorted_keys.shape[0]
     key = sorted_keys[i]
@@ -86,13 +103,11 @@ def sorted_pair_slot(sorted_keys: wp.array[wp.uint64], i: wp.int32) -> tuple[wp.
 
 @wp.func
 def edge_endpoints(faces: wp.array[wp.int32], edge_index: wp.int32) -> tuple[wp.int32, wp.int32]:
-    # The sorted endpoints of edge ``3f + c``, recovered from the edge index alone. Corner ``c`` of
-    # face ``f`` spans ``(v[c], v[(c + 1) % 3])``, matching ``kernels/edges.py:faces_to_edges``, so
-    # this reproduces exactly the row ``faces_to_edges(sorted=True)`` would have written there.
-    face_base = (edge_index // 3) * 3
-    corner = edge_index % 3
-    a = faces[face_base + corner]
-    b = faces[face_base + (corner + 1) % 3]
+    # The sorted endpoints of edge ``3f + c``, recovered from the edge index alone: halfedge
+    # ``3f + c`` (``halfedge.halfedge_endpoints``) spans ``(v[c], v[(c + 1) % 3])``, matching
+    # ``kernels/edges.py:faces_to_edges``, so this reproduces exactly the row
+    # ``faces_to_edges(sorted=True)`` would have written there.
+    a, b = halfedge_endpoints(faces, edge_index)
     return wp.min(a, b), wp.max(a, b)
 
 
@@ -109,57 +124,69 @@ def write_edge_row(
 
 
 @wp.func
-def write_face_pair(
-    edge_groups: wp.array2d[wp.int32], row: wp.int32, out_adjacency: wp.array2d[wp.int32]
+def write_adjacency_row(
+    faces: wp.array[wp.int32],
+    edges_sorted: wp.array2d[wp.int32],
+    edge_0: wp.int32,
+    edge_1: wp.int32,
+    row: wp.int32,
+    out_adjacency: wp.array2d[wp.int32],
+    out_edges: wp.array2d[wp.int32],
 ) -> None:
-    # Two edge indices sharing a key -> the ascending pair of faces owning them. Replaces a gather
-    # through a materialized ``edges_face`` table plus an in-place row sort: the owning face of
-    # edge ``e`` is just ``e // 3``, and ordering two values needs no sort kernel.
-    f0 = edge_groups[row, 0] // 3
-    f1 = edge_groups[row, 1] // 3
+    # Two halfedge indices sharing a key -> row ``row`` of ``face_adjacency``: the ascending pair
+    # of faces owning them, and with ``out_edges`` (a null descriptor otherwise) the shared edge.
+    # The owning face of edge ``e`` is just ``e // 3``, and ordering two values needs no sort
+    # kernel. The shared edge is the first halfedge's sorted endpoints: from a caller-supplied
+    # ``edges_sorted`` row when one is given (a null descriptor otherwise), else recovered from
+    # the halfedge index through ``edge_endpoints``, so no ``(3 * n_faces, 2)`` edge table has to
+    # exist to gather it from. Both selectors are warp-uniform.
+    f0 = edge_0 // 3
+    f1 = edge_1 // 3
     out_adjacency[row, 0] = wp.min(f0, f1)
     out_adjacency[row, 1] = wp.max(f0, f1)
+    if out_edges.shape[0] > 0:
+        if edges_sorted.shape[0] > 0:
+            out_edges[row, 0] = edges_sorted[edge_0, 0]
+            out_edges[row, 1] = edges_sorted[edge_0, 1]
+        else:
+            write_edge_row(faces, edge_0, row, out_edges)
 
 
 @wp.kernel
 def edge_pairs_to_face_pairs(
-    edge_groups: wp.array2d[wp.int32], out_adjacency: wp.array2d[wp.int32]
-) -> None:
-    write_face_pair(edge_groups, wp.int32(wp.tid()), out_adjacency)
-
-
-@wp.kernel
-def edge_pairs_to_face_pairs_and_edges(
     faces: wp.array[wp.int32],
+    edges_sorted: wp.array2d[wp.int32],
     edge_groups: wp.array2d[wp.int32],
     out_adjacency: wp.array2d[wp.int32],
     out_edges: wp.array2d[wp.int32],
 ) -> None:
-    # ``edge_pairs_to_face_pairs`` plus the shared edge of each pair, which is the first grouped
-    # edge's sorted endpoints -- recovered from its index through ``edge_endpoints``, so no
-    # ``(3 * n_faces, 2)`` edge table has to exist to gather it from. Differs from
-    # ``edge_pairs_to_face_pairs_and_table_edges`` only in where that row is read: the faces here,
-    # a caller's precomputed table there.
+    # ``write_adjacency_row`` for every row of an ``(m, 2)`` halfedge-pair table.
     tid = wp.int32(wp.tid())
-    write_face_pair(edge_groups, tid, out_adjacency)
-    write_edge_row(faces, edge_groups[tid, 0], tid, out_edges)
+    write_adjacency_row(
+        faces, edges_sorted, edge_groups[tid, 0], edge_groups[tid, 1], tid, out_adjacency, out_edges
+    )
 
 
 @wp.kernel
-def edge_pairs_to_face_pairs_and_table_edges(
-    edge_groups: wp.array2d[wp.int32],
+def emit_sorted_face_pairs(
+    faces: wp.array[wp.int32],
     edges_sorted: wp.array2d[wp.int32],
+    offsets: wp.array[wp.int32],
+    order: wp.array[wp.int32],
     out_adjacency: wp.array2d[wp.int32],
     out_edges: wp.array2d[wp.int32],
 ) -> None:
-    # The same two answers as ``edge_pairs_to_face_pairs_and_edges`` with the shared edge read from
-    # a caller-supplied ``edges_sorted`` row -- in one launch rather than the pair kernel plus a
-    # ``wp.clone`` of the strided ``edge_groups[:, 0]`` column and a gather through it.
-    tid = wp.int32(wp.tid())
-    write_face_pair(edge_groups, tid, out_adjacency)
-    first = edge_groups[tid, 0]
-    out_edges[tid, 0] = edges_sorted[first, 0]
-    out_edges[tid, 1] = edges_sorted[first, 1]
+    # ``write_adjacency_row`` straight off the sorted halfedge keys, launched over the sorted
+    # positions with ``offsets`` the total-terminated exclusive scan of the exact-pair starts
+    # (``grouping.mark_group_starts`` at length two): a position starts a pair exactly where the
+    # scan steps, and the step's value is the pair's row -- ``grouping.emit_groups``' compaction,
+    # with the pair's faces and edge written in the same launch rather than from an intermediate
+    # ``(m, 2)`` group table.
+    i = wp.int32(wp.tid())
+    row = offsets[i]
+    if offsets[i + 1] == row:
+        return
+    write_adjacency_row(faces, edges_sorted, order[i], order[i + 1], row, out_adjacency, out_edges)
 
 
 @wp.func
@@ -258,21 +285,29 @@ def edge_pair_topology(
 
 
 @wp.kernel
-def face_adjacency_unshared_from_edges(
-    faces: wp.array[wp.int32], edge_groups: wp.array2d[wp.int32], out_unshared: wp.array2d[wp.int32]
+def emit_sorted_unshared(
+    faces: wp.array[wp.int32],
+    offsets: wp.array[wp.int32],
+    order: wp.array[wp.int32],
+    out_unshared: wp.array2d[wp.int32],
 ) -> None:
-    # Same answer as ``face_adjacency_unshared`` with no edge table and no adjacency table. Column
-    # order follows ``edge_pairs_to_face_pairs``, which emits the face pair ascending.
-    tid = wp.int32(wp.tid())
+    # Same answer as ``face_adjacency_unshared`` with no edge table and no adjacency table,
+    # compacted off the sorted halfedge keys exactly as ``emit_sorted_face_pairs`` compacts the
+    # pairs, so the rows align with ``face_adjacency``'s. Column order follows that kernel, which
+    # emits the face pair ascending.
+    i = wp.int32(wp.tid())
+    row = offsets[i]
+    if offsets[i + 1] == row:
+        return
     _shared_a, _shared_b, face_0, face_1, unshared_0, unshared_1 = edge_pair_topology(
-        faces, edge_groups[tid, 0], edge_groups[tid, 1]
+        faces, order[i], order[i + 1]
     )
     if face_0 <= face_1:
-        out_unshared[tid, 0] = unshared_0
-        out_unshared[tid, 1] = unshared_1
+        out_unshared[row, 0] = unshared_0
+        out_unshared[row, 1] = unshared_1
     else:
-        out_unshared[tid, 0] = unshared_1
-        out_unshared[tid, 1] = unshared_0
+        out_unshared[row, 0] = unshared_1
+        out_unshared[row, 1] = unshared_0
 
 
 @wp.kernel

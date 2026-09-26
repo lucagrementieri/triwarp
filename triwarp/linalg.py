@@ -473,15 +473,8 @@ def assemble_interior_system(
         inputs=[q.offsets, q.columns, q.values, fixed_mask, free_map, row_offsets, columns, values],
         device=device,
     )
-    # Hand the finished CSR to a compact ``BsrMatrix`` directly. ``notify_nnz_changed`` is Warp's
-    # documented entry point for exactly this -- storage metadata assigned from outside
-    # ``warp.sparse`` -- and ``bsr_zeros`` leaves ``row_counts`` at ``None``, which is the compact
-    # topology these arrays describe.
-    q_uu = wps.bsr_zeros(n_free, n_free, wp.float64, device=device)
-    q_uu.offsets = row_offsets
-    q_uu.columns = columns
-    q_uu.values = values
-    q_uu.notify_nnz_changed(nnz=nnz_uu)
+    # Hand the finished CSR to a compact ``BsrMatrix`` directly (``_bsr_over``).
+    q_uu = _bsr_over(n_free, n_free, row_offsets, columns, values, nnz_uu)
     return q_uu, twt.as_array2d(rhs, wp.float64)
 
 
@@ -724,11 +717,9 @@ def _scalar_expansion(matrix: wps.BsrMatrix[Any]) -> wps.BsrMatrix[wp.float64]:
             outputs=[offsets, columns, values],
             device=device,
         )
-    expanded = wps.bsr_zeros(2 * n_rows, 2 * int(matrix.ncol), wp.float64, device=device)
-    expanded.offsets = offsets
-    expanded.columns = columns
-    expanded.values = values
-    expanded.notify_nnz_changed(nnz=4 * int(matrix.nnz))
+    expanded = _bsr_over(
+        2 * n_rows, 2 * int(matrix.ncol), offsets, columns, values, 4 * int(matrix.nnz)
+    )
     _EXPANSION_CACHE[matrix] = (
         (identity, (matrix.offsets, matrix.columns, matrix.values)),
         expanded,
@@ -1282,19 +1273,6 @@ def _cg_columns(
             check_every=supported,
             preconditioner=preconditioner,
         )
-    if isinstance(preconditioner, SquaredLaplacianPreconditioner):
-        # Not cached: the preconditioner object is the caller's, typically built fresh per call
-        # against a fresh system, so a keyed state would never be hit again.
-        state = _BatchedCg(
-            matrix,
-            rhs,
-            solution,
-            tol=tol,
-            maxiter=iteration_cap,
-            check_every=supported,
-            preconditioner=preconditioner,
-        )
-        return cast("tuple[int, float, float]", state())
     state = _cached_solver(
         matrix,
         n_columns,
@@ -1713,6 +1691,8 @@ class _BatchedCg:
         # arrays the recorded graph reads.
         if own_storage:
             matrix = _owned_copy(matrix)
+            if isinstance(preconditioner, SquaredLaplacianPreconditioner):
+                preconditioner = preconditioner._owned_copy()
         self._owns_storage = own_storage
         self._matrix = matrix
         self._n_columns, self._n = int(solution.shape[0]), int(solution.shape[1])
@@ -1879,16 +1859,21 @@ class _BatchedCg:
                 kernel_cg.SETTLE_STATE_SIZE, dtype=wp.float64, device=device
             )
 
-    def refresh(self, matrix: wps.BsrMatrix[wp.float64]) -> None:
+    def refresh(
+        self,
+        matrix: wps.BsrMatrix[wp.float64],
+        preconditioner: str | SquaredLaplacianPreconditioner = "diag",
+    ) -> None:
         """
         Write ``matrix`` into this pooled state's own operator storage, and re-derive from it.
 
         One launch (``kernels/linalg.refresh_pooled_operator``) copies the pattern and the values
         and rewrites what construction derived from them -- the narrowed values, the Jacobi
         inverse diagonal -- and, under the Jacobi-Chebyshev polynomial, the Gershgorin ratios its
-        interval is refitted to on the device. The recorded graph reads these same arrays, so the
-        state then solves ``matrix`` with no new recording. Only for a state built with
-        ``own_storage``, whose operator has ``matrix``'s shape.
+        interval is refitted to on the device. A squared-Laplacian ``preconditioner`` is the
+        caller's own, so its arrays are copied into the state's copy of it. The recorded graph
+        reads these same arrays, so the state then solves ``matrix`` with no new recording. Only for
+        a state built with ``own_storage``, whose operator and preconditioner have these shapes.
         """
         assert self._owns_storage
         owned = self._matrix
@@ -1922,6 +1907,9 @@ class _BatchedCg:
         if chebyshev:
             assert isinstance(self._cycle, _JacobiChebyshevApply)
             self._cycle.owner.refit()
+        if isinstance(preconditioner, SquaredLaplacianPreconditioner):
+            assert isinstance(self._cycle, _SquaredLaplacianApply)
+            self._cycle.owner._assign(preconditioner)
 
     def _settle_check(self) -> None:
         """Issue the settle monitor's two launches, after a block of ``check_rounds`` rounds."""
@@ -2275,7 +2263,7 @@ def _cached_solver(
     tol: float,
     maxiter: int,
     check_every: int,
-    preconditioner: str,
+    preconditioner: str | SquaredLaplacianPreconditioner,
     settle: tuple[int, float, int] | None = None,
     narrow_values: bool = False,
     pooled: bool = False,
@@ -2307,19 +2295,25 @@ def _cached_solver(
     live operators of one shape alternating. The first operator of a shape keeps a state of its
     own as above, so an operator solved once, or a single hoisted one, pays no copy.
 
+    A ``SquaredLaplacianPreconditioner`` is the caller's own, built fresh against each fresh system,
+    so a state keyed by the operator would never be hit again: its solve takes a pooled state, whose
+    own copy of the preconditioner ``refresh`` rewrites with the operator, or else a state of its
+    own that is not kept.
+
     Two solves against one state must run on one stream, as every caller here does.
     """
+    squared = isinstance(preconditioner, SquaredLaplacianPreconditioner)
     config = (
         n_columns,
         float(tol),
         int(maxiter),
         int(check_every),
-        preconditioner,
+        preconditioner._pool_shape() if squared else preconditioner,
         settle,
         narrow_values,
     )
     key = (*config, id(matrix.offsets), id(matrix.columns), id(matrix.values))
-    entries = _SOLVER_CACHE.setdefault(matrix, {})
+    entries = {} if squared else _SOLVER_CACHE.setdefault(matrix, {})
     state = entries.pop(key, None)
     if state is None and pooled and _poolable(matrix, preconditioner):
         n = int(matrix.nrow)
@@ -2350,7 +2344,7 @@ def _cached_solver(
                     own_storage=True,
                 )
             else:
-                pooled_state.refresh(matrix)
+                pooled_state.refresh(matrix, preconditioner)
             while len(_SOLVER_POOL) >= _SOLVER_POOL_ENTRIES:
                 _SOLVER_POOL.pop(next(iter(_SOLVER_POOL)))
             _SOLVER_POOL[shape] = pooled_state
@@ -2374,7 +2368,8 @@ def _cached_solver(
         )
         while len(entries) >= _SOLVER_CACHE_ENTRIES:
             entries.pop(next(iter(entries)))
-    # Re-inserted last, so the eviction above drops the least recently used.
+    # Re-inserted last, so the eviction above drops the least recently used. A squared-Laplacian
+    # state's ``entries`` is a throwaway, so it is never kept.
     entries[key] = state
     return state
 
@@ -2388,11 +2383,16 @@ _SHAPES_SEEN: set[tuple[Any, ...]] = set()
 _SHAPES_SEEN_ENTRIES = 256
 
 
-def _poolable(matrix: wps.BsrMatrix[Any], preconditioner: str) -> bool:
+def _poolable(
+    matrix: wps.BsrMatrix[Any], preconditioner: str | SquaredLaplacianPreconditioner
+) -> bool:
     """Whether ``_BatchedCg.refresh`` can rebuild everything a state derives from ``matrix``."""
     return (
         matrix.values.dtype == wp.float64
-        and preconditioner in ("diag", "chebyshev")
+        and (
+            isinstance(preconditioner, SquaredLaplacianPreconditioner)
+            or preconditioner in ("diag", "chebyshev")
+        )
         and int(matrix.nrow) > 0
     )
 
@@ -2414,14 +2414,14 @@ def _row_path(matrix: wps.BsrMatrix[Any], n: int, fold: bool) -> tuple[bool, int
 
 def _owned_copy(matrix: wps.BsrMatrix[Any]) -> wps.BsrMatrix[Any]:
     """Build a ``BsrMatrix`` over copies of ``matrix``'s arrays, for a pooled state to own."""
-    owned = wps.bsr_zeros(
-        int(matrix.nrow), int(matrix.ncol), matrix.values.dtype, device=matrix.device
+    return _bsr_over(
+        int(matrix.nrow),
+        int(matrix.ncol),
+        wp.clone(matrix.offsets),
+        wp.clone(matrix.columns),
+        wp.clone(matrix.values),
+        int(matrix.nnz),
     )
-    owned.offsets = wp.clone(matrix.offsets)
-    owned.columns = wp.clone(matrix.columns)
-    owned.values = wp.clone(matrix.values)
-    owned.notify_nnz_changed(nnz=int(matrix.nnz))
-    return owned
 
 
 def _storage_alias(matrix: wps.BsrMatrix[Any]) -> wps.BsrMatrix[Any]:
@@ -2473,13 +2473,15 @@ def bsr_with_values(matrix: wps.BsrMatrix[Any], values: wp.array[Any]) -> wps.Bs
             f"values must hold one block per stored entry ({matrix.values.shape[0]}), got "
             f"{values.shape[0]}"
         )
-    result = wps.bsr_zeros(int(matrix.nrow), int(matrix.ncol), values.dtype, device=matrix.device)
-    result.offsets = matrix.offsets
-    result.columns = matrix.columns
-    result.values = values
-    result.row_counts = matrix.row_counts
-    result.notify_nnz_changed(nnz=int(matrix.nnz))
-    return result
+    return _bsr_over(
+        int(matrix.nrow),
+        int(matrix.ncol),
+        matrix.offsets,
+        matrix.columns,
+        values,
+        int(matrix.nnz),
+        row_counts=matrix.row_counts,
+    )
 
 
 # ``block_diag``'s results, keyed weakly by the first operator of the stack.
@@ -2573,12 +2575,8 @@ def block_diag(matrices: Sequence[wps.BsrMatrix[Any]]) -> wps.BsrMatrix[wp.float
             outputs=[offsets, columns, values],
             device=device,
         )
-    stacked = wps.bsr_zeros(n_rows, n_rows, wp.float64, device=device)
-    stacked.offsets = offsets
-    stacked.columns = columns
-    stacked.values = values
     # A capacity, as the blocks' own counts are: the offsets bound every row.
-    stacked.notify_nnz_changed(nnz=capacity)
+    stacked = _bsr_over(n_rows, n_rows, offsets, columns, values, capacity)
     # The entry holds every block's arrays, so the identities in its key cannot be reused.
     held = tuple((matrix.offsets, matrix.columns, matrix.values) for matrix in matrices)
     entries[identity] = (held, stacked)
@@ -3025,6 +3023,52 @@ class SquaredLaplacianPreconditioner:
         """Working vectors for ``n_columns`` blocks at column pitch ``stride``."""
         return _SquaredLaplacianApply(self, n_columns, stride)
 
+    def _shares_pattern(self) -> bool:
+        """Whether ``Bᵀ`` is stored over ``B``'s own pattern arrays, as region solves write it."""
+        return (
+            self._factor_t.offsets is self._factor.offsets
+            and self._factor_t.columns is self._factor.columns
+        )
+
+    def _pool_shape(self) -> tuple[Any, ...]:
+        """Return what a pooled solver state's copy of this must match to be rewritten in place."""
+        return (
+            "squared",
+            self._shares_pattern(),
+            *(
+                int(array.shape[0])
+                for factor in (self._factor, self._factor_t)
+                for array in (factor.offsets, factor.columns, factor.values)
+            ),
+            int(self._steps.shape[0]),
+        )
+
+    def _owned_copy(self) -> SquaredLaplacianPreconditioner:
+        """Copy onto storage of its own, for a pooled solver state to hold and ``_assign`` to."""
+        copy = SquaredLaplacianPreconditioner.__new__(SquaredLaplacianPreconditioner)
+        copy._n = self._n
+        copy._device = self._device
+        copy._factor = _owned_copy(self._factor)
+        copy._factor_t = (
+            bsr_with_values(copy._factor, wp.clone(self._factor_t.values))
+            if self._shares_pattern()
+            else _owned_copy(self._factor_t)
+        )
+        copy._steps = wp.clone(self._steps)
+        copy._narrowed = None
+        return copy
+
+    def _assign(self, other: SquaredLaplacianPreconditioner) -> None:
+        """Copy ``other``'s arrays into this one's, which must have ``other``'s ``_pool_shape``."""
+        factors = [(self._factor, other._factor), (self._factor_t, other._factor_t)]
+        for index, (mine, theirs) in enumerate(factors):
+            if index == 0 or not other._shares_pattern():
+                wp.copy(mine.offsets, theirs.offsets)
+                wp.copy(mine.columns, theirs.columns)
+            wp.copy(mine.values, theirs.values)
+        wp.copy(self._steps, other._steps)
+        self._narrowed = None
+
     def narrowed(self) -> tuple[wp.array[wp.float32], wp.array[wp.float32]]:
         """
         Return ``B``'s and ``Bᵀ``'s values in ``float32``, built once.
@@ -3122,6 +3166,11 @@ class _SquaredLaplacianApply(_ChebyshevApply):
         super().__init__(owner._n, n_columns, stride, owner._steps, owner._device)
         self._owner = owner
         self._middle = wp.zeros(self._dofs, dtype=wp.float64, device=self._device)
+
+    @property
+    def owner(self) -> SquaredLaplacianPreconditioner:
+        """The preconditioner whose arrays the recorded polynomial reads."""
+        return self._owner
 
     def apply(self, source: wp.array[wp.float64], destination: wp.array[wp.float64]) -> None:
         """``destination = B Bᵀ source``: ``Bᵀ`` first, then ``B``."""
@@ -3843,3 +3892,33 @@ def _supported_check_every(check_every: int) -> int:
     if check_every == 0 and not wp.is_conditional_graph_supported():
         return CG_CHECK_EVERY_FALLBACK
     return check_every
+
+
+def _bsr_over(
+    n_rows: int,
+    n_cols: int,
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[Any],
+    nnz: int,
+    *,
+    row_counts: wp.array[wp.int32] | None = None,
+) -> wps.BsrMatrix[Any]:
+    """
+    Build a ``BsrMatrix`` over arrays that already hold its storage, allocating nothing.
+
+    ``values``' dtype is the block type, and ``row_counts`` is ``None`` for the compact topology
+    every caller here describes. The typed class is built directly rather than through
+    ``wps.bsr_zeros``, which allocates three placeholder arrays and zeroes the offsets only for
+    every one of them to be replaced; ``notify_nnz_changed`` is still Warp's documented entry
+    point for storage assigned from outside ``warp.sparse``, and records ``nnz``.
+    """
+    matrix = wps.bsr_matrix_t(values.dtype)()
+    matrix.nrow = n_rows
+    matrix.ncol = n_cols
+    matrix.offsets = offsets
+    matrix.columns = columns
+    matrix.values = values
+    matrix.row_counts = row_counts
+    matrix.notify_nnz_changed(nnz=nnz)
+    return matrix

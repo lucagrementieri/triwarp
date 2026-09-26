@@ -17,6 +17,7 @@ from triwarp.kernels.reduce import (
     block_sum,
     commit_sum_and_count,
     outer_sum_chunk,
+    tile_chunk,
 )
 
 
@@ -37,42 +38,6 @@ def is_in_half_space(point: wp.vec3, plane_normal: wp.vec3, plane_origin: wp.vec
     # ``point_plane_distance``: a non-unit normal cannot change the answer and the division cannot
     # change the sign, but it can turn a large dot into an infinity.
     return point_plane_dot(point, plane_normal, plane_origin) > 0.0
-
-
-@wp.kernel
-def accumulate_counted_mean(
-    count: wp.array[wp.int32], mean_distance: wp.array[wp.float32], out_totals: wp.array[wp.float64]
-) -> None:
-    # ``(rows with at least one neighbour, sum of their mean distances)`` into the first two slots
-    # of ``points.statistical_outlier_mask``'s ``(3,)`` accumulator, for its cloud mean.
-    #
-    # One kernel rather than a ``wp.map`` building a ``count > 0`` mask and two ``reduce.sum``
-    # calls over it and over ``mean_distance``. The mask existed only to be counted, so it went
-    # with them: a map, an ``n``-length allocation and two reductions -- each of which is a launch,
-    # an allocation and a host readback -- against one launch and one sixteen-byte readback here,
-    # which is a large fraction of the whole call.
-    #
-    # ``float64`` slots, not ``float32``: slot 0 is a *count*, and a float32 stops representing
-    # consecutive integers at 2 ** 24, which a large cloud reaches. Summing the distances at the
-    # wider precision is free alongside it and strictly better than the float32 tree it replaces.
-    #
-    # An empty row contributes zero to both sums, which is what lets the cloud mean be a plain
-    # reduction: ``neighbor_distance_moments`` writes a zero mean for a row it counted nothing in.
-    chunk, lane = wp.tid()
-    offset, n_rows = block_chunk_1d(count.shape[0], chunk)
-    if n_rows <= 0:
-        return
-
-    counted = wp.float64(0.0)
-    total = wp.float64(0.0)
-    for k in range(lane, n_rows, wp.block_dim()):
-        if count[offset + k] > 0:
-            counted = counted + wp.float64(1.0)
-            total = total + wp.float64(mean_distance[offset + k])
-
-    # ``reduce.commit_sum_and_count``'s two-slot commit, with the count in the *sum* slot: this
-    # buffer's order is ``(count, total)``.
-    commit_sum_and_count(lane, counted, total, out_totals)
 
 
 @wp.func
@@ -268,12 +233,21 @@ def estimate_point_normals(
     out_normals[v] = normal
 
 
+# Rows per block of ``neighbor_distance_moments``: four tiles, so a block of ``TILE_1D`` lanes walks
+# four rows each. One row per lane (64) keeps the grid widest but puts one float64 commit per 64
+# rows on the two accumulator slots, and at a million rows that contention made the fused kernel
+# 1.4x the unfused pair it replaced; 1024 starves the grid below ~100 k rows (2.6x slower at 41 k).
+# 256 measured at or below the unfused pair at both ends (0.54x at 41 k rows, 0.93x at 1 M, k = 16).
+MOMENT_ROWS_PER_BLOCK = wp.constant(256)
+
+
 @wp.kernel
 def neighbor_distance_moments(
     neighbor_distance: wp.array2d[wp.float32],
     out_mean: wp.array[wp.float32],
     out_rms: wp.array[wp.float32],
     out_count: wp.array[wp.int32],
+    out_totals: wp.array[wp.float64],
 ) -> None:
     # First and second moments of each point's neighbour distances, over the *filled* slots only:
     # ``query_nearest`` leaves unused slots at ``inf`` (index -1), and a row can be short when
@@ -283,29 +257,56 @@ def neighbor_distance_moments(
     # The mean feeds Open3D's statistical criterion and the RMS is the LoOP "standard distance".
     # Each caller wants only its own moments, so a length-zero output is skipped: the statistical
     # mask passes no ``out_rms`` and ``outlier_probability`` only ``out_rms``.
-    i = wp.int32(wp.tid())
+    #
+    # The statistical mask also passes ``out_totals``, the first two slots of its
+    # ``(count, total, deviation)`` accumulator, and gets ``(rows with at least one neighbour, sum
+    # of their mean distances)`` folded into them here: a separate fold over this launch's own
+    # outputs would re-read them for one more launch. ``MOMENT_ROWS_PER_BLOCK`` rows per block, a
+    # narrower fold than the reduce module's, because the kernel writes per row and the wide fold
+    # would collapse the grid (CLAUDE.md section 13.2); lane-strided by ``wp.block_dim()`` so the
+    # CPU device's single lane covers the block's rows. ``float64`` slots: slot 0 is a *count*,
+    # which a float32 stops representing exactly at 2 ** 24.
+    #
+    # An empty row contributes zero to both sums, which is what lets the cloud mean be a plain
+    # reduction.
+    chunk, lane = wp.tid()
     k = neighbor_distance.shape[1]
-    total = wp.float32(0.0)
-    total_sq = wp.float32(0.0)
-    count = wp.int32(0)
-    for s in range(k):
-        d = neighbor_distance[i, s]
-        if not wp.isinf(d):
-            total += d
-            total_sq += d * d
-            count += 1
-    mean = wp.float32(0.0)
-    rms = wp.float32(0.0)
-    if count > 0:
-        inverse = 1.0 / wp.float32(count)
-        mean = total * inverse
-        rms = wp.sqrt(total_sq * inverse)
-    if out_mean.shape[0] > 0:
-        out_mean[i] = mean
-    if out_rms.shape[0] > 0:
-        out_rms[i] = rms
-    if out_count.shape[0] > 0:
-        out_count[i] = count
+    offset, remaining = tile_chunk(neighbor_distance.shape[0], chunk, MOMENT_ROWS_PER_BLOCK)
+    if remaining <= 0:
+        return
+    remaining = wp.min(remaining, MOMENT_ROWS_PER_BLOCK)
+    counted = wp.float64(0.0)
+    distance_total = wp.float64(0.0)
+    for r in range(lane, remaining, wp.block_dim()):
+        i = offset + r
+        total = wp.float32(0.0)
+        total_sq = wp.float32(0.0)
+        count = wp.int32(0)
+        for s in range(k):
+            d = neighbor_distance[i, s]
+            if not wp.isinf(d):
+                total += d
+                total_sq += d * d
+                count += 1
+        mean = wp.float32(0.0)
+        rms = wp.float32(0.0)
+        if count > 0:
+            inverse = 1.0 / wp.float32(count)
+            mean = total * inverse
+            rms = wp.sqrt(total_sq * inverse)
+            counted = counted + wp.float64(1.0)
+            distance_total = distance_total + wp.float64(mean)
+        if out_mean.shape[0] > 0:
+            out_mean[i] = mean
+        if out_rms.shape[0] > 0:
+            out_rms[i] = rms
+        if out_count.shape[0] > 0:
+            out_count[i] = count
+    # Launch-uniform, so the block-collective commit stays on one side of it for every lane. The
+    # count goes in the *sum* slot of ``reduce.commit_sum_and_count``'s pair: this buffer's order
+    # is ``(count, total)``.
+    if out_totals.shape[0] > 0:
+        commit_sum_and_count(lane, counted, distance_total, out_totals)
 
 
 @wp.kernel
@@ -372,9 +373,17 @@ def is_statistical_outlier(
 
 @wp.func
 def counted_cloud_mean(totals: wp.array[wp.float64]) -> wp.float64:
-    # The cloud mean over the counted rows, off ``accumulate_counted_mean``'s ``(count, total)``
+    # The cloud mean over the counted rows, off ``neighbor_distance_moments``' ``(count, total)``
     # slots -- the division the host used to do after reading them back, in the same ``float64``.
     return totals[1] / totals[0]
+
+
+@wp.func
+def has_cloud_deviation(totals: wp.array[wp.float64]) -> wp.bool:
+    # A (ddof = 1) cloud deviation needs two counted rows. The one rule both the deviation pass and
+    # the mask launch branch on: below it the first adds nothing and the second disables the
+    # threshold, so the two must never disagree about which side a cloud is on.
+    return totals[0] >= wp.float64(2.0)
 
 
 @wp.kernel
@@ -382,15 +391,15 @@ def accumulate_counted_deviation(
     count: wp.array[wp.int32], mean_distance: wp.array[wp.float32], out_totals: wp.array[wp.float64]
 ) -> None:
     # The squared-deviation sum behind ``statistical_outlier_mask``'s cloud deviation, into slot 2
-    # of the ``(count, total, deviation)`` buffer whose first two slots ``accumulate_counted_mean``
-    # has already filled -- so the mean it centres on never leaves the device. Each term is the
-    # ``float32`` ``centered_square_if_counted`` around the ``float32`` cloud mean, as before; the
-    # terms are summed in ``float64``, which is also what the Open3D reference accumulates in. A
-    # cloud with fewer than two counted rows has no deviation and adds nothing (the mask kernel
-    # disables the threshold there).
+    # of the ``(count, total, deviation)`` buffer whose first two slots
+    # ``neighbor_distance_moments`` has already filled -- so the mean it centres on never leaves
+    # the device. Each term is the ``float32`` ``centered_square_if_counted`` around the
+    # ``float32`` cloud mean, as before; the terms are summed in ``float64``, which is also what the
+    # Open3D reference accumulates in. A cloud with fewer than two counted rows has no deviation
+    # and adds nothing (the mask kernel disables the threshold there).
     chunk, lane = wp.tid()
     offset, n_rows = block_chunk_1d(count.shape[0], chunk)
-    if n_rows <= 0 or out_totals[0] < wp.float64(2.0):
+    if n_rows <= 0 or not has_cloud_deviation(out_totals):
         return
     center = wp.float32(counted_cloud_mean(out_totals))
     total = wp.float64(0.0)
@@ -416,10 +425,9 @@ def statistical_outlier_from_totals(
     # ``inf``, which disables only the distance third of the predicate and keeps the empty- and
     # coincident-neighbourhood halves.
     i = wp.int32(wp.tid())
-    counted = totals[0]
     threshold = wp.float32(FLOAT32_INF_CONSTANT)
-    if counted >= wp.float64(2.0):
-        cloud_std = wp.sqrt(totals[2] / (counted - wp.float64(1.0)))
+    if has_cloud_deviation(totals):
+        cloud_std = wp.sqrt(totals[2] / (totals[0] - wp.float64(1.0)))
         threshold = wp.float32(counted_cloud_mean(totals) + std_ratio * cloud_std)
     out_mask[i] = is_statistical_outlier(mean_distance[i], count[i], threshold)
 

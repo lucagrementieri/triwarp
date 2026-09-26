@@ -32,8 +32,9 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import read_scalar, require_same_device
+from triwarp._device import read_scalar, read_values, require_same_device
 from triwarp.constants import INDEX_RADIX_PAIR, INT32_MAX
+from triwarp.kernels import adjacency as kernel_adjacency
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import boundary as kernel_boundary
 from triwarp.kernels import scatter as kernel_scatter
@@ -164,8 +165,8 @@ def boundary_loops(
     Parameters
     ----------
     vertices
-        ``(n_vertices,)`` vertex positions; only the count is used (as the successor-array
-        size).
+        ``(n_vertices,)`` vertex positions; only the count is used, as the successor-array
+        size and the edge-key radix, so every face index must be below it.
     faces
         Length-``3 * n_faces`` ``wp.int32`` face index buffer.
     edges_sorted
@@ -236,8 +237,8 @@ def boundary_loops_batched(
     Parameters
     ----------
     vertices
-        ``(n_vertices,)`` vertex positions; only the count is used (as the successor-array
-        size).
+        ``(n_vertices,)`` vertex positions; only the count is used, as the successor-array
+        size and the edge-key radix, so every face index must be below it.
     faces
         Length-``3 * n_faces`` ``wp.int32`` face index buffer.
     edges_sorted
@@ -284,21 +285,22 @@ def boundary_loops_batched(
     n_vertices = int(vertices.shape[0])
     # One boundary detection for every edge view below; ``boundary_edges`` /
     # ``oriented_boundary_edges`` / ``boundary_vertex_indices`` would each redo the key sort.
-    boundary = _BoundaryHalfedges(faces, edges_sorted)
+    boundary = _BoundaryHalfedges(faces, edges_sorted, n_vertices)
+    has_seam, has_pinch = _boundary_defects(boundary, edges, n_vertices)
     if boundary.count() == 0:
         return (
             wp.empty(0, dtype=wp.int32, device=device),
             wp.empty(0, dtype=wp.int32, device=device),
             wp.empty(0, dtype=wp.int32, device=device),
         )
-
-    directed, rows, has_seam, has_pinch = _boundary_defects(boundary, edges, n_vertices)
     if has_pinch:
+        _, rows = boundary.edges(edges, sort_pair=False, with_rows=True)
         return _pinched_boundary_cycles(faces, rows, n_vertices)
     if has_seam:
         return _unoriented_boundary_cycles(
             boundary.edges(edges_sorted, sort_pair=True)[0], n_vertices
         )
+    directed, _ = boundary.edges(edges, sort_pair=False)
     # ``validate=False``: ``directed`` holds vertex indices this function just gathered out of
     # ``faces``, so the range check would only re-derive a bound the caller already guarantees —
     # at the cost of a device synchronization.
@@ -307,12 +309,13 @@ def boundary_loops_batched(
 
 def _boundary_defects(
     boundary: _BoundaryHalfedges, edges: twt.Array2dInt32 | None, n_vertices: int
-) -> tuple[twt.Array2dInt32, wp.array[wp.int32], bool, bool]:
+) -> tuple[bool, bool]:
     """
-    Emit the directed boundary edges and their halfedges, and detect a seam and a pinch.
+    Count the boundary edges and detect whether their directed rows have a seam or a pinch.
 
-    Returns the directed rows, their halfedge indices, whether the rows have an orientation seam,
-    and whether they have a pinch.
+    Returns whether the rows have an orientation seam and whether they have a pinch; the count is
+    left in ``boundary`` for [`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched]
+    to read.
 
     They have neither on an orientable surface with a manifold boundary, which is what lets
     [`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched] hand them straight to
@@ -334,19 +337,14 @@ def _boundary_defects(
     orientability problem, and a gate reading only out-degree would send it down the undirected
     walk, which has nothing to offer a vertex of degree four.
 
-    One 8-byte host readback, and no pass of its own: the degree census rides in the launch that
-    emits the directed rows (``kernels/boundary.count_boundary_degree``). Neither flag needs a pass
-    over the *vertices*: only a boundary vertex ever has a non-zero degree, and the thread that
-    pushes one past its threshold learns so from the value its own ``wp.atomic_add`` returns.
+    No pass and no readback of its own: the degree census rides in the launch that flags the
+    boundary runs (``kernels/boundary.mark_boundary_runs``), and its two bits come back in the one
+    readback that sizes the boundary. Neither flag needs a pass over the *vertices*: only a
+    boundary vertex ever has a non-zero degree, and the thread that pushes one past its threshold
+    learns so from the value its own ``wp.atomic_add`` returns.
     """
-    device = boundary.faces.device
-    degrees = twt.as_array2d(wp.zeros((n_vertices, 2), dtype=wp.int32, device=device), wp.int32)
-    flags = wp.zeros(2, dtype=wp.int32, device=device)
-    directed, rows = boundary.edges(
-        edges, sort_pair=False, with_rows=True, degrees=(degrees, flags)
-    )
-    has_seam, has_pinch = (bool(flag) for flag in flags.numpy())
-    return directed, rows, has_seam, has_pinch
+    boundary.count(census=(edges, n_vertices))
+    return boundary.defects
 
 
 def _pinched_boundary_cycles(
@@ -999,7 +997,8 @@ def boundary_vertex_indices(
         return wp.empty(0, dtype=wp.int32, device=faces.device)
     # The endpoints are vertex indices below ``len(vertices)``, so a per-vertex flag array and its
     # scan give the sorted unique set directly -- no edge list and no ``unique_1d``.
-    return _BoundaryHalfedges(faces, edges_sorted).vertex_indices(int(vertices.shape[0]))
+    n_vertices = int(vertices.shape[0])
+    return _BoundaryHalfedges(faces, edges_sorted, n_vertices).vertex_indices(n_vertices)
 
 
 def boundary_vertices(
@@ -1065,7 +1064,7 @@ def ears(
     Returns
     -------
     ear : wp.array[wp.int32]
-        Face indices of ear triangles on ``faces.device``. Empty when no ears exist.
+        Face indices of ear triangles on ``faces.device``, ascending. Empty when no ears exist.
     ear_opp : wp.array[wp.int32]
         Local edge index of the interior edge for each ear face, same length as ``ear``.
 
@@ -1088,19 +1087,24 @@ def ears(
     # The mask is read straight off the sorted keys: no scan and no readback.
     edge_boundary = _BoundaryHalfedges(faces, edges_sorted).halfedge_mask()
 
-    out_ear = wp.empty(n_faces, dtype=wp.int32, device=device)
-    out_ear_opp = wp.empty(n_faces, dtype=wp.int32, device=device)
-    counter = wp.zeros(1, dtype=wp.int32, device=device)
+    # Flag, scan in place, and emit at the scan's steps: ascending face order, one readback.
+    inclusive = wp.empty(n_faces, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_boundary.find_ears,
-        dim=n_faces,
-        inputs=[edge_boundary, out_ear, out_ear_opp, counter],
-        device=device,
+        kernel_boundary.mark_ears, dim=n_faces, inputs=[edge_boundary, inclusive], device=device
     )
-
-    n_ears, (ear, ear_opp) = tw.array.trim_to_count(counter, out_ear, out_ear_opp)
+    wp.utils.array_scan(inclusive, out_array=inclusive, inclusive=True)
+    # Sizes the output: the one host readback.
+    n_ears = int(read_scalar(inclusive))
     if n_ears == 0:
         return empty, empty
+    ear = wp.empty(n_ears, dtype=wp.int32, device=device)
+    ear_opp = wp.empty(n_ears, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_boundary.emit_ears,
+        dim=n_faces,
+        inputs=[edge_boundary, inclusive, ear, ear_opp],
+        device=device,
+    )
     return ear, ear_opp
 
 
@@ -1113,10 +1117,17 @@ class _BoundaryHalfedges:
     module needs (the undirected rows, the directed rows, the halfedge indices, the vertices, a
     per-halfedge mask) is read off ``faces`` and the sorted keys without an edge table. The keys
     pack against [`constants.INDEX_RADIX_PAIR`][triwarp.constants.INDEX_RADIX_PAIR], which orders
-    them exactly as the vertex count would and needs no bound.
+    them exactly as the vertex count would and needs no bound -- or, where the caller already
+    relies on every index being below ``n_vertices``, against that count, so the sort orders only
+    the bits a key can occupy. Either radix gives the same key order.
     """
 
-    def __init__(self, faces: wp.array[wp.int32], edges_sorted: twt.Array2dInt32 | None) -> None:
+    def __init__(
+        self,
+        faces: wp.array[wp.int32],
+        edges_sorted: twt.Array2dInt32 | None,
+        n_vertices: int | None = None,
+    ) -> None:
         device = faces.device
         n = int(faces.shape[0]) // 3 * 3
         self.faces = faces
@@ -1124,10 +1135,13 @@ class _BoundaryHalfedges:
         self.n = n
         self.keys = wp.empty(2 * n, dtype=wp.uint64, device=device)
         self.order = wp.empty(2 * n, dtype=wp.int32, device=device)
-        base = wp.uint64(INDEX_RADIX_PAIR)
+        radix = n_vertices if n_vertices else INDEX_RADIX_PAIR
+        base = wp.uint64(radix)
+        # The sort's double-width buffers are kept whole: every reader here passes ``n``, so the
+        # trimmed views ``adjacency.sorted_face_edge_keys`` hands back would be pure host cost.
         if edges_sorted is None:
             wp.launch(
-                kernel_boundary.face_edge_keys_and_order,
+                kernel_adjacency.face_edge_keys_and_order,
                 dim=n // 3,
                 inputs=[faces, base, self.keys, self.order],
                 device=device,
@@ -1139,47 +1153,71 @@ class _BoundaryHalfedges:
                 inputs=[edges_sorted, base, self.keys, self.order],
                 device=device,
             )
-        wp.utils.radix_sort_pairs(self.keys, self.order, count=n)
+        wp.utils.radix_sort_pairs(
+            self.keys,
+            self.order,
+            count=n,
+            end_bit=min(64, max(1, (radix * radix - 1).bit_length())),
+        )
         self._inclusive: wp.array[wp.int32] | None = None
         self._count = 0
+        self.defects = (False, False)
 
-    def count(self) -> int:
-        """Return the boundary edge count; the first call scans and reads the total back."""
+    def count(self, census: tuple[twt.Array2dInt32 | None, int] | None = None) -> int:
+        """
+        Return the boundary edge count; the first call scans and reads the total back.
+
+        ``census`` is ``boundary_loops_batched``'s ``(table, n_vertices)``: the directed rows'
+        source and the vertex count. Given on the first call, the degree census runs in the
+        flagging launch and its seam and pinch bits come back with the total, into ``defects``.
+        """
         if self._inclusive is None:
             device = self.faces.device
-            self._inclusive = wp.empty(self.n, dtype=wp.int32, device=device)
+            n = self.n
+            table: twt.Array2dInt32 | None = None
+            degrees: twt.Array2dInt32 | None = None
+            if census is None:
+                flags = wp.empty(n, dtype=wp.int32, device=device)
+            else:
+                table, n_vertices = census
+                # One zeroed buffer: the scanned flags, the census' two defect bits beyond them,
+                # and the ``(n_vertices, 2)`` degree table after those -- one allocation, and the
+                # total and both bits adjacent for the single readback.
+                flags = wp.zeros(n + 2 + 2 * n_vertices, dtype=wp.int32, device=device)
+                degrees = twt.as_array2d(flags[n + 2 :].reshape((n_vertices, 2)), wp.int32)
             wp.launch(
                 kernel_boundary.mark_boundary_runs,
-                dim=self.n,
-                inputs=[self.keys, wp.int32(self.n), self._inclusive],
+                dim=n,
+                inputs=[self.keys, self.order, wp.int32(n), self.faces, table, degrees, flags],
                 device=device,
             )
-            wp.utils.array_scan(self._inclusive, out_array=self._inclusive, inclusive=True)
-            # Sizes every output below: the one host readback of the boundary detection.
-            self._count = int(read_scalar(self._inclusive))
+            inclusive = flags if census is None else twt.as_dense(flags[:n])
+            wp.utils.array_scan(inclusive, out_array=inclusive, inclusive=True)
+            self._inclusive = inclusive
+            # Sizes every output below: the one host readback of the boundary detection, which
+            # carries the census' two bits alongside the total when there is one.
+            if census is None:
+                self._count = int(read_scalar(inclusive))
+            else:
+                total, seam, pinch = read_values(flags, n - 1, 3)
+                self._count = total
+                self.defects = (bool(seam), bool(pinch))
         return self._count
 
     def edges(
-        self,
-        table: twt.Array2dInt32 | None,
-        *,
-        sort_pair: bool,
-        with_rows: bool = False,
-        degrees: tuple[twt.Array2dInt32, wp.array[wp.int32]] | None = None,
+        self, table: twt.Array2dInt32 | None, *, sort_pair: bool, with_rows: bool = False
     ) -> tuple[twt.Array2dInt32, wp.array[wp.int32]]:
         """
         Emit the boundary edge rows in ascending key order, and (``with_rows``) their halfedges.
 
         Rows are read from ``table`` when given, else from ``faces`` (ascending when
-        ``sort_pair``). ``degrees`` is ``boundary_loops_batched``'s ``(degrees, defects)`` census,
-        accumulated over the directed rows in the same launch.
+        ``sort_pair``).
         """
         device = self.faces.device
         k = self.count()
         out_edges = twt.empty_2d((k, 2), wp.int32, device=device)
         out_rows = wp.empty(k if with_rows else 0, dtype=wp.int32, device=device)
         if k > 0:
-            out_degrees, out_defects = degrees if degrees is not None else (None, None)
             wp.launch(
                 kernel_boundary.emit_boundary_edges,
                 dim=self.n,
@@ -1191,8 +1229,6 @@ class _BoundaryHalfedges:
                     sort_pair,
                     out_rows if with_rows else None,
                     out_edges,
-                    out_degrees,
-                    out_defects,
                 ],
                 device=device,
             )

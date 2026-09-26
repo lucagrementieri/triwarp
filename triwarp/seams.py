@@ -34,6 +34,7 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import read_scalar, require_same_device
+from triwarp.kernels import adjacency as kernel_adjacency
 from triwarp.kernels import seams as kernel_seams
 
 # Whether the seam predicate compares coordinates rather than texcoord indices. A lookup rather than
@@ -77,8 +78,10 @@ def crease_edges(
     Returns
     -------
     twt.Array2dInt32
-        ``(k, 2)`` vertex-index pairs on ``faces.device``, one row per selected edge. Row order
-        follows [`face_adjacency`][triwarp.adjacency.face_adjacency] and is not sorted.
+        ``(k, 2)`` vertex-index pairs on ``faces.device``, one row per selected edge, smaller index
+        first. The creases come first, in [`face_adjacency`][triwarp.adjacency.face_adjacency]'s
+        row order, and the boundary edges, when asked for, after them in
+        [`boundary_edges`][triwarp.boundary.boundary_edges]' order; neither block is sorted.
 
     Raises
     ------
@@ -102,42 +105,43 @@ def crease_edges(
     if n_faces == 0:
         return twt.empty_2d((0, 2), wp.int32, device=device)
 
-    adjacency, adjacency_edges = tw.adjacency.face_adjacency(
-        faces, return_edges=True, n_vertices=int(vertices.shape[0])
+    # One radix sort of every halfedge's edge key, payload its halfedge index: an interior edge is
+    # a run of exactly two keys -- ``face_adjacency``'s row, in its order -- and a boundary edge a
+    # run of one, so both classes are flagged off the one sort, numbered by one scan of the flag
+    # table and emitted by one launch, creases first. A key is below ``n_vertices ** 2``, so only
+    # those bits are sorted.
+    n_vertices = int(vertices.shape[0])
+    n = 3 * n_faces
+    keys = wp.empty(2 * n, dtype=wp.uint64, device=device)
+    order = wp.empty(2 * n, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_adjacency.face_edge_keys_and_order,
+        dim=n_faces,
+        inputs=[faces, wp.uint64(n_vertices), keys, order],
+        device=device,
     )
-    n_rows = int(adjacency.shape[0])
-    n_creases = 0
-    # One flag per adjacency row, scanned in place: the total is the scan's last entry.
-    inclusive = wp.empty(n_rows, dtype=wp.int32, device=device)
-    if n_rows > 0:
+    wp.utils.radix_sort_pairs(
+        keys, order, count=n, end_bit=min(64, max(1, (n_vertices * n_vertices - 1).bit_length()))
+    )
+    flags = twt.empty_2d((2 if include_boundary else 1, n), wp.int32, device=device)
+    wp.launch(
+        kernel_seams.crease_flags,
+        dim=n,
+        inputs=[vertices, faces, keys, order, n, wp.float32(math.radians(angle)), flags],
+        device=device,
+    )
+    inclusive = flags.flatten()
+    wp.utils.array_scan(inclusive, out_array=inclusive, inclusive=True)
+    # Sizes the output: the one host readback.
+    n_edges = int(read_scalar(inclusive))
+    edges = twt.empty_2d((n_edges, 2), wp.int32, device=device)
+    if n_edges > 0:
         wp.launch(
-            kernel_seams.crease_flags,
-            dim=n_rows,
-            inputs=[vertices, faces, adjacency, wp.float32(math.radians(angle)), inclusive],
+            kernel_seams.emit_crease_edges,
+            dim=int(inclusive.shape[0]),
+            inputs=[inclusive, order, n, faces, edges],
             device=device,
         )
-        wp.utils.array_scan(inclusive, out_array=inclusive, inclusive=True)
-        n_creases = int(read_scalar(inclusive))
-
-    boundary = None
-    n_boundary = 0
-    if include_boundary:
-        boundary = tw.boundary.boundary_edges(vertices, faces)
-        n_boundary = int(boundary.shape[0])
-    if n_creases == 0 and boundary is not None:
-        return twt.as_array2d(boundary, wp.int32)
-
-    # The creases fill the head of the result and the boundary edges, when asked for, its tail.
-    edges = twt.empty_2d((n_creases + n_boundary, 2), wp.int32, device=device)
-    if n_creases > 0:
-        wp.launch(
-            kernel_seams.scatter_crease_edges,
-            dim=n_rows,
-            inputs=[inclusive, adjacency_edges, edges],
-            device=device,
-        )
-    if boundary is not None and n_boundary > 0:
-        wp.copy(edges, boundary, dest_offset=2 * n_creases, count=2 * n_boundary)
     return edges
 
 

@@ -240,6 +240,20 @@ def ecl_init_parent_parity(out_words: wp.array[wp.int32]) -> None:
     out_words[v] = v << 1
 
 
+@wp.func
+def ecl_hook_pair_parity(
+    words: wp.array[wp.int32], a: wp.int32, b: wp.int32, edge_sign: wp.int32
+) -> None:
+    # The parity hook of one signed graph edge ``(a, b)``: ``ecl_hook_pair``'s counterpart, shared
+    # by ``ecl_hook_parity`` and the kernels that form their signed edges in the thread
+    # (``validation``'s orientation over the sorted halfedge keys). A self-loop unions nothing.
+    if a != b:
+        rep_a = wp.int32(0)
+        par_a = wp.int32(0)
+        rep_a, par_a = find_representative_parity(words, a)
+        ecl_hook_edge_parity(words, rep_a, par_a, b, edge_sign)
+
+
 @wp.kernel
 def ecl_hook_parity(
     edges: wp.array2d[wp.int32], signs: wp.array[wp.int32], words: wp.array[wp.int32]
@@ -247,23 +261,18 @@ def ecl_hook_parity(
     # One thread per signed edge; each thread's retry loop only exits once its two endpoints share
     # a tree, so after this single launch the forest spans every edge — no host convergence loop.
     e = wp.int32(wp.tid())
-    a = edges[e, 0]
-    b = edges[e, 1]
-    if a == b:
-        return
-    rep_a = wp.int32(0)
-    par_a = wp.int32(0)
-    rep_a, par_a = find_representative_parity(words, a)
-    ecl_hook_edge_parity(words, rep_a, par_a, b, signs[e])
+    ecl_hook_pair_parity(words, edges[e, 0], edges[e, 1], signs[e])
 
 
 @wp.kernel
 def ecl_flatten_parity(
     words: wp.array[wp.int32], out_labels: wp.array[wp.int32], out_parity: wp.array[wp.int32]
 ) -> None:
+    # ``out_labels`` may be a null descriptor (shape 0) for a caller that wants the parity alone.
     v = wp.int32(wp.tid())
     root = wp.int32(0)
     parity = wp.int32(0)
     root, parity = find_representative_parity(words, v)
-    out_labels[v] = root
+    if out_labels.shape[0] > 0:
+        out_labels[v] = root
     out_parity[v] = parity

@@ -119,6 +119,15 @@ def wrap_index(i: wp.int32, n: wp.int32) -> wp.int32:
 
 
 @wp.func
+def loop_point(k: wp.int32, n: wp.int32) -> wp.int32:
+    # Point index of entry ``k`` in ``[0, n]`` of a closed loop's ``n + 1`` entries, the last being
+    # the first point again -- ``wrap_index`` for an index known to be at most ``n``, as a select
+    # rather than two modulos (an integer division each). ``k + 1`` for ``k`` in ``[0, n)`` is the
+    # usual caller.
+    return wp.where(k < n, k, wp.int32(0))
+
+
+@wp.func
 def ravel_index(i: wp.int32, j: wp.int32, k: wp.int32, ny: wp.int32, nz: wp.int32) -> wp.int32:
     # Row-major flat index into an (nx, ny, nz) box, ``nx`` implicit in ``i``'s own range. Shared by
     # ``voxels.flat_cell_index`` (a box) and ``reconstruction.poisson_grid_index`` (the cube
@@ -178,7 +187,7 @@ def loop_next_slot(
     # in three spellings a duplicate scan keying on statement text cannot connect. Every one of them
     # is one edge of a rim, and getting the wrap wrong silently joins two different holes.
     begin = loop_starts[loop_id[slot]]
-    return begin + wrap_index(slot - begin + 1, loop_sizes[loop_id[slot]])
+    return begin + loop_point(slot - begin + 1, loop_sizes[loop_id[slot]])
 
 
 @wp.func
@@ -760,22 +769,6 @@ def map_sorted_inverse(
     if index >= n or sorted_unique[index] != value:
         index = n - 1
     out_inverse[i] = index
-
-
-@wp.kernel
-def mark_rows_present(
-    rows: wp.array2d[wp.int32], queries: wp.array2d[wp.int32], out_present: wp.array[wp.bool]
-) -> None:
-    # Which of a handful of index rows occur in a table of them, decided on device so the caller
-    # never reads back a buffer that scales with the mesh. Every thread that matches stores ``True``
-    # into its query's slot, so the race is benign and no atomic is needed; ``out_present`` arrives
-    # zeroed. Deliberately a scan rather than a hash or a sort: the query count is a handful, the
-    # table is read once, and there is nothing to amortize a structure over.
-    row, query = wp.tid()
-    for column in range(queries.shape[1]):
-        if rows[row, column] != queries[query, column]:
-            return
-    out_present[query] = True
 
 
 # Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in

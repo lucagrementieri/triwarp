@@ -25,7 +25,7 @@ import warp as wp
 
 from triwarp.constants import INT32_MAX_CONSTANT
 from triwarp.kernels.algorithms.connected_components import ecl_hook_edge, find_representative
-from triwarp.kernels.array import binary_search_index, lattice_position, ravel_index
+from triwarp.kernels.array import binary_search_index, lattice_position, ravel_index, scanned_count
 from triwarp.kernels.predicates import triangle_aabb, triangle_aabb_overlap
 from triwarp.kernels.triangles import face_vertices, row_triple, write_row_triple
 
@@ -344,55 +344,62 @@ def lattice_points(lower: wp.vec3, step: wp.vec3, out_points: wp.array3d[wp.vec3
 # ---------------------------------------------------------------------------------------------
 
 
+@wp.func
+def count_point_bucket(
+    volume: wp.uint64,
+    points: wp.array[wp.vec3],
+    p: wp.int32,
+    n_voxels: wp.int32,
+    out_slots: wp.array[wp.int32],
+    out_counts: wp.array[wp.int32],
+) -> wp.int32:
+    # The probe-and-histogram run both pooling kernels open with: point ``p``'s voxel row
+    # (``lookup_point_slots``' probe, done in the pooling launch so it pays one launch for the probe
+    # and the histogram), written to ``out_slots`` unless the caller passed a length-zero one, and
+    # counted into its bucket. A point outside the grid goes into a sentinel bucket past the last
+    # voxel -- so it sorts to the end and every real voxel's segment stays contiguous -- and keeps
+    # the slot ``-1``, which is what is returned.
+    slot = point_slot(volume, points[p])
+    if out_slots.shape[0] > 0:
+        out_slots[p] = slot
+    wp.atomic_add(out_counts, wp.where(slot < 0, n_voxels, slot), 1)
+    return slot
+
+
 @wp.kernel
 def bucket_point_slots(
     volume: wp.uint64,
     points: wp.array[wp.vec3],
     n_voxels: wp.int32,
-    write_buckets: wp.bool,
     out_slots: wp.array[wp.int32],
     out_buckets: wp.array[wp.int32],
     out_order: wp.array[wp.int32],
     out_counts: wp.array[wp.int32],
 ) -> None:
-    # Each point's voxel row (``lookup_point_slots``' probe, done here so the pooling pays one
-    # launch for the probe and the histogram) and its count. Points that fall outside the grid go
-    # into a sentinel bucket past the last voxel, so they sort to the end and every real voxel's
-    # segment stays contiguous; their slot stays ``-1``.
-    #
-    # ``write_buckets`` is warp-uniform: only the mean/sum pooling branch sorts by bucket, and it
-    # hands ``out_buckets`` / ``out_order`` straight to ``radix_sort_pairs`` -- the leading halves
-    # of its two double buffers, keys and identity payload, so the sort needs no key copy and no
-    # separate payload seed (the upper halves are scratch the sort fills before reading). The
-    # min/max branch wants nothing from this launch but the slots and ``out_counts``, so the
-    # selector lets that caller pass length-zero buffers instead of cloud-sized ones.
-    #
-    # A caller that wants the buckets but not the slots passes a length-zero ``out_slots``.
+    # The mean/sum pooling's first launch: each point's bucket and count (``count_point_bucket``),
+    # with ``out_buckets`` / ``out_order`` the leading halves of ``radix_sort_pairs``' two double
+    # buffers, keys and identity payload, so the sort needs no key copy and no separate payload
+    # seed (the upper halves are scratch the sort fills before reading). The min/max twin is
+    # ``pool_extremum_points``; the two differ only in what follows the shared probe.
     p = wp.int32(wp.tid())
-    slot = point_slot(volume, points[p])
-    if out_slots.shape[0] > 0:
-        out_slots[p] = slot
-    bucket = wp.where(slot < 0, n_voxels, slot)
-    if write_buckets:
-        out_buckets[p] = bucket
-        out_order[p] = p
-    wp.atomic_add(out_counts, bucket, 1)
+    slot = count_point_bucket(volume, points, p, n_voxels, out_slots, out_counts)
+    out_buckets[p] = wp.where(slot < 0, n_voxels, slot)
+    out_order[p] = p
 
 
 @wp.kernel
 def segment_reduce_vec3(
     order: wp.array[wp.int32],
     values: wp.array[wp.vec3],
-    offsets: wp.array[wp.int32],
-    counts: wp.array[wp.int32],
+    ends: wp.array[wp.int32],
     average: wp.bool,
     out_values: wp.array[wp.vec3],
 ) -> None:
     # One thread per voxel walking its segment in index order: the sum is bitwise reproducible,
-    # which a float ``wp.atomic_add`` over the points would not be.
+    # which a float ``wp.atomic_add`` over the points would not be. ``ends`` is the in-place
+    # inclusive scan of the bucket counts, which carries both the segment start and its length.
     v = wp.int32(wp.tid())
-    start = offsets[v]
-    count = counts[v]
+    start, count = scanned_count(ends, v)
     total = wp.vec3(0.0, 0.0, 0.0)
     for j in range(start, start + count):
         total = total + values[order[j]]
@@ -402,15 +409,22 @@ def segment_reduce_vec3(
 
 
 @wp.kernel
-def pool_extremum_vec3(
-    slots: wp.array[wp.int32],
+def pool_extremum_points(
+    volume: wp.uint64,
+    points: wp.array[wp.vec3],
     values: wp.array[wp.vec3],
+    n_voxels: wp.int32,
     largest: wp.bool,
+    out_slots: wp.array[wp.int32],
+    out_counts: wp.array[wp.int32],
     out_values: wp.array[wp.vec3],
 ) -> None:
-    # Component-wise atomic min / max: order-independent for floats, so no sort is needed here.
+    # The min/max pooling in the probe launch itself (``count_point_bucket``): component-wise atomic
+    # min / max, order-independent for floats, so no sort is needed. ``out_values`` arrives filled
+    # with the +-inf the atomics reduce from; ``zero_empty_voxels`` then resets the voxels no point
+    # reached, which only ``counts`` -- final once this launch ends -- can name.
     p = wp.int32(wp.tid())
-    slot = slots[p]
+    slot = count_point_bucket(volume, points, p, n_voxels, out_slots, out_counts)
     if slot < 0:
         return
     if largest:
@@ -420,15 +434,12 @@ def pool_extremum_vec3(
 
 
 @wp.kernel
-def seed_extremum_voxels(
-    counts: wp.array[wp.int32], limit: wp.vec3, out_values: wp.array[wp.vec3]
-) -> None:
-    # The starting value of the min / max pooling: ``limit`` (+-inf) where a point will land, 0 in
-    # an empty voxel. An empty voxel's slot is never touched by ``pool_extremum_vec3``'s atomics, so
-    # seeding it at its final answer up front is what spares a second pass zeroing it afterwards --
-    # ``counts`` is already known before the atomics run.
+def zero_empty_voxels(counts: wp.array[wp.int32], out_values: wp.array[wp.vec3]) -> None:
+    # A voxel no point landed in pools to zero, for every pooling; the min/max atomics left it at
+    # the +-inf they reduce from.
     v = wp.int32(wp.tid())
-    out_values[v] = wp.where(counts[v] == 0, wp.vec3(0.0, 0.0, 0.0), limit)
+    if counts[v] == 0:
+        out_values[v] = wp.vec3(0.0, 0.0, 0.0)
 
 
 # ---------------------------------------------------------------------------------------------
