@@ -9,6 +9,7 @@ from triwarp.kernels.array import (
     pack_farthest_key,
     unpack_ranked_index,
 )
+from triwarp.kernels.grouping import HASH_MULT_U64, hash_slot, next_slot
 from triwarp.kernels.predicates import point_plane_dot, triangle_normal
 from triwarp.kernels.reduce import (
     block_chunk_1d,
@@ -42,8 +43,8 @@ def is_in_half_space(point: wp.vec3, plane_normal: wp.vec3, plane_origin: wp.vec
 def accumulate_counted_mean(
     count: wp.array[wp.int32], mean_distance: wp.array[wp.float32], out_totals: wp.array[wp.float64]
 ) -> None:
-    # ``(rows with at least one neighbour, sum of their mean distances)`` into one ``(2,)``
-    # accumulator, for ``points.statistical_outlier_mask``'s cloud mean.
+    # ``(rows with at least one neighbour, sum of their mean distances)`` into the first two slots
+    # of ``points.statistical_outlier_mask``'s ``(3,)`` accumulator, for its cloud mean.
     #
     # One kernel rather than a ``wp.map`` building a ``count > 0`` mask and two ``reduce.sum``
     # calls over it and over ``mean_distance``. The mask existed only to be counted, so it went
@@ -74,12 +75,28 @@ def accumulate_counted_mean(
     commit_sum_and_count(lane, counted, total, out_totals)
 
 
+@wp.func
+def centroid_from_sum(point_sum: wp.array[wp.vec3], n: wp.float32) -> wp.vec3:
+    # ``point_sum[0] / n`` -- the same ``wp.div`` ``points.centroid``'s map applies, so a consumer
+    # reading the raw sum gets the centroid's exact bits -- and the zero vector for a length-zero
+    # array, which is how the uncentred Gram matrix asks for no center.
+    if point_sum.shape[0] == 0:
+        return wp.vec3(0.0, 0.0, 0.0)
+    return point_sum[0] / n
+
+
 @wp.kernel
 def centered_covariance(
-    points: wp.array[wp.vec3], center: wp.array[wp.vec3], out_cov: wp.array[wp.mat33]
+    points: wp.array[wp.vec3],
+    center: wp.array[wp.vec3],
+    center_divisor: wp.float32,
+    out_cov: wp.array[wp.mat33],
 ) -> None:
-    # Scatter matrix C = sum_k outer(x_k - center, x_k - center). With a zero center this is
-    # the uncentred Gram matrix G = sum_k outer(x_k, x_k).
+    # Scatter matrix C = sum_k outer(x_k - c, x_k - c) with ``c = center[0] / center_divisor``, so
+    # a caller holding the point *sum* passes it with ``n`` and pays no division launch of its own
+    # (``centroid_from_sum``), and a caller holding a centroid passes ``1.0``, which divides
+    # exactly. A length-zero ``center`` is the zero center, i.e. the uncentred Gram matrix
+    # G = sum_k outer(x_k, x_k).
     #
     # Stays in ``points`` rather than moving to ``reduce`` with the rest of the chunked-accumulate
     # family: the reusable half -- the tile skeleton and ``outer_sum_chunk`` -- is already in
@@ -108,7 +125,9 @@ def centered_covariance(
     if remaining <= 0:
         return
 
-    m = outer_sum_chunk(points, center[0], offset, remaining, lane, wp.block_dim())
+    m = outer_sum_chunk(
+        points, centroid_from_sum(center, center_divisor), offset, remaining, lane, wp.block_dim()
+    )
 
     # Block-collective, so it runs outside the ``lane == 0`` guard.
     total = block_sum(m)
@@ -132,7 +151,7 @@ def finalize_fit_line(m: wp.array[wp.mat33], out_axis: wp.array[wp.vec3]) -> Non
 
 @wp.kernel
 def finalize_fit_plane(
-    center: wp.array[wp.vec3], m: wp.array[wp.mat33], out_plane: wp.array[wp.vec3]
+    point_sum: wp.array[wp.vec3], n: wp.float32, m: wp.array[wp.mat33], out_plane: wp.array[wp.vec3]
 ) -> None:
     # One output buffer rather than two, because both entries cross to the host together and a
     # readback costs far more than the row of it that is read: slot 0 is the normal, slot 1 the
@@ -144,7 +163,7 @@ def finalize_fit_plane(
     # normal is the singular vector with the smallest singular value
     # (svd3 returns singular values in descending order: last column of u).
     out_plane[0] = wp.normalize(mat33_column(u, 2))
-    out_plane[1] = center[0]
+    out_plane[1] = centroid_from_sum(point_sum, n)
 
 
 # Orientation modes for estimate_point_normals (mirror Open3D's orient methods).
@@ -155,7 +174,7 @@ ORIENT_CAMERA = wp.constant(wp.int32(2))  # point toward a camera location
 
 @wp.kernel
 def finalize_principal_axes(
-    center: wp.array[wp.vec3], m: wp.array[wp.mat33], out_frame: wp.array[wp.vec3]
+    point_sum: wp.array[wp.vec3], n: wp.float32, m: wp.array[wp.mat33], out_frame: wp.array[wp.vec3]
 ) -> None:
     # One ``(5,)`` output buffer rather than three, because all three results cross to the host
     # together: rows 0-2 are the rotation's rows, row 3 the eigenvalues, row 4 the centroid --
@@ -175,14 +194,15 @@ def finalize_principal_axes(
     out_frame[1] = axis1
     out_frame[2] = axis2
     out_frame[3] = sigma
-    out_frame[4] = center[0]
+    out_frame[4] = centroid_from_sum(point_sum, n)
 
 
 @wp.kernel
 def estimate_point_normals(
     points: wp.array[wp.vec3],
     neighbor_idx: wp.array2d[wp.int32],
-    centroid: wp.array[wp.vec3],
+    point_sum: wp.array[wp.vec3],
+    n_points: wp.float32,
     orient_mode: wp.int32,
     orient_reference: wp.vec3,
     out_normals: wp.array[wp.vec3],
@@ -236,7 +256,9 @@ def estimate_point_normals(
     # Orientation: flip so the normal points along a per-point reference vector.
     ref = wp.vec3(0.0, 0.0, 0.0)
     if orient_mode == ORIENT_CENTROID:
-        ref = points[v] - centroid[0]  # outward from the cloud centroid (star-shaped assumption)
+        # Outward from the cloud centroid (star-shaped assumption). ``point_sum`` is only read in
+        # this mode; the others pass a null array.
+        ref = points[v] - centroid_from_sum(point_sum, n_points)
     elif orient_mode == ORIENT_DIRECTION:
         ref = orient_reference
     else:
@@ -259,6 +281,8 @@ def neighbor_distance_moments(
     # zero count, which is how both callers detect it.
     #
     # The mean feeds Open3D's statistical criterion and the RMS is the LoOP "standard distance".
+    # Each caller wants only its own moments, so a length-zero output is skipped: the statistical
+    # mask passes no ``out_rms`` and ``outlier_probability`` only ``out_rms``.
     i = wp.int32(wp.tid())
     k = neighbor_distance.shape[1]
     total = wp.float32(0.0)
@@ -270,14 +294,18 @@ def neighbor_distance_moments(
             total += d
             total_sq += d * d
             count += 1
-    out_count[i] = count
-    if count == 0:
-        out_mean[i] = 0.0
-        out_rms[i] = 0.0
-        return
-    inverse = 1.0 / wp.float32(count)
-    out_mean[i] = total * inverse
-    out_rms[i] = wp.sqrt(total_sq * inverse)
+    mean = wp.float32(0.0)
+    rms = wp.float32(0.0)
+    if count > 0:
+        inverse = 1.0 / wp.float32(count)
+        mean = total * inverse
+        rms = wp.sqrt(total_sq * inverse)
+    if out_mean.shape[0] > 0:
+        out_mean[i] = mean
+    if out_rms.shape[0] > 0:
+        out_rms[i] = rms
+    if out_count.shape[0] > 0:
+        out_count[i] = count
 
 
 @wp.kernel
@@ -343,6 +371,60 @@ def is_statistical_outlier(
 
 
 @wp.func
+def counted_cloud_mean(totals: wp.array[wp.float64]) -> wp.float64:
+    # The cloud mean over the counted rows, off ``accumulate_counted_mean``'s ``(count, total)``
+    # slots -- the division the host used to do after reading them back, in the same ``float64``.
+    return totals[1] / totals[0]
+
+
+@wp.kernel
+def accumulate_counted_deviation(
+    count: wp.array[wp.int32], mean_distance: wp.array[wp.float32], out_totals: wp.array[wp.float64]
+) -> None:
+    # The squared-deviation sum behind ``statistical_outlier_mask``'s cloud deviation, into slot 2
+    # of the ``(count, total, deviation)`` buffer whose first two slots ``accumulate_counted_mean``
+    # has already filled -- so the mean it centres on never leaves the device. Each term is the
+    # ``float32`` ``centered_square_if_counted`` around the ``float32`` cloud mean, as before; the
+    # terms are summed in ``float64``, which is also what the Open3D reference accumulates in. A
+    # cloud with fewer than two counted rows has no deviation and adds nothing (the mask kernel
+    # disables the threshold there).
+    chunk, lane = wp.tid()
+    offset, n_rows = block_chunk_1d(count.shape[0], chunk)
+    if n_rows <= 0 or out_totals[0] < wp.float64(2.0):
+        return
+    center = wp.float32(counted_cloud_mean(out_totals))
+    total = wp.float64(0.0)
+    for k in range(lane, n_rows, wp.block_dim()):
+        term = centered_square_if_counted(mean_distance[offset + k], count[offset + k], center)
+        total = total + wp.float64(term)
+    block = block_sum(total)
+    if lane == 0:
+        wp.atomic_add(out_totals, 2, block)
+
+
+@wp.kernel
+def statistical_outlier_from_totals(
+    mean_distance: wp.array[wp.float32],
+    count: wp.array[wp.int32],
+    totals: wp.array[wp.float64],
+    std_ratio: wp.float64,
+    out_mask: wp.array[wp.bool],
+) -> None:
+    # ``is_statistical_outlier`` at the cloud threshold ``mean + std_ratio * std`` (ddof = 1), with
+    # the threshold formed from the ``(count, total, deviation)`` slots in ``float64`` and rounded
+    # once to ``float32``. Fewer than two counted rows give no deviation: the threshold is then
+    # ``inf``, which disables only the distance third of the predicate and keeps the empty- and
+    # coincident-neighbourhood halves.
+    i = wp.int32(wp.tid())
+    counted = totals[0]
+    threshold = wp.float32(FLOAT32_INF_CONSTANT)
+    if counted >= wp.float64(2.0):
+        cloud_std = wp.sqrt(totals[2] / (counted - wp.float64(1.0)))
+        threshold = wp.float32(counted_cloud_mean(totals) + std_ratio * cloud_std)
+    out_mask[i] = is_statistical_outlier(mean_distance[i], count[i], threshold)
+
+
+@wp.func
 def is_finite_point(point: wp.vec3) -> wp.bool:
     # All three coordinates finite -- the row predicate behind ``point_finite_mask``. Any one NaN
     # or infinity condemns the point, which is what a downstream tree build or covariance fit
@@ -361,24 +443,65 @@ def zero_normalized_bits(value: wp.float32) -> wp.int32:
 
 
 @wp.func
-def pack_xy_bits(point: wp.vec3) -> wp.int64:
-    # Round one of the exact position key: the x and y bit patterns side by side in one int64.
-    # Injective, because each half is exactly 32 bits wide -- which is the whole point, and the
-    # difference from ``kernels.grouping.pack_vec3``, whose key *buckets* all three coordinates
-    # into 21 bits apiece and so merges positions that merely agree to ~2.4e-4 relative.
-    x_bits = wp.uint64(wp.uint32(zero_normalized_bits(point[0])))
-    y_bits = wp.uint64(wp.uint32(zero_normalized_bits(point[1])))
-    return wp.int64((x_bits << wp.uint64(32)) | y_bits)
+def same_position_bits(a: wp.vec3, b: wp.vec3) -> wp.bool:
+    # Exact position equality under the dedup's rule: equal ``float32`` bit patterns with the two
+    # zeros folded together, so two identical ``NaN`` rows are one position and ``-0.0`` is
+    # ``+0.0``. The one spelling ``point_duplicate_first`` compares candidates with.
+    return (
+        zero_normalized_bits(a[0]) == zero_normalized_bits(b[0])
+        and zero_normalized_bits(a[1]) == zero_normalized_bits(b[1])
+        and zero_normalized_bits(a[2]) == zero_normalized_bits(b[2])
+    )
 
 
 @wp.func
-def pack_class_z_bits(class_id: wp.int32, point: wp.vec3) -> wp.int64:
-    # Round two: the (x, y) equivalence class from round one against the z bits. Injective for the
-    # same reason -- ``class_id`` is an index into the round-one unique array, so it is below the
-    # point count and fits the high 32 bits with room to spare.
-    class_bits = wp.uint64(wp.uint32(class_id))
+def position_hash_slot(point: wp.vec3, mask: wp.int32) -> wp.int32:
+    # The home slot of a position: the x and y bit patterns side by side in one 64-bit word,
+    # xor'ed with the z bits spread by the Fibonacci multiplier, then ``grouping.hash_slot``'s own
+    # fold. Any mixing works -- a colliding slot is resolved by ``same_position_bits``, never
+    # trusted -- so this only has to spread the probes, including over an axis-aligned lattice.
+    x_bits = wp.uint64(wp.uint32(zero_normalized_bits(point[0])))
+    y_bits = wp.uint64(wp.uint32(zero_normalized_bits(point[1])))
     z_bits = wp.uint64(wp.uint32(zero_normalized_bits(point[2])))
-    return wp.int64((class_bits << wp.uint64(32)) | z_bits)
+    key = ((x_bits << wp.uint64(32)) | y_bits) ^ (z_bits * HASH_MULT_U64)
+    return hash_slot(wp.int64(key), mask)
+
+
+@wp.kernel
+def point_duplicate_first(
+    points: wp.array[wp.vec3],
+    mask: wp.int32,
+    out_first: wp.array[wp.int32],
+    out_slot: wp.array[wp.int32],
+) -> None:
+    # One open-addressing table of point indices, ``-1`` empty. A point claims an empty slot with
+    # ``atomic_cas``; an occupied slot holds *some* point of its class, which is enough to compare
+    # against, because every member of a class has the same position. Once a point has found its
+    # class slot it lowers the slot to its own index with ``atomic_min`` -- a member's index never
+    # reads as empty, so the probe of a concurrent thread is unaffected -- and after the launch
+    # every class slot holds its smallest index: the first occurrence, whatever the arrival order.
+    # ``out_first`` must arrive filled with ``-1``; it leaves holding the minima.
+    i = wp.int32(wp.tid())
+    point = points[i]
+    h = position_hash_slot(point, mask)
+    while True:
+        prev = wp.atomic_cas(out_first, h, wp.int32(-1), i)
+        if prev == wp.int32(-1):
+            break
+        if same_position_bits(points[prev], point):
+            wp.atomic_min(out_first, h, i)
+            break
+        h = next_slot(h, mask)
+    out_slot[i] = h
+
+
+@wp.kernel
+def point_duplicate_from_first(
+    first: wp.array[wp.int32], slot: wp.array[wp.int32], out_mask: wp.array[wp.bool]
+) -> None:
+    # A point is a duplicate unless it is its class's smallest index.
+    i = wp.int32(wp.tid())
+    out_mask[i] = first[slot[i]] != i
 
 
 # Lanes per block for ``farthest_point_sample_block``, keyed on the cloud size. The kernel is one
@@ -541,12 +664,14 @@ def support_indices(
 
 @wp.kernel
 def shell_bounds(
-    shell_vertices: wp.array[wp.vec3],
+    shell_vertices: wp.indexedarray[wp.vec3],
     out_centroid: wp.array[wp.vec3],
     out_radius: wp.array[wp.float32],
 ) -> None:
     # One thread: the shell has a few hundred vertices at most, and reducing on device keeps the
     # support sweep and the tetrahedron build in one launch chain with no host readback between.
+    # ``shell_vertices`` is the points gathered through the support indices as a Python-scope
+    # ``wp.indexedarray`` view, so neither this kernel nor ``tetrahedron_planes`` needs a copy.
     n = shell_vertices.shape[0]
     total = wp.vec3(0.0, 0.0, 0.0)
     for i in range(n):
@@ -579,7 +704,7 @@ def outward_plane(p0: wp.vec3, p1: wp.vec3, p2: wp.vec3, interior: wp.vec3) -> w
 
 @wp.kernel
 def tetrahedron_planes(
-    shell_vertices: wp.array[wp.vec3],
+    shell_vertices: wp.indexedarray[wp.vec3],
     shell_faces: wp.array[wp.int32],
     centroid: wp.array[wp.vec3],
     flatness: wp.float32,
@@ -665,11 +790,10 @@ def _declare_map_kernels() -> None:
     derived and what forks a ``wp.map`` module; only this module's *own* forking ops belong
     here (the shared builtins are declared there).
 
-    Five ops are ``wp.map``'d from ``points.py``; all five are declared. ``is_finite_point``
-    (``point_finite_mask``), ``pack_xy_bits``/``pack_class_z_bits`` (``point_duplicate_mask``'s two
-    packing rounds) and ``radial_sort_key`` (``radial_sort``) are reachable from a length-1 point
-    cloud exactly as ``is_in_half_space`` is, and each forks its own module the first time a call at
-    the other length is seen.
+    Three ops are ``wp.map``'d from ``points.py``; all three are declared. ``is_finite_point``
+    (``point_finite_mask``) and ``radial_sort_key`` (``radial_sort``) are reachable from a length-1
+    point cloud exactly as ``is_in_half_space`` is, and each forks its own module the first time a
+    call at the other length is seen.
     """
     dense, single = map_probe, map_probe_single
     declare_map_signatures(
@@ -678,10 +802,6 @@ def _declare_map_kernels() -> None:
             (is_in_half_space, (single(wp.vec3), wp.vec3(), wp.vec3()), wp.bool),
             (is_finite_point, (dense(wp.vec3),), wp.bool),
             (is_finite_point, (single(wp.vec3),), wp.bool),
-            (pack_xy_bits, (dense(wp.vec3),), wp.int64),
-            (pack_xy_bits, (single(wp.vec3),), wp.int64),
-            (pack_class_z_bits, (dense(wp.int32), dense(wp.vec3)), wp.int64),
-            (pack_class_z_bits, (single(wp.int32), single(wp.vec3)), wp.int64),
             (radial_sort_key, (dense(wp.vec3), wp.vec3(), wp.vec3(), wp.vec3()), wp.float32),
             (radial_sort_key, (single(wp.vec3), wp.vec3(), wp.vec3(), wp.vec3()), wp.float32),
         ]

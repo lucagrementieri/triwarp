@@ -340,7 +340,7 @@ def voxel_down_sample(
     grid = voxelize_points(points, voxel_size, origin=origin)
     # The pooling pass already probes every point's voxel row, which is the inverse; reuse it
     # rather than probing the grid a second time.
-    pooled, slots = _pool_by_voxel(grid, points, points, pooling)
+    pooled, slots = _pool_by_voxel(grid, points, points, pooling, return_slots=return_inverse)
     if not return_inverse:
         return pooled
     return pooled, slots if slots is not None else _point_slots(grid, points)
@@ -394,7 +394,7 @@ def pool_by_voxel(
     [`cell_centers`][triwarp.voxels.cell_centers]
     """
     require_same_device(grid=grid, points=points, values=values)
-    return _pool_by_voxel(grid, points, values, pooling)[0]
+    return _pool_by_voxel(grid, points, values, pooling, return_slots=False)[0]
 
 
 def _pool_by_voxel(
@@ -402,13 +402,16 @@ def _pool_by_voxel(
     points: wp.array[wp.vec3],
     values: wp.array[wp.vec3],
     pooling: Literal["mean", "min", "max", "sum"],
+    *,
+    return_slots: bool,
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32] | None]:
     """
     [`pool_by_voxel`][triwarp.voxels.pool_by_voxel], also returning each point's voxel row.
 
     The rows are the probe the pooling runs on anyway, and
     [`voxel_down_sample`][triwarp.voxels.voxel_down_sample]'s inverse is exactly them. ``None``
-    when nothing was probed (an empty grid or cloud).
+    when nothing was probed (an empty grid or cloud), or when ``return_slots`` is ``False`` and
+    the pooling did not need them (``"mean"`` / ``"sum"`` sort by bucket instead).
     """
     if pooling not in ("mean", "min", "max", "sum"):
         raise ValueError(f"pooling must be 'mean', 'sum', 'min' or 'max', got {pooling!r}")
@@ -426,17 +429,23 @@ def _pool_by_voxel(
     if n_points == 0:
         return wp.zeros(n_voxels, dtype=wp.vec3, device=device), None
 
-    slots = _point_slots(grid, points)
+    # The min/max atomics read the slots; the mean/sum branch only returns them.
+    keeps_slots = return_slots or pooling in ("min", "max")
+    slots = wp.empty(n_points if keeps_slots else 0, dtype=wp.int32, device=device)
     # One sentinel bucket past the last voxel collects the points that fall outside the grid.
     counts = wp.zeros(n_voxels + 1, dtype=wp.int32, device=device)
-    # Only the mean/sum branch sorts by bucket; the min/max branch reads nothing from this launch
-    # but ``counts``, so it asks for no per-point buckets and allocates none.
+    # Only the mean/sum branch sorts by bucket, and it gets the sort's two double buffers seeded
+    # by the launch itself; the min/max branch reads nothing from this launch but the slots and
+    # ``counts``, so it asks for no per-point buckets and allocates none.
     sorts_by_bucket = pooling not in ("min", "max")
-    buckets = wp.empty(n_points if sorts_by_bucket else 0, dtype=wp.int32, device=device)
+    sort_length = 2 * n_points if sorts_by_bucket else 0
+    buckets = wp.empty(sort_length, dtype=wp.int32, device=device)
+    order = wp.empty(sort_length, dtype=wp.int32, device=device)
     wp.launch(
         kernel_voxels.bucket_point_slots,
         dim=n_points,
-        inputs=[slots, wp.int32(n_voxels), sorts_by_bucket, buckets, counts],
+        inputs=[grid.id, points, wp.int32(n_voxels), sorts_by_bucket],
+        outputs=[slots, buckets, order, counts],
         device=device,
     )
 
@@ -462,9 +471,15 @@ def _pool_by_voxel(
             device=device,
         )
     else:
-        sorted_buckets, order = tw.array.sort_and_argsort(buckets)
-        del sorted_buckets
-        offsets, _total = tw.array.counts_to_offsets(counts)
+        # Stable, so each voxel's segment lists its points in index order.
+        # Every bucket is at most ``n_voxels`` (the sentinel), so only those low bits are sorted.
+        wp.utils.radix_sort_pairs(
+            buckets, order, count=n_points, end_bit=max(1, int(n_voxels).bit_length())
+        )
+        # Only the offsets are wanted -- the total is ``n_points`` minus the sentinel bucket and
+        # nothing reads it -- so an exclusive scan with no readback.
+        offsets = wp.empty(n_voxels + 1, dtype=wp.int32, device=device)
+        wp.utils.array_scan(counts, out_array=offsets, inclusive=False)
         pooled = wp.empty(n_voxels, dtype=wp.vec3, device=device)
         wp.launch(
             kernel_voxels.segment_reduce_vec3,
@@ -472,7 +487,7 @@ def _pool_by_voxel(
             inputs=[order, values, offsets, counts, pooling == "mean", pooled],
             device=device,
         )
-    return pooled, slots
+    return pooled, slots if keeps_slots else None
 
 
 def cells(grid: wp.Volume, *, order: Literal["grid", "sorted"] = "grid") -> twt.Array2dInt32:

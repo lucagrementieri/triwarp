@@ -1,7 +1,168 @@
 import warp as wp
 
-from triwarp.kernels.array import loop_rim_edge, pack_ranked_key
-from triwarp.kernels.halfedge import next_boundary_halfedge
+from triwarp.kernels.adjacency import write_face_edge_keys
+from triwarp.kernels.array import loop_rim_edge, pack_directed_key, pack_ranked_key, scanned_count
+from triwarp.kernels.grouping import sorted_run_of_length
+from triwarp.kernels.halfedge import halfedge_endpoints, next_boundary_halfedge
+
+# Every boundary query here is one radix sort of the halfedges' undirected edge keys, carrying each
+# halfedge's index as the payload: a boundary edge is then a run of exactly one key, and its
+# payload names the halfedge -- which is row ``h`` of ``edges.faces_to_edges``, so the edge's
+# endpoints (sorted or directed) are read straight off ``faces`` and no ``(3F, 2)`` edge table is
+# ever built. The kernels below write the sort's input and read its verdict.
+
+
+@wp.kernel
+def face_edge_keys_and_order(
+    faces: wp.array[wp.int32],
+    base: wp.uint64,
+    out_keys: wp.array[wp.uint64],
+    out_order: wp.array[wp.int32],
+) -> None:
+    # ``adjacency.face_edge_keys`` plus the identity payload ``radix_sort_pairs`` carries, written
+    # straight into the first half of the sort's double-width buffers: no key copy, and no
+    # separate identity fill. The upper halves are sort scratch and are never initialized.
+    f = wp.int32(wp.tid())
+    write_face_edge_keys(faces, f, 3 * f, base, out_keys)
+    for k in range(3):
+        out_order[3 * f + k] = 3 * f + k
+
+
+@wp.kernel
+def table_edge_keys_and_order(
+    edges_sorted: wp.array2d[wp.int32],
+    base: wp.uint64,
+    out_keys: wp.array[wp.uint64],
+    out_order: wp.array[wp.int32],
+) -> None:
+    # The same sort input from a caller's precomputed ``(3F, 2)`` sorted edge table: row ``h`` is
+    # already ``[min, max]``, so it packs as it stands, exactly as ``grouping.pack_indices`` would.
+    h = wp.int32(wp.tid())
+    out_keys[h] = pack_directed_key(edges_sorted[h, 0], edges_sorted[h, 1], base)
+    out_order[h] = h
+
+
+@wp.func
+def boundary_halfedge_pair(
+    faces: wp.array[wp.int32], table: wp.array2d[wp.int32], sort_pair: wp.bool, h: wp.int32
+) -> tuple[wp.int32, wp.int32]:
+    # Row ``h`` of the edge table the caller holds, or of the one ``faces`` implies when ``table``
+    # is ``None`` (a null descriptor, whose ``shape[0]`` reads 0): halfedge ``h``'s directed pair,
+    # ascending when ``sort_pair``.
+    a = wp.int32(0)
+    b = wp.int32(0)
+    if table.shape[0] > 0:
+        a = table[h, 0]
+        b = table[h, 1]
+    else:
+        a, b = halfedge_endpoints(faces, h)
+        if sort_pair:
+            lo = wp.min(a, b)
+            b = wp.max(a, b)
+            a = lo
+    return a, b
+
+
+@wp.kernel
+def mark_boundary_runs(
+    sorted_keys: wp.array[wp.uint64], n: wp.int32, out_flags: wp.array[wp.int32]
+) -> None:
+    # 1 where a sorted position holds a key occurring exactly once -- a boundary edge -- as the
+    # ``int32`` flag ``wp.utils.array_scan`` then scans in place.
+    i = wp.int32(wp.tid())
+    out_flags[i] = wp.where(sorted_run_of_length(sorted_keys, n, i, 1), wp.int32(1), wp.int32(0))
+
+
+@wp.func
+def count_boundary_degree(
+    out_degrees: wp.array2d[wp.int32], out_flags: wp.array[wp.int32], tail: wp.int32, head: wp.int32
+) -> None:
+    # Column 0: how many boundary edges *leave* each vertex. Column 1: how many touch it at all.
+    # One out-edge and two incidences is the well-behaved case. Two out-edges is the seam of a
+    # non-orientable surface, where ``succ[tail] = head`` silently drops an edge. Four incidences
+    # is a pinch point, where two loops meet and no 2-regular walk over vertices exists at all --
+    # the two are different defects with different walks: the seam's is undirected, the pinch's is
+    # over halfedges (``boundary_halfedge_successors``).
+    #
+    # The two defect bits are stamped here rather than by a second pass over the degree table:
+    # ``wp.atomic_add`` returns the value the slot held *before* the increment, so the thread that
+    # pushes a vertex past the threshold is the one that knows it. Boundary vertices are the only
+    # ones whose degrees are ever non-zero, so no pass over the vertices is needed. Slot 0 is "some
+    # vertex has two out-edges", slot 1 is "some vertex has more than two incidences", and the
+    # caller reads both in one 8-byte transfer.
+    if wp.atomic_add(out_degrees, tail, 0, 1) >= 1:
+        out_flags[0] = 1
+    if wp.atomic_add(out_degrees, tail, 1, 1) >= 2:
+        out_flags[1] = 1
+    if wp.atomic_add(out_degrees, head, 1, 1) >= 2:
+        out_flags[1] = 1
+
+
+@wp.kernel
+def emit_boundary_edges(
+    inclusive: wp.array[wp.int32],
+    order: wp.array[wp.int32],
+    faces: wp.array[wp.int32],
+    table: wp.array2d[wp.int32],
+    sort_pair: wp.bool,
+    out_rows: wp.array[wp.int32],
+    out_edges: wp.array2d[wp.int32],
+    out_degrees: wp.array2d[wp.int32],
+    out_defects: wp.array[wp.int32],
+) -> None:
+    # One thread per sorted position; ``inclusive`` is ``mark_boundary_runs``' flags scanned in
+    # place, so a boundary edge is where the scan steps and its rank is the step's start. Rows come
+    # out in ascending key order -- the order ``grouping.group`` emitted them in. Every output is
+    # optional (``None``, read as ``shape[0] == 0``): the halfedge index, its edge row (see
+    # ``boundary_halfedge_pair``), and ``boundary_loops_batched``'s degree census of the directed
+    # rows, folded in here so it costs no launch of its own.
+    i = wp.int32(wp.tid())
+    g, count = scanned_count(inclusive, i)
+    if count == 0:
+        return
+    h = order[i]
+    if out_rows.shape[0] > 0:
+        out_rows[g] = h
+    if out_edges.shape[0] > 0:
+        a, b = boundary_halfedge_pair(faces, table, sort_pair, h)
+        out_edges[g, 0] = a
+        out_edges[g, 1] = b
+        if out_degrees.shape[0] > 0:
+            count_boundary_degree(out_degrees, out_defects, a, b)
+
+
+@wp.kernel
+def mark_boundary_vertices(
+    sorted_keys: wp.array[wp.uint64],
+    order: wp.array[wp.int32],
+    n: wp.int32,
+    faces: wp.array[wp.int32],
+    table: wp.array2d[wp.int32],
+    out_flags: wp.array[wp.int32],
+) -> None:
+    # Flag both endpoints of every boundary edge in a zeroed per-vertex ``int32`` array, which the
+    # caller scans in place: the sorted unique boundary vertices then come out of the scan's steps
+    # with no edge list and no ``unique_1d``. Concurrent writers all store 1, so no atomic.
+    i = wp.int32(wp.tid())
+    if not sorted_run_of_length(sorted_keys, n, i, 1):
+        return
+    a, b = boundary_halfedge_pair(faces, table, False, order[i])
+    out_flags[a] = 1
+    out_flags[b] = 1
+
+
+@wp.kernel
+def boundary_halfedge_mask(
+    sorted_keys: wp.array[wp.uint64],
+    order: wp.array[wp.int32],
+    n: wp.int32,
+    out_mask: wp.array[wp.bool],
+) -> None:
+    # Per halfedge: is its edge a boundary edge? ``order`` is a permutation of ``0 .. n - 1``, so
+    # every entry of ``out_mask`` is written exactly once and it needs no zero fill -- and there is
+    # no scan and no readback, since the mask's size is known.
+    i = wp.int32(wp.tid())
+    out_mask[order[i]] = sorted_run_of_length(sorted_keys, n, i, 1)
 
 
 @wp.kernel
@@ -99,37 +260,6 @@ def boundary_halfedge_successors(
     following = next_boundary_halfedge(faces, twins, h)
     out_edges[i, 0] = h
     out_edges[i, 1] = wp.where(following >= 0, following, h)
-
-
-@wp.kernel
-def count_boundary_degrees(
-    directed_edges: wp.array2d[wp.int32],
-    out_degrees: wp.array2d[wp.int32],
-    out_flags: wp.array[wp.int32],
-) -> None:
-    # Column 0: how many boundary edges *leave* each vertex. Column 1: how many touch it at all.
-    # One out-edge and two incidences is the well-behaved case. Two out-edges is the seam of a
-    # non-orientable surface, where ``succ[tail] = head`` silently drops an edge. Four incidences
-    # is a pinch point, where two loops meet and no 2-regular walk over vertices exists at all --
-    # the two are different defects with different walks: the seam's is undirected, the pinch's is
-    # over halfedges (``boundary_halfedge_successors``).
-    #
-    # The two defect bits are stamped here rather than by a second pass over the degree table:
-    # ``wp.atomic_add`` returns the value the slot held *before* the increment, so the thread that
-    # pushes a vertex past the threshold is the one that knows it. That retires a launch whose
-    # ``dim`` was the whole vertex count for an answer that is two bits -- boundary vertices are
-    # the only ones whose degrees are ever non-zero, and there are ``2 * n_edges`` of those.
-    # Slot 0 is "some vertex has two out-edges", slot 1 is "some vertex has more than two
-    # incidences", and the caller reads both in one 8-byte transfer.
-    e = wp.int32(wp.tid())
-    tail = directed_edges[e, 0]
-    head = directed_edges[e, 1]
-    if wp.atomic_add(out_degrees, tail, 0, 1) >= 1:
-        out_flags[0] = 1
-    if wp.atomic_add(out_degrees, tail, 1, 1) >= 2:
-        out_flags[1] = 1
-    if wp.atomic_add(out_degrees, head, 1, 1) >= 2:
-        out_flags[1] = 1
 
 
 @wp.kernel

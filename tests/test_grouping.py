@@ -152,6 +152,40 @@ def test_unique_1d_inverse_counts(device: str):
     assert np.array_equal(counts_wp.numpy(), counts_np)
 
 
+@pytest.mark.parametrize("dtype", [wp.int32, wp.uint64])
+def test_unique_1d_max_value(device: str, dtype) -> None:
+    """
+    Class A against ``numpy.unique``, at the tightest ``max_value`` the data allows.
+
+    The bound only narrows the final sort to the bits it needs, so the answer must be the unbounded
+    one. The values span a few thousand distinct keys drawn to leave the top bit of the bound set,
+    so a sort that dropped one bit too many would misorder them; the ``int32`` arm reaches the
+    signed sort path, where the narrowed range stops short of the sign bit.
+    """
+    rng = np.random.default_rng(20)
+    data_np = rng.integers(0, 5000, 20000).astype(np.uint64 if dtype == wp.uint64 else np.int32)
+    unique_np, inverse_np, counts_np = np.unique(data_np, return_inverse=True, return_counts=True)
+    assert int(unique_np.max()).bit_length() == 13
+
+    data_wp = wp.array(data_np, dtype=dtype, device=device)
+    unique_wp, inverse_wp, counts_wp = tw.grouping.unique_1d(
+        data_wp, return_inverse=True, return_counts=True, max_value=int(unique_np.max())
+    )
+    assert np.array_equal(unique_wp.numpy(), unique_np)
+    assert np.array_equal(inverse_wp.numpy(), inverse_np.ravel())
+    assert np.array_equal(counts_wp.numpy(), counts_np)
+
+
+def test_unique_1d_max_value_invalid(device: str) -> None:
+    """Not a library comparison: the two inputs ``max_value`` rejects."""
+    ints_wp = wp.array(np.arange(4, dtype=np.int32), dtype=wp.int32, device=device)
+    floats_wp = wp.array(np.arange(4, dtype=np.float32), dtype=wp.float32, device=device)
+    with pytest.raises(ValueError, match="non-negative"):
+        tw.grouping.unique_1d(ints_wp, max_value=-1)
+    with pytest.raises(ValueError, match="integer data only"):
+        tw.grouping.unique_1d(floats_wp, max_value=3)
+
+
 def test_unique_rows_int32(device: str):
     data_np = np.array([[1, 2, 3], [4, 5, 6], [1, 2, 3], [4, 5, 7]], dtype=np.int32)
     data_wp = wp.array(data_np, dtype=wp.int32, device=device)

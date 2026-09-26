@@ -2,79 +2,165 @@ from typing import Any
 
 import warp as wp
 
+from triwarp.kernels.algorithms.connected_components import (
+    ecl_hook_pair,
+    ecl_prehook_pair,
+    find_representative,
+)
 from triwarp.kernels.array import (
     OverloadTable,
     binary_search_sorted_contains,
     cross2,
     mark_at,
     pack_edge_key,
+    scanned_count,
 )
 from triwarp.kernels.halfedge import halfedge_next, halfedge_prev
+from triwarp.kernels.predicates import vector_angle
+from triwarp.kernels.triangles import face_normals_and_area
 
 
 @wp.kernel
-def corner_union_edges(
+def crease_flags(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    face_adjacency: wp.array2d[wp.int32],
+    threshold: wp.float32,
+    out_flags: wp.array[wp.int32],
+) -> None:
+    # The 0/1 crease verdict of each adjacency row, for the caller to scan in place. The angle is
+    # ``adjacency.face_adjacency_angles``' exactly: the same unit normals (from
+    # ``face_normals_and_area``, which ``triangles.face_normals_and_areas`` writes them with, formed
+    # here inline rather than through a per-face buffer) and the same ``vector_angle``, so
+    # ``angle > threshold`` is the predicate thresholding that function's output would be. Strictly
+    # greater, so a zero threshold selects every non-coplanar interior edge.
+    i = wp.int32(wp.tid())
+    normal_a, _area_a = face_normals_and_area(vertices, faces, face_adjacency[i, 0])
+    normal_b, _area_b = face_normals_and_area(vertices, faces, face_adjacency[i, 1])
+    out_flags[i] = wp.where(vector_angle(normal_a, normal_b) > threshold, wp.int32(1), wp.int32(0))
+
+
+@wp.kernel
+def scatter_crease_edges(
+    inclusive: wp.array[wp.int32],
+    adjacency_edges: wp.array2d[wp.int32],
+    out_edges: wp.array2d[wp.int32],
+) -> None:
+    # Compact the flagged adjacency rows' shared edges into the head of ``out_edges`` in row order.
+    # ``inclusive`` is ``crease_flags``' output scanned in place, so each row's flag is the step
+    # between its scan value and its predecessor's. ``out_edges`` may be longer than the crease
+    # count; the tail is the caller's.
+    i = wp.int32(wp.tid())
+    row, flag = scanned_count(inclusive, i)
+    if flag != 0:
+        out_edges[row, 0] = adjacency_edges[i, 0]
+        out_edges[row, 1] = adjacency_edges[i, 1]
+
+
+@wp.func
+def corner_union(
     faces: wp.array[wp.int32],
     twins: wp.array[wp.int32],
     marked_keys: wp.array[wp.uint64],
     key_base: wp.uint64,
-    out_edges: wp.array2d[wp.int32],
-    out_count: wp.array[wp.int32],
-) -> None:
-    # Two graph edges per *uncut* interior mesh edge, joining the two face corners that meet at each
-    # of its two endpoints. Connected components of that graph are exactly the copies each vertex
-    # needs: a vertex whose whole fan is uncut stays one vertex, and every marked edge crossing the
-    # fan splits it.
+    h: wp.int32,
+) -> tuple[wp.int32, wp.int32]:
+    # One edge of the corner graph per halfedge: the two face corners that meet at one endpoint of
+    # an *uncut* interior mesh edge, or ``(h, h)`` -- a self-loop, which unions nothing -- for a
+    # boundary or marked edge. Connected components of that graph are exactly the copies each
+    # vertex needs: a vertex whose whole fan is uncut stays one vertex, and every marked edge
+    # crossing the fan splits it.
     #
-    # Both endpoints matter, and getting only one of them wrong is silent: the fan around a vertex
-    # is then connected by half its edges and every vertex splits into two.
+    # Each undirected edge joins corners at *both* of its endpoints, and the edge's two halfedges
+    # emit one join each. Getting only one endpoint right is silent: the fan around a vertex is
+    # then connected by half its edges and every vertex splits into two.
     #
-    # ``h < twin`` emits each undirected edge once. ``halfedge_twins`` pairs halfedges by their
-    # *undirected* endpoint set alone (no direction check), so ``twin`` can run either opposite
-    # ``h`` (the consistently-wound case) or the same way as ``h`` (an edge-manifold but
-    # inconsistently-wound mesh -- this module's own ``uv_seam_edges`` Notes name that as a real,
-    # supported divergence, not an excluded input). Both cases have to be handled, or the two
-    # corners unioned belong to two different original vertices.
+    # ``twin`` runs opposite ``h`` in every table ``halfedge_twins`` builds, which leaves a
+    # same-direction pair at ``-1``; but a caller's own ``twins`` may pair the two halfedges of an
+    # edge by their undirected endpoints alone, so ``twin`` can also run the same way as ``h`` (an
+    # edge-manifold but inconsistently-wound mesh). Both cases have to be handled, or the two
+    # corners joined belong to two different vertices.
     #
-    # For ``h: u -> v``: if ``twin`` runs ``v -> u`` (opposite), the corners at ``u`` are ``h`` and
-    # ``next(twin)`` and the corners at ``v`` are ``next(h)`` and ``twin``. If ``twin`` runs
-    # ``u -> v`` (same direction as ``h``), the corners at ``u`` are ``h`` and ``twin`` themselves,
-    # and at ``v`` are ``next(h)`` and ``next(twin)``.
-    h = wp.int32(wp.tid())
+    # For ``h: u -> v`` with ``twin: v -> u`` (opposite), ``h``'s own corner sits at ``u`` with
+    # ``next(twin)``, and ``twin`` answers the ``v`` end the same way. With ``twin: u -> v`` (same
+    # direction), the corners at ``u`` are ``h`` and ``twin`` and those at ``v`` are ``next(h)``
+    # and ``next(twin)``; the lower-indexed half takes ``u`` and the higher ``v``.
     twin = twins[h]
-    if twin < 0 or twin < h:
-        return
+    if twin < 0:
+        return h, h
     if binary_search_sorted_contains(
         marked_keys, pack_edge_key(faces[h], faces[halfedge_next(h)], key_base)
     ):
-        return
-    slot = wp.atomic_add(out_count, 0, 2)
-    if faces[twin] == faces[h]:
-        # Same-direction twin: each halfedge's own corner is at the shared origin ``u``.
-        out_edges[slot, 0] = h
-        out_edges[slot, 1] = twin
-        out_edges[slot + 1, 0] = halfedge_next(h)
-        out_edges[slot + 1, 1] = halfedge_next(twin)
-    else:
-        # Opposite-direction twin (the consistently-wound case).
-        out_edges[slot, 0] = h
-        out_edges[slot, 1] = halfedge_next(twin)
-        out_edges[slot + 1, 0] = halfedge_next(h)
-        out_edges[slot + 1, 1] = twin
+        return h, h
+    if faces[twin] != faces[h]:
+        return h, halfedge_next(twin)
+    if h < twin:
+        return h, twin
+    return halfedge_next(h), halfedge_next(twin)
+
+
+@wp.kernel
+def corner_union_prehook(
+    faces: wp.array[wp.int32],
+    twins: wp.array[wp.int32],
+    marked_keys: wp.array[wp.uint64],
+    key_base: wp.uint64,
+    parents: wp.array[wp.int32],
+) -> None:
+    # ``connected_components.ecl_init_parent_edges`` over the corner graph, with each edge formed
+    # from ``corner_union`` in the thread rather than read from a materialised edge list. Runs over
+    # an identity ``parents``; changes no root and keeps the hook below cheap (see there).
+    h = wp.int32(wp.tid())
+    a, b = corner_union(faces, twins, marked_keys, key_base, h)
+    ecl_prehook_pair(parents, a, b)
+
+
+@wp.kernel
+def corner_union_hook(
+    faces: wp.array[wp.int32],
+    twins: wp.array[wp.int32],
+    marked_keys: wp.array[wp.uint64],
+    key_base: wp.uint64,
+    parents: wp.array[wp.int32],
+) -> None:
+    # ``connected_components.ecl_hook_edges`` over the same corner graph. Every union points the
+    # larger root at the smaller, so each component's root is its smallest corner whichever order
+    # the unions ran in.
+    h = wp.int32(wp.tid())
+    a, b = corner_union(faces, twins, marked_keys, key_base, h)
+    ecl_hook_pair(parents, a, b)
+
+
+@wp.kernel
+def corner_roots(
+    parents: wp.array[wp.int32], out_roots: wp.array[wp.int32], out_is_root: wp.array[wp.int32]
+) -> None:
+    # ``connected_components.ecl_flatten`` plus a 0/1 flag on each component's root corner -- its
+    # smallest -- so an inclusive scan of the flags numbers the components in ascending root order.
+    h = wp.int32(wp.tid())
+    root = find_representative(parents, h)
+    out_roots[h] = root
+    out_is_root[h] = wp.where(root == h, wp.int32(1), wp.int32(0))
 
 
 @wp.kernel
 def scatter_corner_values(
     faces: wp.array[wp.int32],
-    corner_index: wp.array[wp.int32],
+    roots: wp.array[wp.int32],
+    root_ranks: wp.array[wp.int32],
     values: wp.array[Any],
+    out_corner_index: wp.array[wp.int32],
     out_values: wp.array[Any],
 ) -> None:
-    # Position (or any per-vertex attribute) of each output copy, gathered through the corner it
-    # came from. Every corner in a component writes the *same* value, so the race is benign by
-    # construction and no atomics are needed.
+    # Rank each corner's component and gather its position (or any per-vertex attribute) into it.
+    # ``root_ranks`` is ``corner_roots``' flags scanned in place, so a root's entry less one is its
+    # component's rank among the roots, in ascending root order. Every corner in a component
+    # writes the *same* value, so the race on ``out_values`` is benign by construction and needs no
+    # atomics.
     h = wp.int32(wp.tid())
-    out_values[corner_index[h]] = values[faces[h]]
+    rank = root_ranks[roots[h]] - 1
+    out_corner_index[h] = rank
+    out_values[rank] = values[faces[h]]
 
 
 @wp.func
@@ -140,14 +226,13 @@ def classify_uv_halfedge(
         return UV_EDGE_NONE
     forwards, backwards = canonical_edge_halfedges(faces, h, twin)
 
-    # ``halfedge_twins`` pairs ``h``/``twin`` by their undirected endpoint set alone, with no
-    # direction check, so ``backwards`` runs opposite ``forwards`` only on a consistently-wound
-    # mesh -- this module's own Notes name inconsistent winding as a real, supported divergence, not
-    # an excluded input. When it runs the *other* way, the corner sitting on top of ``forwards``'
-    # tail is the one *following* ``backwards``, and vice versa; when it runs the *same* way, that
-    # corner is ``backwards`` itself, and the one on top of ``forwards``' head is the one following
-    # it. ``faces[backwards] == faces[forwards]`` is exactly the same-direction case, since both
-    # then share the same origin vertex.
+    # ``halfedge_twins`` pairs only opposite halfedges, but a caller's own ``twins`` may pair the
+    # two halfedges of an edge by their undirected endpoints alone, so ``backwards`` can also run
+    # the same way as ``forwards`` on an inconsistently-wound mesh. When it runs the *other* way,
+    # the corner sitting on top of ``forwards``' tail is the one *following* ``backwards``, and vice
+    # versa; when it runs the *same* way, that corner is ``backwards`` itself, and the one on top of
+    # ``forwards``' head is the one following it. ``faces[backwards] == faces[forwards]`` is exactly
+    # the same-direction case, since both then share the same origin vertex.
     tail_forwards = corner_texcoord(face_texcoords, has_face_texcoords, forwards)
     head_forwards = corner_texcoord(face_texcoords, has_face_texcoords, halfedge_next(forwards))
     if faces[backwards] == faces[forwards]:
@@ -200,61 +285,69 @@ def classify_uv_halfedges(
     match_uv: wp.bool,
     tolerance_sq: wp.float32,
     out_flags: wp.array2d[wp.int32],
-    out_counts: wp.array[wp.int32],
 ) -> None:
     # One thread per halfedge. Row ``k`` of ``out_flags`` is the 0/1 selection of class ``k + 1``
-    # (seam, boundary, foldover), laid out so one inclusive scan over the flattened buffer
-    # numbers all three blocks at once; ``out_counts`` totals each class so a single readback sizes
-    # all three outputs. Every flag is written on every path, so the caller may allocate
-    # ``out_flags`` with ``wp.empty``; ``out_counts`` arrives zeroed.
+    # (seam, boundary, foldover), laid out so one inclusive scan of the flattened buffer, in place,
+    # numbers all three blocks at once and leaves each block's running total in its last column.
+    # Every flag is written on every path, so the caller may allocate ``out_flags`` with
+    # ``wp.empty``.
     h = wp.int32(wp.tid())
     kind = classify_uv_halfedge(
         faces, twins, face_texcoords, has_face_texcoords, texcoords, match_uv, tolerance_sq, h
     )
     for k in range(3):
         out_flags[k, h] = wp.where(kind == k + 1, wp.int32(1), wp.int32(0))
-    if kind != UV_EDGE_NONE:
-        wp.atomic_add(out_counts, kind - 1, 1)
+
+
+@wp.func
+def scanned_block_row(inclusive: wp.array[wp.int32], n: wp.int32, k: wp.int32, h: wp.int32):
+    # Row of entry ``h`` within block ``k`` of a ``(3, n)`` flag table scanned in place as one flat
+    # buffer, and that entry's flag. Block ``k``'s positions run on from the totals of the blocks
+    # before it, which sit in the flat entry just ahead of the block; subtracting it makes each
+    # block zero-based.
+    start, flag = scanned_count(inclusive, k * n + h)
+    base = wp.int32(0)
+    if k > 0:
+        base = inclusive[k * n - 1]
+    return start - base, flag
 
 
 @wp.kernel
 def scatter_uv_halfedges(
     faces: wp.array[wp.int32],
     twins: wp.array[wp.int32],
-    flags: wp.array2d[wp.int32],
-    inclusive: wp.array2d[wp.int32],
-    counts: wp.array[wp.int32],
+    inclusive: wp.array[wp.int32],
     out_seams: wp.array2d[wp.int32],
     out_boundaries: wp.array2d[wp.int32],
     out_foldovers: wp.array2d[wp.int32],
 ) -> None:
-    # Compact the three classes into their rows in ascending halfedge order. ``inclusive`` is the
-    # inclusive scan of the *flattened* ``flags``, so block ``k``'s positions run on from the
-    # totals of the blocks before it; subtracting those totals makes each block zero-based. A seam
-    # or foldover row is the ``(face, corner)`` pair of both canonical halfedges; a boundary row is
-    # this halfedge's own ``(face, corner)``, under the ``h = 3 * f + k`` convention.
+    # Compact the three classes into their rows in ascending halfedge order. ``inclusive`` is
+    # ``classify_uv_halfedges``' flags scanned in place as one flat buffer, so each flag is
+    # recovered as a step of the scan. A seam or foldover row is the ``(face, corner)`` pair of
+    # both canonical halfedges; a boundary row is this halfedge's own ``(face, corner)``, under the
+    # ``h = 3 * f + k`` convention. A halfedge carries at most one class.
     h = wp.int32(wp.tid())
-    if flags[1, h] != 0:
-        row = inclusive[1, h] - 1 - counts[0]
+    n = inclusive.shape[0] // 3
+    row, is_boundary = scanned_block_row(inclusive, n, 1, h)
+    if is_boundary != 0:
         out_boundaries[row, 0] = h // 3
         out_boundaries[row, 1] = h % 3
         return
-    is_seam = flags[0, h] != 0
-    if not is_seam and flags[2, h] == 0:
+    seam_row, is_seam = scanned_block_row(inclusive, n, 0, h)
+    foldover_row, is_foldover = scanned_block_row(inclusive, n, 2, h)
+    if is_seam == 0 and is_foldover == 0:
         return
     forwards, backwards = canonical_edge_halfedges(faces, h, twins[h])
-    if is_seam:
-        row = inclusive[0, h] - 1
-        out_seams[row, 0] = forwards // 3
-        out_seams[row, 1] = forwards % 3
-        out_seams[row, 2] = backwards // 3
-        out_seams[row, 3] = backwards % 3
+    if is_seam != 0:
+        out_seams[seam_row, 0] = forwards // 3
+        out_seams[seam_row, 1] = forwards % 3
+        out_seams[seam_row, 2] = backwards // 3
+        out_seams[seam_row, 3] = backwards % 3
     else:
-        row = inclusive[2, h] - 1 - counts[0] - counts[1]
-        out_foldovers[row, 0] = forwards // 3
-        out_foldovers[row, 1] = forwards % 3
-        out_foldovers[row, 2] = backwards // 3
-        out_foldovers[row, 3] = backwards % 3
+        out_foldovers[foldover_row, 0] = forwards // 3
+        out_foldovers[foldover_row, 1] = forwards % 3
+        out_foldovers[foldover_row, 2] = backwards // 3
+        out_foldovers[foldover_row, 3] = backwards % 3
 
 
 @wp.kernel
@@ -314,7 +407,14 @@ def _register_overloads() -> None:
     SCATTER_CORNER_VALUES = OverloadTable(
         scatter_corner_values,
         {
-            d: [wp.array[wp.int32], wp.array[wp.int32], wp.array[d], wp.array[d]]
+            d: [
+                wp.array[wp.int32],
+                wp.array[wp.int32],
+                wp.array[wp.int32],
+                wp.array[d],
+                wp.array[wp.int32],
+                wp.array[d],
+            ]
             for d in (wp.vec3, wp.vec3d)
         },
     )

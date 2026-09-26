@@ -347,7 +347,10 @@ def _repeated_oriented_triangles(
         inputs=[tris, inclusive_counts, wp.uint64(n), keys, slots],
         device=device,
     )
-    wp.utils.radix_sort_pairs(keys, slots, count=n_candidates)
+    # Three indices below ``n`` pack below ``n ** 3``, so the sort orders only those low bits.
+    wp.utils.radix_sort_pairs(
+        keys, slots, count=n_candidates, end_bit=min(64, max(1, (n**3 - 1).bit_length()))
+    )
 
     flags = wp.empty(n_candidates, dtype=wp.int32, device=device)
     wp.launch(

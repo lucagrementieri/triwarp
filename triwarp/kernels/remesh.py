@@ -444,18 +444,22 @@ def mark_long_edges(
     sizing: wp.array[wp.float32],
     use_sizing: wp.bool,
     out_long: wp.array[wp.bool],
+    out_flags: wp.array[wp.int32],
 ) -> None:
     # ``length > target`` per unique edge, with the length computed here rather than read from a
     # separate length pass whose only consumer this is. The target is ``max_edge`` or, against a
     # per-vertex sizing field, the mean of the endpoints' -- the standard reading of a
     # vertex-sampled sizing function, and symmetric in the edge's orientation. One warp-uniform
     # branch rather than two kernels, since the two differ by a parameter; ``sizing`` is not read
-    # (and may be a null array) when ``use_sizing`` is false.
+    # (and may be a null array) when ``use_sizing`` is false. The verdict is written twice: as the
+    # mask the split reads, and as the ``int32`` flag the caller scans in place into its ranks.
     e = wp.int32(wp.tid())
     target = max_edge
     if use_sizing:
         target = wp.float32(0.5) * (sizing[unique_edges[e, 0]] + sizing[unique_edges[e, 1]])
-    out_long[e] = unique_edge_length(vertices, unique_edges, e) > target
+    is_long = unique_edge_length(vertices, unique_edges, e) > target
+    out_long[e] = is_long
+    out_flags[e] = wp.where(is_long, wp.int32(1), wp.int32(0))
 
 
 @wp.kernel
@@ -563,18 +567,21 @@ def mark_long_region_edges(
     inverse: wp.array[wp.int32],
     max_edge: wp.float32,
     out_long: wp.array[wp.bool],
+    out_flags: wp.array[wp.int32],
 ) -> None:
     # ``mark_long_edges``' uniform test restricted to the edges with at least one incident face in
     # the region -- region-border edges included. One thread per face corner, over a zeroed mask:
     # the region test and the length test in one launch, where a per-edge pass would first need the
     # region membership scattered into an edge mask of its own. An edge is tested once per region
     # face holding it, at most twice on a manifold, and every write is the same ``True``, so the
-    # race is benign.
+    # race is benign. ``out_flags`` (zeroed too) carries the same marks as ``int32``, for the
+    # caller to scan in place into the split's ranks.
     i = wp.int32(wp.tid())
     if region_flags[i // 3] != 0:
         e = inverse[i]
         if unique_edge_length(vertices, unique_edges, e) > max_edge:
             out_long[e] = wp.bool(True)
+            out_flags[e] = wp.int32(1)
 
 
 # ---------------------------------------------------------------------------
@@ -646,7 +653,6 @@ def emit_density_splits(
     faces: wp.array[wp.int32],
     region: wp.array[wp.bool],
     scale: wp.array[wp.float32],
-    split: wp.array[wp.int32],
     split_offsets: wp.array[wp.int32],
     n_vertices: wp.int32,
     out_positions: wp.array[wp.vec3],
@@ -662,7 +668,9 @@ def emit_density_splits(
     # criterion suits a parallel refinement: one scan for the new-vertex slots, and one kernel.
     #
     # The face slots need no scan of their own: every face before ``f`` becomes one face plus two
-    # more if it split, so ``f``'s first output face is ``f + 2 * split_offsets[f]``.
+    # more if it split, so ``f``'s first output face is ``f + 2 * split_offsets[f]``. The offsets
+    # are the ``n_faces + 1`` exclusive scan of ``mark_density_splits``' flags, so a face split
+    # exactly where they step.
     #
     # Child faces inherit their parent's region membership, matching
     # ``subdivide_region_to_size``, so a caller's patch mask survives the pass.
@@ -671,7 +679,7 @@ def emit_density_splits(
     slot = split_offsets[f]
     first = f + wp.int32(2) * slot
     base = first * 3
-    if split[f] == wp.int32(0):
+    if split_offsets[f + 1] == slot:
         out_faces[base + 0] = i
         out_faces[base + 1] = j
         out_faces[base + 2] = k
@@ -1578,23 +1586,6 @@ def remapped_corner_triple(
 
 
 @wp.kernel
-def remap_faces_with_distinct_mask(
-    faces: wp.array[wp.int32],
-    remap: wp.array[wp.int32],
-    out_faces: wp.array[wp.int32],
-    out_mask: wp.array[wp.bool],
-) -> None:
-    # One pass for both halves of ``remapped_corner_triple``: the test reads only this face's own
-    # three remapped corners, so a separate gather would write them to memory for this kernel to
-    # read straight back. ``cluster_remap_faces`` is the same pass plus the referenced-vertex marks
-    # vertex clustering needs.
-    f = wp.int32(wp.tid())
-    i0, i1, i2, distinct = remapped_corner_triple(faces, remap, f)
-    write_corner_triple(out_faces, f, i0, i1, i2)
-    out_mask[f] = distinct
-
-
-@wp.kernel
 def valence_flip_candidates(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
@@ -2144,72 +2135,125 @@ def cluster_pick_closest(
         wp.atomic_min(out_representative, labels[v], v)
 
 
-@wp.kernel
-def cluster_remap_faces(
-    faces: wp.array[wp.int32],
-    labels: wp.array[wp.int32],
-    out_faces: wp.array[wp.int32],
-    out_distinct: wp.array[wp.bool],
-    out_referenced: wp.array[wp.int32],
-) -> None:
-    # ``remap_faces_with_distinct_mask`` plus a mark on every cluster a surviving face names, so
-    # the vertex compaction is an exclusive scan of ``out_referenced`` (caller-zeroed) rather than
-    # a face gather and a sort-based dedup of its corners. The marks are plain stores of one value,
-    # so racing threads agree.
-    f = wp.int32(wp.tid())
-    i0, i1, i2, distinct = remapped_corner_triple(faces, labels, f)
-    write_corner_triple(out_faces, f, i0, i1, i2)
-    out_distinct[f] = distinct
+@wp.func
+def mark_surviving_face(
+    faces: wp.array[wp.int32], remap: wp.array[wp.int32], f: wp.int32, flags: wp.array[wp.int32]
+) -> tuple[wp.int32, wp.int32, wp.int32, wp.bool]:
+    # Face ``f``'s corners through ``remap`` and whether it survives, recorded as the ``int32``
+    # flags one scan turns into both compactions: face ``f``'s own at ``f``, and a mark at
+    # ``n_faces + t`` on every target a surviving face names (plain stores -- every writer stores
+    # the same value -- over caller-zeroed marks). The face flag is written whatever its value.
+    i0, i1, i2, distinct = remapped_corner_triple(faces, remap, f)
+    flags[f] = wp.where(distinct, wp.int32(1), wp.int32(0))
     if distinct:
-        mark_corners(out_referenced, 0, i0, i1, i2, wp.int32(1))
+        mark_corners(flags, faces.shape[0] // 3, i0, i1, i2, wp.int32(1))
+    return i0, i1, i2, distinct
 
 
 @wp.kernel
-def cluster_compact_surviving_faces(
-    remapped: wp.array[wp.int32],
-    surviving: wp.array[wp.int32],
+def mark_surviving_faces(
+    faces: wp.array[wp.int32], remap: wp.array[wp.int32], out_flags: wp.array[wp.int32]
+) -> None:
+    # Which faces survive a vertex remap (vertex clustering's cell labels, an edge collapse's
+    # survivor map) and which targets they still name, so both compactions are one scan of
+    # ``out_flags`` rather than a face gather and a sort-based dedup of the corners. The remapped
+    # corners are not stored: ``compact_surviving_faces`` re-reads them through ``remap`` for the
+    # faces that survive. ``remap_and_mark_faces`` is the same marking with the corners written.
+    mark_surviving_face(faces, remap, wp.int32(wp.tid()), out_flags)
+
+
+@wp.func
+def scanned_slot(offsets: wp.array[wp.int32], i: wp.int32) -> tuple[wp.int32, wp.bool]:
+    # Element ``i``'s compacted slot and whether it is kept, from an exclusive scan of 0/1 marks
+    # that ends in its total: kept exactly where the scan steps. The slot is taken relative to
+    # ``offsets[0]`` because the scan may be the tail of a longer one (the vertex marks scanned
+    # after the face flags), whose leading entry is then the count of everything before it.
+    slot = offsets[i]
+    return slot - offsets[0], offsets[i + 1] != slot
+
+
+@wp.kernel
+def compact_surviving_faces(
+    faces: wp.array[wp.int32],
+    remap: wp.array[wp.int32],
+    face_offsets: wp.array[wp.int32],
     ranks: wp.array[wp.int32],
     out_faces: wp.array[wp.int32],
+    out_totals: wp.array[wp.int32],
 ) -> None:
-    # Renumber the ``k``-th surviving face (``remapped`` holds its cluster ids) onto the compacted
-    # vertices and write it densely at row
-    # ``k``: ``ranks`` is the exclusive scan of the referenced marks, so it is monotone in the
-    # cluster id, and the rows keep the input's face order -- what a face-mask ``submesh`` of the
-    # remapped faces returns.
-    k = wp.int32(wp.tid())
-    a, b, c = corner_triple(remapped, surviving[k])
-    out_faces[3 * k] = ranks[a]
-    out_faces[3 * k + 1] = ranks[b]
-    out_faces[3 * k + 2] = ranks[c]
+    # Launched over every input face. ``face_offsets`` and ``ranks`` are the two halves of one
+    # inclusive scan over ``mark_surviving_faces``' face flags followed by its target marks, behind
+    # a leading zero, each read as an exclusive scan with its total at the end (``scanned_slot``).
+    # A surviving face is written at its dense row, so the rows keep the input's face order -- what
+    # a face-mask ``submesh`` of the remapped faces returns -- with every corner renumbered onto
+    # the compacted targets, which keep their order too. The last thread publishes both totals
+    # (kept targets, surviving faces) side by side, so the host reads them in one copy.
+    f = wp.int32(wp.tid())
+    n_faces = face_offsets.shape[0] - 1
+    if f == n_faces - 1:
+        out_totals[0] = ranks[ranks.shape[0] - 1] - ranks[0]
+        out_totals[1] = face_offsets[n_faces]
+    row, survived = scanned_slot(face_offsets, f)
+    if not survived:
+        return
+    i0, i1, i2, _distinct = remapped_corner_triple(faces, remap, f)
+    s0, _k0 = scanned_slot(ranks, i0)
+    s1, _k1 = scanned_slot(ranks, i1)
+    s2, _k2 = scanned_slot(ranks, i2)
+    write_corner_triple(out_faces, row, s0, s1, s2)
+
+
+@wp.kernel
+def compact_collapse_vertices(
+    positions: wp.array[wp.vec3],
+    low: wp.array[wp.float32],
+    high: wp.array[wp.float32],
+    ranks: wp.array[wp.int32],
+    out_positions: wp.array[wp.vec3],
+    out_low: wp.array[wp.float32],
+    out_high: wp.array[wp.float32],
+) -> None:
+    # A collapse pass's surviving vertices and their two length bands, written into their compacted
+    # slots in one pass. ``ranks`` is ``compact_surviving_faces``' scan of the referenced marks, so
+    # a vertex is kept exactly where it steps -- the order ``repair.remove_unreferenced_vertices``
+    # keeps and gathering the bands by its inverse reproduces.
+    v = wp.int32(wp.tid())
+    slot, kept = scanned_slot(ranks, v)
+    if not kept:
+        return
+    out_positions[slot] = positions[v]
+    out_low[slot] = low[v]
+    out_high[slot] = high[v]
 
 
 @wp.kernel
 def cluster_compact_means(
     sums: wp.array[wp.vec3],
     counts: wp.array[wp.int32],
-    referenced: wp.array[wp.int32],
     ranks: wp.array[wp.int32],
     out_vertices: wp.array[wp.vec3],
 ) -> None:
-    # The mean of every referenced cluster, written straight into its compacted slot.
+    # The mean of every referenced cluster, written straight into its compacted slot. ``ranks`` is
+    # ``compact_surviving_faces``' scan of the referenced marks (``scanned_slot``).
     c = wp.int32(wp.tid())
-    if referenced[c] != 0:
-        out_vertices[ranks[c]] = mean_from_sum(sums[c], counts[c])
+    slot, kept = scanned_slot(ranks, c)
+    if kept:
+        out_vertices[slot] = mean_from_sum(sums[c], counts[c])
 
 
 @wp.kernel
 def cluster_compact_representatives(
     vertices: wp.array[wp.vec3],
     representative: wp.array[wp.int32],
-    referenced: wp.array[wp.int32],
     ranks: wp.array[wp.int32],
     out_vertices: wp.array[wp.vec3],
 ) -> None:
     # ``cluster_compact_means``' sibling for the closest-to-centre contraction: the representative
     # vertex's own position, into the compacted slot.
     c = wp.int32(wp.tid())
-    if referenced[c] != 0:
-        out_vertices[ranks[c]] = vertices[representative[c]]
+    slot, kept = scanned_slot(ranks, c)
+    if kept:
+        out_vertices[slot] = vertices[representative[c]]
 
 
 # Objective for ``objective_flip_candidates``. A warp-uniform kernel argument rather than a
@@ -3026,18 +3070,13 @@ def remap_and_mark_faces(
     out_faces: wp.array[wp.int32],
     out_flags: wp.array[wp.int32],
 ) -> None:
-    # ``remap_faces_with_distinct_mask`` for the pass's compaction, writing both of its keep masks
-    # as the ``int32`` flags the one scan after it reads: face ``f``'s at ``f``, and a mark at
-    # ``n_faces + v`` on every vertex a surviving face names (plain stores -- every writer stores
-    # the same value -- over marks ``begin_decimation_pass`` zeroed). A padded face is the dummy
-    # triangle, never distinct, so it keeps neither itself nor the dummy vertex.
+    # ``mark_surviving_faces`` for the pass's compaction, also writing the remapped corners, which
+    # the pass's own compaction reads (the marks are over ``begin_decimation_pass``' zeroing). A
+    # padded face is the dummy triangle, never distinct, so it keeps neither itself nor the dummy
+    # vertex.
     f = wp.int32(wp.tid())
-    i0, i1, i2, distinct = remapped_corner_triple(faces, remap, f)
+    i0, i1, i2, _distinct = mark_surviving_face(faces, remap, f, out_flags)
     write_corner_triple(out_faces, f, i0, i1, i2)
-    n_faces = faces.shape[0] // 3
-    out_flags[f] = wp.where(distinct, wp.int32(1), wp.int32(0))
-    if distinct:
-        mark_corners(out_flags, n_faces, i0, i1, i2, wp.int32(1))
 
 
 @wp.func

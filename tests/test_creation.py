@@ -18,7 +18,12 @@ from meshlib import mrmeshpy as mm
 from scipy.spatial import cKDTree
 
 import triwarp as tw
-from tests.comparisons import euler_characteristic, lexsort_rows, open_edge_count
+from tests.comparisons import (
+    assert_unordered_rows_equal,
+    euler_characteristic,
+    lexsort_rows,
+    open_edge_count,
+)
 from tests.conversions import (
     meshlib_to_trimesh,
     open3d_to_trimesh,
@@ -1339,6 +1344,44 @@ def test_extrude_polygon_mid_plane(device: str) -> None:
     assert np.allclose(warp_to_trimesh(vertices_wp, faces_wp).bounds[:, 2], [-0.5, 0.5], atol=1e-5)
 
 
+def _star_ring(n: int, clockwise: bool) -> np.ndarray:
+    """Return a non-convex ``n``-vertex star, which ``triangulate_polygon`` ear-clips."""
+    theta = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+    radius = np.where(np.arange(n) % 2 == 0, 1.0, 0.4)
+    ring_np = np.column_stack((radius * np.cos(theta), radius * np.sin(theta)))
+    return ring_np[::-1].copy() if clockwise else ring_np
+
+
+@pytest.mark.parametrize("ring_name", ["square", "L", "star", "star_cw"])
+@pytest.mark.parametrize("height", [0.5, -0.5])
+def test_extrude_polygon_ring_walls_match_the_derived_boundary(
+    device: str, ring_name: str, height: float
+) -> None:
+    """
+    Triwarp against triwarp: the ring-edge walls against the derived boundary.
+
+    ``extrude_polygon`` walls a full ``n - 2`` triangulation from its ring edges and never derives
+    the boundary; ``extrude_triangulation`` derives it from the same triangulation. The derived path
+    carries the oracle (``test_extrude_polygon`` compares it with trimesh), so the two must build
+    the same mesh -- and, on the CPU device, the same buffers row for row, since the ring walls are
+    emitted in the derived boundary's order. On CUDA the ear clip's face order is not reproducible
+    between calls, so there the rows are compared as a set. The star rings reach the ear clip in
+    both orientations, and both height signs re-wind the caps.
+    """
+    rings = {"square": _SQUARE_RING, "L": _L_RING}
+    ring_np = rings.get(ring_name, _star_ring(12, ring_name == "star_cw"))
+    ring_wp, faces_wp = tw.polyline.triangulate_polygon(points_to_warp_uv(ring_np, device))
+    assert int(faces_wp.shape[0]) // 3 == ring_np.shape[0] - 2
+    derived_v, derived_f = tw.creation.extrude_triangulation(ring_wp, faces_wp, height)
+    ring_v, ring_f = tw.creation.extrude_polygon(points_to_warp_uv(ring_np, device), height)
+    _assert_closed(ring_v, ring_f)
+    assert np.array_equal(ring_v.numpy(), derived_v.numpy())
+    if device == "cpu":
+        assert np.array_equal(ring_f.numpy(), derived_f.numpy())
+    else:
+        assert_unordered_rows_equal(ring_f.numpy().reshape(-1, 3), derived_f.numpy().reshape(-1, 3))
+
+
 def test_extrude_triangulation_recovers_subdivided_boundary(device: str) -> None:
     # A boundary edge split by an extra collinear vertex still has to become two wall quads, which
     # is why the boundary is recovered from the triangulation rather than taken from the input ring.
@@ -1469,6 +1512,21 @@ def test_sweep_polygon_invalid(device: str) -> None:
         tw.creation.sweep_polygon(
             ring_wp, path_wp, angles=wp.zeros(2, dtype=wp.float32, device=device)
         )
+
+
+def test_sweep_polygon_rejects_a_non_simple_ring(device: str) -> None:
+    """
+    A self-intersecting ring triangulates partially, so the sweep derives its boundary and raises.
+
+    The ring-edge walls are only taken for a full ``n - 2`` triangulation; a bow-tie gets one
+    triangle for four vertices, which is the branch where the boundary is derived and checked.
+    """
+    bowtie_np = np.array([[0.0, 0.0], [1.0, 1.0], [1.0, 0.0], [0.0, 1.0]])
+    ring_wp, faces_wp = tw.polyline.triangulate_polygon(points_to_warp_uv(bowtie_np, device))
+    assert int(faces_wp.shape[0]) // 3 < int(ring_wp.shape[0]) - 2
+    path_wp = points_to_warp(_SWEEP_PATHS["straight"], device)
+    with pytest.raises(ValueError, match="simple ring"):
+        tw.creation.sweep_polygon(points_to_warp_uv(bowtie_np, device), path_wp)
 
 
 # --- composites -------------------------------------------------------------------------
@@ -1820,12 +1878,12 @@ def test_parametric_lattice_paths_agree(
     in the last float32 bit would be a second definition of the geometry rather than a faster route
     to the same one.
 
-    The gate is at ``_PARAMETRIC_LATTICE_DEVICE_FROM`` lattice samples, which every resolution a
-    test or fixture uses sits *below* — so without forcing it the device path would never run in
-    the suite at all. The surfaces straddle the gluing rules the two paths have to agree on: a
-    twisted wrap with two collapsed pole rows (``boy``, ``cross_cap``), a wrap in each direction
-    (``klein``), a twist with a boundary (``mobius``), a plain open patch (``dini``) and a
-    pole on one end only (``conic_spiral``).
+    The gate is at ``_PARAMETRIC_LATTICE_DEVICE_FROM`` lattice samples, which the smallest
+    resolutions here sit below and the rest above -- so each path is forced both ways rather than
+    left to whichever side of the gate a resolution happens to land on. The surfaces straddle the
+    gluing rules the two paths have to agree on: a twisted wrap with two collapsed pole rows
+    (``boy``, ``cross_cap``), a wrap in each direction (``klein``), a twist with a boundary
+    (``mobius``), a plain open patch (``dini``) and a pole on one end only (``conic_spiral``).
     """
     forced = tw.creation._PARAMETRIC_LATTICE_DEVICE_FROM
     monkeypatch.setattr(tw.creation, "_PARAMETRIC_LATTICE_DEVICE_FROM", 1 << 30)

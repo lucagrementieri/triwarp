@@ -1,16 +1,64 @@
 import warp as wp
 
 from triwarp.kernels.adjacency import write_face_edge_keys
+from triwarp.kernels.algorithms.connected_components import (
+    ecl_hook_pair,
+    ecl_prehook_pair,
+    find_representative,
+)
 from triwarp.kernels.array import (
     binary_search_index,
     binary_search_sorted_contains,
     masked_at,
     pack_directed_key,
     pack_edge_key,
+    scanned_count,
 )
+from triwarp.kernels.grouping import sorted_run_of_length
 from triwarp.kernels.halfedge import halfedge_endpoints
 from triwarp.kernels.scatter import mark_corners
 from triwarp.kernels.triangles import corner_triple
+
+
+@wp.kernel
+def mark_indexed_face_vertices(
+    faces: wp.array[wp.int32], face_indices: wp.array[wp.int32], out_flags: wp.array[wp.int32]
+) -> None:
+    # Flag every vertex a listed face references, in a zeroed per-vertex ``int32`` array the
+    # caller scans in place: the vertex indices are bounded by the vertex count, so the scan of a
+    # mask is the sorted unique set ``unique_1d`` would hash and sort for, and a listed duplicate
+    # face only re-marks the corners it already marked.
+    i = wp.int32(wp.tid())
+    a, b, c = corner_triple(faces, face_indices[i])
+    mark_corners(out_flags, 0, a, b, c, wp.int32(1))
+
+
+@wp.kernel
+def compact_indexed_submesh(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    face_indices: wp.array[wp.int32],
+    inclusive: wp.array[wp.int32],
+    out_faces: wp.array[wp.int32],
+    out_vertices: wp.array[wp.vec3],
+    out_vertex_index: wp.array[wp.int32],
+) -> None:
+    # Both halves of the index-driven extraction in one launch over ``max(k, n_vertices)``
+    # threads, from ``mark_indexed_face_vertices``' flags scanned in place: listed face ``t`` is
+    # written at row ``t`` with each corner at its vertex's compact rank, and a flagged vertex
+    # ``t`` is written at that rank. ``out_vertex_index`` is optional (``None``).
+    t = wp.int32(wp.tid())
+    if t < face_indices.shape[0]:
+        a, b, c = corner_triple(faces, face_indices[t])
+        out_faces[3 * t] = inclusive[a] - 1
+        out_faces[3 * t + 1] = inclusive[b] - 1
+        out_faces[3 * t + 2] = inclusive[c] - 1
+    if t < vertices.shape[0]:
+        start, count = scanned_count(inclusive, t)
+        if count != 0:
+            out_vertices[start] = vertices[t]
+            if out_vertex_index.shape[0] > 0:
+                out_vertex_index[start] = t
 
 
 @wp.kernel
@@ -112,51 +160,43 @@ def submesh_counts(
 
 
 @wp.kernel
-def compact_submesh_faces(
+def compact_submesh(
+    vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     face_mask: wp.array[wp.bool],
     keep_masked: wp.bool,
     ranks: wp.array[wp.int32],
     out_faces: wp.array[wp.int32],
-) -> None:
-    f = wp.int32(wp.tid())
-    if face_mask[f] != keep_masked:
-        return
-    n_faces = face_mask.shape[0]
-    offset = ranks[n_faces - 1] + 1
-    a, b, c = corner_triple(faces, f)
-    slot = 3 * (ranks[f] - 1)
-    out_faces[slot] = ranks[n_faces + a] - offset
-    out_faces[slot + 1] = ranks[n_faces + b] - offset
-    out_faces[slot + 2] = ranks[n_faces + c] - offset
-
-
-@wp.kernel
-def compact_submesh_vertices(
-    vertices: wp.array[wp.vec3],
-    ranks: wp.array[wp.int32],
-    n_faces: wp.int32,
     out_vertices: wp.array[wp.vec3],
     out_vertex_index: wp.array[wp.int32],
 ) -> None:
-    # A vertex is kept when its inclusive rank steps up; for vertex 0 the step is taken from the
-    # face half's total, which is exactly the vertex half's baseline.
-    v = wp.int32(wp.tid())
-    rank = ranks[n_faces + v]
-    if rank == ranks[n_faces + v - 1]:
-        return
-    slot = rank - ranks[n_faces - 1] - 1
-    out_vertices[slot] = vertices[v]
-    out_vertex_index[slot] = v
+    # Both halves of the extraction in one launch over ``max(n_faces, n_vertices)`` threads: thread
+    # ``t`` compacts face ``t`` and vertex ``t`` where each exists. The two halves read the same
+    # finished scan and write disjoint outputs, so nothing orders them.
+    t = wp.int32(wp.tid())
+    n_faces = face_mask.shape[0]
+    offset = ranks[n_faces - 1] + 1
+    if t < n_faces and face_mask[t] == keep_masked:
+        # A kept face lands at its rank, its corners at their vertices' ranks.
+        a, b, c = corner_triple(faces, t)
+        slot = 3 * (ranks[t] - 1)
+        out_faces[slot] = ranks[n_faces + a] - offset
+        out_faces[slot + 1] = ranks[n_faces + b] - offset
+        out_faces[slot + 2] = ranks[n_faces + c] - offset
+    if t < vertices.shape[0]:
+        # A vertex is kept when its inclusive rank steps up; for vertex 0 the step is taken from the
+        # face half's total, which is exactly the vertex half's baseline.
+        rank = ranks[n_faces + t]
+        if rank != ranks[n_faces + t - 1]:
+            slot = rank - offset
+            out_vertices[slot] = vertices[t]
+            out_vertex_index[slot] = t
 
 
-@wp.kernel
-def face_mask_from_vertex_mask(
-    faces: wp.array[wp.int32],
-    vertex_mask: wp.array[wp.bool],
-    require_all: wp.bool,
-    out_face_mask: wp.array[wp.bool],
-) -> None:
+@wp.func
+def face_selected_by_vertices(
+    faces: wp.array[wp.int32], vertex_mask: wp.array[wp.bool], require_all: wp.bool, f: wp.int32
+) -> wp.bool:
     # Reduce a per-vertex selection onto its faces: keep a face when all three of its corners are
     # selected (``require_all``), or when at least one is. One warp-uniform branch rather than two
     # kernels, since the two differ by a parameter and not by an algorithm.
@@ -167,20 +207,47 @@ def face_mask_from_vertex_mask(
     # min/max reductions with a host readback each, a sort or a span-sized table, and a second
     # ``flatnonzero``. Reading the mask directly is one O(1) lookup per corner; see
     # ``masked_at`` for why the read is guarded.
-    f = wp.int32(wp.tid())
     a, b, c = corner_triple(faces, f)
     hit_a = masked_at(vertex_mask, a)
     hit_b = masked_at(vertex_mask, b)
     hit_c = masked_at(vertex_mask, c)
     if require_all:
-        out_face_mask[f] = hit_a and hit_b and hit_c
-    else:
-        out_face_mask[f] = hit_a or hit_b or hit_c
+        return hit_a and hit_b and hit_c
+    return hit_a or hit_b or hit_c
+
+
+@wp.kernel
+def face_mask_from_vertex_mask(
+    faces: wp.array[wp.int32],
+    vertex_mask: wp.array[wp.bool],
+    require_all: wp.bool,
+    out_face_mask: wp.array[wp.bool],
+) -> None:
+    f = wp.int32(wp.tid())
+    out_face_mask[f] = face_selected_by_vertices(faces, vertex_mask, require_all, f)
+
+
+@wp.kernel
+def face_flags_from_vertex_mask(
+    faces: wp.array[wp.int32],
+    vertex_mask: wp.array[wp.bool],
+    require_all: wp.bool,
+    out_flags: wp.array[wp.int32],
+) -> None:
+    # ``face_mask_from_vertex_mask`` as the ``int32`` flag a caller scans in place to compact the
+    # selected face indices, with no bool mask in between.
+    f = wp.int32(wp.tid())
+    out_flags[f] = wp.where(
+        face_selected_by_vertices(faces, vertex_mask, require_all, f), wp.int32(1), wp.int32(0)
+    )
 
 
 @wp.kernel
 def dilate_vertex_mask(
-    faces: wp.array[wp.int32], in_mask: wp.array[wp.bool], out_mask: wp.array[wp.bool]
+    faces: wp.array[wp.int32],
+    in_mask: wp.array[wp.bool],
+    value: wp.bool,
+    out_mask: wp.array[wp.bool],
 ) -> None:
     # One one-ring dilation round, reached through the faces: on a triangle mesh two vertices share
     # an edge exactly when they share a face, so marking every corner of a face with a selected
@@ -188,10 +255,14 @@ def dilate_vertex_mask(
     # against the same round over a caller's unique edges, it is level at a hundred thousand faces
     # and 1.2x at tens of millions, so the edge form was retired rather than kept beside it.
     # ``out_mask`` must be pre-seeded with ``in_mask``; re-marking the selected corner is a no-op.
+    #
+    # ``value`` is the polarity spread: ``True`` dilates, and ``False`` dilates the *complement* --
+    # a face with an unselected corner clears all three -- which is ``shrink_vertex_mask``'s erosion
+    # without forming the complement on the way in or out.
     f = wp.int32(wp.tid())
     a, b, c = corner_triple(faces, f)
-    if in_mask[a] or in_mask[b] or in_mask[c]:
-        mark_corners(out_mask, 0, a, b, c, wp.bool(True))
+    if in_mask[a] == value or in_mask[b] == value or in_mask[c] == value:
+        mark_corners(out_mask, 0, a, b, c, value)
 
 
 @wp.kernel
@@ -210,112 +281,175 @@ def mark_incident_vertices(
 
 
 @wp.kernel
-def edge_region_counts(
-    inverse: wp.array[wp.int32],
+def mark_region_seam(
+    sorted_keys: wp.array[wp.uint64],
+    order: wp.array[wp.int32],
     face_mask: wp.array[wp.bool],
-    write_region_halfedge: wp.bool,
-    out_count: wp.array[wp.int32],
-    out_region_count: wp.array[wp.int32],
-    out_region_halfedge: wp.array[wp.int32],
+    n: wp.int32,
+    out_flags: wp.array[wp.int32],
 ) -> None:
-    # Per unique edge: total incident-face count, how many of those faces are in the region, and
-    # (only when the caller asked for the oriented form) which halfedge belongs to the region face.
-    # A seam edge has exactly one region-incident face by definition, so no race decides that write;
-    # edges with two or none region-incident faces are not seams and whatever lands there is
-    # discarded downstream. `out_region_halfedge` is `None` and `write_region_halfedge` is `False`
-    # together on the non-oriented path, so this thread never indexes the null array.
+    # One thread per position of the radix-sorted halfedge keys, whose payload is each halfedge's
+    # index (``boundary.face_edge_keys_and_order``): 1 where a run of *exactly two* halfedges starts
+    # -- an interior edge -- whose two faces sit on opposite sides of the region. That is the seam
+    # rule, read off the sort with no unique-edge table and no per-edge counts. The flags are the
+    # ``int32`` the caller scans in place.
     i = wp.int32(wp.tid())
-    e = inverse[i]
-    wp.atomic_add(out_count, e, wp.int32(1))
-    if face_mask[i // 3]:
-        wp.atomic_add(out_region_count, e, wp.int32(1))
-        if write_region_halfedge:
-            out_region_halfedge[e] = i
+    flag = wp.int32(0)
+    if sorted_run_of_length(sorted_keys, n, i, 2):
+        if face_mask[order[i] // 3] != face_mask[order[i + 1] // 3]:
+            flag = wp.int32(1)
+    out_flags[i] = flag
 
 
-@wp.func
-def region_boundary_flag(count: wp.int32, region_count: wp.int32) -> wp.bool:
-    # Interior region-boundary edge: exactly two incident faces, exactly one in the region.
-    return count == 2 and region_count == 1
+@wp.kernel
+def emit_region_seam(
+    inclusive: wp.array[wp.int32],
+    order: wp.array[wp.int32],
+    faces: wp.array[wp.int32],
+    face_mask: wp.array[wp.bool],
+    oriented: wp.bool,
+    out_edges: wp.array2d[wp.int32],
+) -> None:
+    # Where ``mark_region_seam``'s in-place scan steps, write the seam edge at its rank: in
+    # ascending key order, the region face's halfedge -- directed when ``oriented``, which puts the
+    # region on its left, else ascending.
+    i = wp.int32(wp.tid())
+    g, count = scanned_count(inclusive, i)
+    if count == 0:
+        return
+    h = order[i]
+    if not face_mask[h // 3]:
+        h = order[i + 1]
+    a, b = halfedge_endpoints(faces, h)
+    if oriented:
+        out_edges[g, 0] = a
+        out_edges[g, 1] = b
+    else:
+        out_edges[g, 0] = wp.min(a, b)
+        out_edges[g, 1] = wp.max(a, b)
 
 
-@wp.func
-def keep_selected(selected: wp.bool, keep_flag: wp.int32) -> wp.bool:
-    # Stay selected only if the vertex was selected and its component is not fully selected.
-    return selected and keep_flag != 0
+@wp.kernel
+def prehook_face_edges(faces: wp.array[wp.int32], parents: wp.array[wp.int32]) -> None:
+    # ``ecl_init_parent_edges`` over the three directed edges of each face, formed in the thread:
+    # the components are labelled by their smallest vertex whatever the multiplicity and order of
+    # the unions, so the faces' own edges serve without an edge table.
+    f = wp.int32(wp.tid())
+    a, b, c = corner_triple(faces, f)
+    ecl_prehook_pair(parents, a, b)
+    ecl_prehook_pair(parents, b, c)
+    ecl_prehook_pair(parents, c, a)
+
+
+@wp.kernel
+def hook_face_edges(faces: wp.array[wp.int32], parents: wp.array[wp.int32]) -> None:
+    # ``ecl_hook_edges`` over the same face edges, after ``prehook_face_edges`` has finished.
+    f = wp.int32(wp.tid())
+    a, b, c = corner_triple(faces, f)
+    ecl_hook_pair(parents, a, b)
+    ecl_hook_pair(parents, b, c)
+    ecl_hook_pair(parents, c, a)
+
+
+@wp.kernel
+def label_flagged_components(
+    parents: wp.array[wp.int32],
+    flags: wp.array[wp.bool],
+    value: wp.bool,
+    out_labels: wp.array[wp.int32],
+    out_root_flagged: wp.array[wp.bool],
+) -> None:
+    # ``ecl_flatten`` and a per-component flag in one pass: each node's label is its root -- the
+    # smallest node of its component, whatever order the unions ran in -- and a node whose flag
+    # equals ``value`` flags its root in the zeroed ``out_root_flagged``. The per-node answer is
+    # then a read through the node's own label. ``exclude_fully_selected_components`` flags a
+    # component holding an *unselected* vertex; ``faces_left_of_contour`` one holding a seed face.
+    v = wp.int32(wp.tid())
+    root = find_representative(parents, v)
+    out_labels[v] = root
+    if flags[v] == value:
+        out_root_flagged[root] = True
 
 
 @wp.kernel
 def keep_selected_by_component(
     mask: wp.array[wp.bool],
     labels: wp.array[wp.int32],
-    keep: wp.array[wp.int32],
+    keep: wp.array[wp.bool],
     out_mask: wp.array[wp.bool],
 ) -> None:
-    # The per-vertex answer read straight through the vertex's own component label. Done at
-    # Python scope this was a gather -- an ``indexedarray`` view, a cloud-sized allocation and a
-    # launch to materialise it -- handed to a second launch that then compared it against
-    # ``mask``. Both reads are at this thread's own index, so the intermediate never needed to
-    # exist.
+    # Stay selected only if the vertex was selected and its component is not fully selected -- has
+    # at least one unselected vertex. Both reads are at this thread's own index, so the per-vertex
+    # copy of the component flag a Python-scope gather would build never exists.
     v = wp.int32(wp.tid())
-    out_mask[v] = keep_selected(mask[v], keep[labels[v]])
+    out_mask[v] = mask[v] and keep[labels[v]]
 
 
-@wp.kernel
-def keep_component_scatter(
-    mask: wp.array[wp.bool], labels: wp.array[wp.int32], out_keep: wp.array[wp.int32]
-) -> None:
-    # A component is "kept" (not fully selected) if it has at least one unselected vertex.
-    v = wp.int32(wp.tid())
-    if not mask[v]:
-        out_keep[labels[v]] = wp.int32(1)
-
-
-@wp.kernel
-def open_dual_edges_and_seeds(
+@wp.func
+def open_dual_twin(
     faces: wp.array[wp.int32],
     twins: wp.array[wp.int32],
     contour_keys_sorted: wp.array[wp.uint64],
     base: wp.uint64,
-    cursor: wp.array[wp.int32],
-    out_dual_edges: wp.array2d[wp.int32],
-    out_seeds: wp.array[wp.bool],
-) -> None:
-    # One pass over halfedges answers both halves of the fill at once. A halfedge running *along*
-    # the contour in its own direction puts its face on the left, since a face's corners run
-    # counter-clockwise -- so the contour's orientation is the only thing deciding which side is
-    # "left". And an edge on the contour in *either* direction is blocked, so it emits no dual edge.
+    h: wp.int32,
+) -> tuple[wp.bool, wp.int32]:
+    # Halfedge ``h`` against a directed contour. First: does it run *along* the contour in its own
+    # direction? Its face is then on the left, since a face's corners run counter-clockwise -- so
+    # the contour's orientation is the only thing deciding which side is "left". Second: the twin
+    # whose face the dual graph joins to ``h``'s, or ``-1`` -- for a boundary halfedge, for the far
+    # half of an edge (the lower half answers for it, so each dual edge is taken once), and for an
+    # edge on the contour in *either* direction, which is blocked.
     #
-    # Doing it this way rather than through `face_adjacency` is deliberate: the dual graph, the
-    # blocking test and the seeding all come from `twins`, which is one hash-and-group pass instead
-    # of that plus a second key sort over every halfedge and a mask-compact over every dual edge.
-    h = wp.int32(wp.tid())
+    # Everything comes from ``twins`` rather than ``face_adjacency``: one hash-and-group pass
+    # instead of that plus a second key sort over every halfedge.
     tail, tip = halfedge_endpoints(faces, h)
-    forward = pack_directed_key(tail, tip, base)
-    along_contour = binary_search_sorted_contains(contour_keys_sorted, forward)
-    if along_contour:
-        out_seeds[h // 3] = True
-
+    along_contour = binary_search_sorted_contains(
+        contour_keys_sorted, pack_directed_key(tail, tip, base)
+    )
     twin = twins[h]
-    if twin <= h:
-        return  # boundary halfedge, or the far half of an edge the lower half already emitted
-    backward = pack_directed_key(tip, tail, base)
-    if along_contour or binary_search_sorted_contains(contour_keys_sorted, backward):
-        return
-    slot = wp.atomic_add(cursor, 0, 1)
-    out_dual_edges[slot, 0] = h // 3
-    out_dual_edges[slot, 1] = twin // 3
+    open_twin = wp.int32(-1)
+    if twin > h and not along_contour:
+        backward = pack_directed_key(tip, tail, base)
+        if not binary_search_sorted_contains(contour_keys_sorted, backward):
+            open_twin = twin
+    return along_contour, open_twin
 
 
 @wp.kernel
-def mark_labels_of_seeds(
-    labels: wp.array[wp.int32], seeds: wp.array[wp.bool], out_label_seeded: wp.array[wp.bool]
+def seed_and_prehook_dual(
+    faces: wp.array[wp.int32],
+    twins: wp.array[wp.int32],
+    contour_keys_sorted: wp.array[wp.uint64],
+    base: wp.uint64,
+    parents: wp.array[wp.int32],
+    out_seeds: wp.array[wp.bool],
 ) -> None:
-    # One flag per component label, so the per-face answer becomes a gather. Labels name a
-    # representative element, so the flag array is face-indexed rather than 0..k-1.
-    f = wp.int32(wp.tid())
-    if seeds[f]:
-        out_label_seeded[labels[f]] = True
+    # The flood fill's first pass over halfedges: seed the faces left of the contour and pre-hook
+    # the open dual edges into an identity ``parents``. The union-find is per edge and order-free,
+    # so the dual edges are formed in the thread and never listed -- no cursor, no buffer, no
+    # readback to trim one. The pre-hook is ``ecl_init_parent_edges``' and keeps the hook cheap on
+    # long sequential cycles and hub faces.
+    h = wp.int32(wp.tid())
+    along_contour, twin = open_dual_twin(faces, twins, contour_keys_sorted, base, h)
+    if along_contour:
+        out_seeds[h // 3] = True
+    if twin >= 0:
+        ecl_prehook_pair(parents, h // 3, twin // 3)
+
+
+@wp.kernel
+def hook_dual(
+    faces: wp.array[wp.int32],
+    twins: wp.array[wp.int32],
+    contour_keys_sorted: wp.array[wp.uint64],
+    base: wp.uint64,
+    parents: wp.array[wp.int32],
+) -> None:
+    # The hook over the same open dual edges, after ``seed_and_prehook_dual`` has finished.
+    h = wp.int32(wp.tid())
+    _along_contour, twin = open_dual_twin(faces, twins, contour_keys_sorted, base, h)
+    if twin >= 0:
+        ecl_hook_pair(parents, h // 3, twin // 3)
 
 
 @wp.kernel

@@ -346,25 +346,36 @@ def lattice_points(lower: wp.vec3, step: wp.vec3, out_points: wp.array3d[wp.vec3
 
 @wp.kernel
 def bucket_point_slots(
-    slots: wp.array[wp.int32],
+    volume: wp.uint64,
+    points: wp.array[wp.vec3],
     n_voxels: wp.int32,
     write_buckets: wp.bool,
+    out_slots: wp.array[wp.int32],
     out_buckets: wp.array[wp.int32],
+    out_order: wp.array[wp.int32],
     out_counts: wp.array[wp.int32],
 ) -> None:
-    # Points that fall outside the grid go into a sentinel bucket past the last voxel, so they sort
-    # to the end and every real voxel's segment stays contiguous.
+    # Each point's voxel row (``lookup_point_slots``' probe, done here so the pooling pays one
+    # launch for the probe and the histogram) and its count. Points that fall outside the grid go
+    # into a sentinel bucket past the last voxel, so they sort to the end and every real voxel's
+    # segment stays contiguous; their slot stays ``-1``.
     #
-    # ``write_buckets`` is warp-uniform: only the mean/sum pooling branch sorts by bucket, and the
-    # min/max branch wants nothing from this launch but ``out_counts``. Writing the per-point
-    # buckets for it anyway is one ``int32`` per point stored and an allocation to hold them, so
-    # the selector lets that caller pass a length-zero buffer instead of a cloud-sized one.
+    # ``write_buckets`` is warp-uniform: only the mean/sum pooling branch sorts by bucket, and it
+    # hands ``out_buckets`` / ``out_order`` straight to ``radix_sort_pairs`` -- the leading halves
+    # of its two double buffers, keys and identity payload, so the sort needs no key copy and no
+    # separate payload seed (the upper halves are scratch the sort fills before reading). The
+    # min/max branch wants nothing from this launch but the slots and ``out_counts``, so the
+    # selector lets that caller pass length-zero buffers instead of cloud-sized ones.
+    #
+    # A caller that wants the buckets but not the slots passes a length-zero ``out_slots``.
     p = wp.int32(wp.tid())
-    bucket = slots[p]
-    if bucket < 0:
-        bucket = n_voxels
+    slot = point_slot(volume, points[p])
+    if out_slots.shape[0] > 0:
+        out_slots[p] = slot
+    bucket = wp.where(slot < 0, n_voxels, slot)
     if write_buckets:
         out_buckets[p] = bucket
+        out_order[p] = p
     wp.atomic_add(out_counts, bucket, 1)
 
 

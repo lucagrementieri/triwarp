@@ -1037,7 +1037,9 @@ def split_non_manifold_vertices(
     )
     # ECL-CC labels each component by its smallest node id, and a node id *is* a corner, so the
     # representative's vertex is the original this copy came from.
-    representatives, new_faces = tw.grouping.unique_1d(labels, return_inverse=True)
+    representatives, new_faces = tw.grouping.unique_1d(
+        labels, return_inverse=True, max_value=n_corners - 1
+    )
     source = tw.array.gather(faces, representatives)
     return tw.array.gather(vertices, source), new_faces, source
 
@@ -1141,7 +1143,7 @@ def collapse_small_triangles(
             pairs, node_count=n_vertices, validate=False
         )
 
-        unique_labels, inverse = unique_1d(labels, return_inverse=True)
+        unique_labels, inverse = unique_1d(labels, return_inverse=True, max_value=n_vertices - 1)
         unique_indices = tw.grouping.first_occurrence_indices(inverse, int(unique_labels.shape[0]))
         class_vertices = tw.array.gather(current_vertices, unique_indices)
         remapped_faces = tw.array.remap_indices(current_faces, inverse)

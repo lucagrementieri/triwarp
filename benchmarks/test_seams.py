@@ -147,12 +147,13 @@ def test_crease_edges(bench_case: BenchCase) -> None:
 @pytest.mark.parametrize("cut_fraction", [0.25, 1.0])
 def test_cut_along_edges(bench_case: BenchCase, cut_fraction: float) -> None:
     """
-    Twins, key set, corner graph and a components pass over ``3F`` nodes.
+    Twins, key set and a union-find over ``3F`` corners, each halfedge naming one join.
 
     The two fractions are the two ends of the components pass: at ``0.25`` most corners still merge,
-    so the pass contracts ``3F`` nodes down toward ``V``, while at ``1.0`` the corner graph has no
-    edges at all and every node is already its own component. If the second is *faster*, the
-    contraction is the cost and is the thing to attack.
+    so the pass contracts ``3F`` nodes down toward ``V``, while at ``1.0`` every join is a self-loop
+    and every node is already its own component. Both issue the same launches, allocations and
+    readbacks -- the corner graph is formed in the union-find's own threads, never materialised or
+    compacted -- so any gap between them is the hooks' device work.
 
     ``igl.cut_mesh`` is the reference that takes the same *edge set* triwarp does, once it is
     rewritten as the ``(n_faces, 3)`` per-corner bool mask the binding wants -- that rewrite is an
@@ -162,11 +163,8 @@ def test_cut_along_edges(bench_case: BenchCase, cut_fraction: float) -> None:
     vertices against 32 on a cut cube; see ``tests/test_seams.py``), which is what makes the third
     row worth having.
 
-    **The two sides slope in opposite directions across the fraction**, and that is the finding
-    this row adds: triwarp gets *faster* from ``0.25`` to ``1.0`` (the components pass has nothing
-    left to contract when everything is cut) while igl gets slower (its per-corner walk pays for
-    each new vertex it emits). So the contraction really is triwarp's cost here, and it is not a
-    cost igl has.
+    igl gets slower from ``0.25`` to ``1.0``: its per-corner walk pays for each new vertex it
+    emits.
     """
     if bench_case.kind == "igl":
         vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np

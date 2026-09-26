@@ -226,7 +226,10 @@ def _unique_edges_from_keys(
     keys: wp.array[wp.uint64], n_vertices: int, device: wp.DeviceLike
 ) -> tuple[twt.Array2dInt32, wp.array[wp.int32]]:
     """Deduplicate packed edge keys into ``(unique_edges, inverse)``, unpacked by ``n_vertices``."""
-    unique_keys, inverse = tw.grouping.unique_1d(keys, return_inverse=True)
+    # A key is ``min + max * n_vertices``, below ``n_vertices ** 2``, which bounds the sort's bits.
+    unique_keys, inverse = tw.grouping.unique_1d(
+        keys, return_inverse=True, max_value=n_vertices * n_vertices - 1
+    )
 
     # The deduplicated rows are recovered from the keys, not by gathering the corner that first
     # produced each one: the packing is exactly invertible for two columns, so a

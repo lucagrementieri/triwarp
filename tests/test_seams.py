@@ -11,7 +11,7 @@ from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 import triwarp.typing as twt
-from tests.comparisons import lexsort_rows
+from tests.comparisons import lexsort_rows, same_partition
 from tests.conversions import (
     meshlib_bitset_to_numpy,
     meshlib_to_trimesh,
@@ -259,6 +259,58 @@ def test_cut_along_edges_all_interior_edges_gives_a_triangle_soup(
     cut_vertices_wp, cut_faces_wp = tw.seams.cut_along_edges(vertices_wp, faces_wp, all_edges_wp)
     assert int(cut_vertices_wp.shape[0]) == int(faces_wp.shape[0])
     assert _face_component_count(cut_vertices_wp, cut_faces_wp) == int(faces_wp.shape[0]) // 3
+
+
+def test_cut_along_edges_ignores_the_winding(
+    device: str, icosphere_coarse: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
+    """
+    Triwarp against triwarp: reversing some faces' winding does not change which corners merge.
+
+    The cut is defined on undirected edges, so an edge-manifold but inconsistently wound mesh must
+    give the same corner partition as the consistently wound one -- which carries the igl and
+    MeshLib comparisons below. The flipped faces put same-direction twins on every edge they share
+    with an unflipped face, the branch no consistently wound fixture reaches (and which only a
+    caller's own ``twins`` table can reach); a cut that joins the wrong corners there splits or
+    merges vertices the consistent cut does not.
+    """
+    sphere_tm, _sphere_tm_wp = icosphere_coarse
+    faces_np = np.asarray(sphere_tm.faces, dtype=np.int32)
+    flipped = np.arange(faces_np.shape[0]) % 7 == 0
+    flipped_faces_np = faces_np.copy()
+    flipped_faces_np[flipped] = faces_np[flipped][:, [0, 2, 1]]
+    vertices_wp, faces_wp = numpy_to_warp(sphere_tm.vertices, faces_np, device)
+    edges_wp = twt.as_array2d(
+        wp.array(
+            tw.seams.crease_edges(vertices_wp, faces_wp, angle=0.0).numpy()[::3],
+            dtype=wp.int32,
+            device=device,
+        ),
+        wp.int32,
+    )
+    _, cut_faces_wp = tw.seams.cut_along_edges(vertices_wp, faces_wp, edges_wp)
+    _, flipped_faces_wp = numpy_to_warp(sphere_tm.vertices, flipped_faces_np, device)
+    # ``halfedge_twins`` pairs only opposite halfedges and leaves a same-direction edge at ``-1``,
+    # so the table that reaches the same-direction branch is a caller's own, pairing the two
+    # halfedges of each interior edge by their undirected endpoints.
+    corners = np.stack([flipped_faces_np, np.roll(flipped_faces_np, -1, axis=1)], axis=-1)
+    keys_np = np.sort(corners.reshape(-1, 2), axis=1)
+    order = np.lexsort((keys_np[:, 1], keys_np[:, 0]))
+    twins_np = np.full(keys_np.shape[0], -1, dtype=np.int32)
+    first, second = order[0::2], order[1::2]
+    assert np.array_equal(keys_np[first], keys_np[second])  # closed and edge-manifold
+    twins_np[first], twins_np[second] = second, first
+    flipped_twins_wp = wp.array(twins_np, dtype=wp.int32, device=device)
+    _, cut_flipped_wp = tw.seams.cut_along_edges(
+        vertices_wp, flipped_faces_wp, edges_wp, twins=flipped_twins_wp
+    )
+    cut_np = cut_faces_wp.numpy().reshape(-1, 3)
+    # Undo the flip on the output so corner ``(f, k)`` names the same corner in both cuts.
+    cut_flipped_np = cut_flipped_wp.numpy().reshape(-1, 3)
+    cut_flipped_np[flipped] = cut_flipped_np[flipped][:, [0, 2, 1]]
+    n_out = np.unique(cut_np).shape[0]
+    assert sphere_tm.vertices.shape[0] < n_out < cut_np.size
+    assert same_partition(cut_np.ravel(), cut_flipped_np.ravel())
 
 
 def test_cut_along_edges_opens_a_boundary(

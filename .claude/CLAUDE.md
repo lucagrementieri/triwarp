@@ -604,6 +604,14 @@ kernels. Related:
   `binary_search_index_left` is `side="left"` (the exact slot for a present key — use this plus
   `index < n and values[index] == v` for a lookup), and `binary_search_sorted_contains` is
   membership only. Detail and the bug it caused: §16.5.
+- **A radix sort of packed keys whose radix is known passes `end_bit`**, and the producer writes the
+  keys straight into the sort's double-width buffer. `wp.utils.radix_sort_pairs` otherwise orders
+  every bit of the key, at a cost that is mostly fixed per digit pass, so a 64-bit sort of edge
+  keys below `n_vertices ** 2` pays for passes over bits that are always zero -- measured 2.1x on the
+  sort at 24 k keys (§13.1). The permutation is identical (the sort is stable), so it is
+  byte-identical on both devices. `unique_1d(max_value=)`, `adjacency.sorted_face_edge_keys` and
+  `unique_faces(max_index=)` carry the bound through; the pair radix (`INDEX_RADIX_PAIR`) needs all
+  64 bits and gains nothing.
 
 ### 3.2 Typing (`triwarp.typing`)
 
@@ -3771,6 +3779,7 @@ on real wrappers, is only worth 1.00-1.02x — not a lever.)*
 | `wp.utils.array_scan` | 7.1 µs |
 | **`wp.utils.array_sum`** | **39.8 µs — 3.4x a plain launch** |
 | `wp.utils.radix_sort_pairs` | 15.6 (int32) / 18.6 (int64) µs at `n = 1`; 64.3 / 86.1 at 61 440 |
+| `radix_sort_pairs(..., end_bit=b)`, `uint64` keys, graph-replayed | **43.4 against 89.5 µs** at 24 576 keys, 24 bits; 87.8 / 120.7 at 491 520, 34 bits; 310 / 367 at 3 M, 42 bits (§16.23) |
 | a cached `wp.map` call (Python overhead above the kernel) | ~11 µs |
 | a host readback | ~0.1 ms *queued*, **14.3 µs isolated** — the 0.1 ms is the pipeline drain in front of it, not its own cost (§16.7), so price it by what is queued |
 | `wp.synchronize_device` | 1.1 µs |
@@ -4157,6 +4166,16 @@ appends stragglers to a work list, then one warp per straggler. Two levers decli
 `block_dim` (256, the default, wins at every value from 32) and tightening the query margin — the
 vertex bound *equals* the answer to all 16 digits, so the query only confirms what the bound found.
 The imbalance does not necessarily persist at scale (§16.6).
+
+**A BVH walk's device time is sensitive to how its loop is spelled, by up to 5x, with no resource
+difference to show for it** (§16.23). Five count-only walks over one mesh's BVH, identical
+candidates, 37-38 registers, the same 33 KB shared traversal stack and no spills: `mesh_query_aabb`
+with a stored box and no cap 97 us, the same with a literal `c < 32` cap 453 us, `bvh_query_aabb` 522
+us whether its box was stored or formed in the kernel, and `mesh_aabb_collect` (a runtime cap) 98 us
+with a stored box but 455 us with the box formed from the face corners. Not a rule to spell around --
+it is code-generation variance -- but it means **a new or fused walk kernel is timed against the one
+it replaces, on the device**, and it is an open lead for `mesh_to_mesh_distance`, whose
+`bvh_query_aabb` walk is the slow spelling (untested: its narrow phase changes the loop).
 
 ### 14.3 CUDA graph capture
 
@@ -4755,6 +4774,12 @@ inside the worktree — it resolves that copy as its own project and builds a se
   by more than 10x. Take launch counts and device totals from
   `wp.timing_begin(cuda_filter=wp.TIMING_KERNEL | wp.TIMING_MEMSET, synchronize=True)`, and wall time
   from a separate un-instrumented loop.
+
+- **A/B one pytest process per module, never several modules in one process.** An A/B of fifteen
+  benchmark modules in one invocation put ~24 cells under 0.93x -- `face_adjacency_angles[dragon]`
+  0.47x in two separate runs -- and every one was level with its module run alone (§16.23): the
+  arm's timing depended on the allocator and cache state the preceding modules left. The round
+  sweep's `run.sh` is one process per module for this reason; an ad hoc A/B must be too.
 
 ### 15.8 Probe-process contamination
 
@@ -6532,7 +6557,10 @@ shared by four concurrent reviewers (min over alternating processes); probes are
   ring build. `remove_unreferenced_vertices` in one mark, scan and compaction: 1.29-1.55x.
   - **REFUTED -- a hash-only validate for `halfedge_twins`** (directed-edge uniqueness through
     `hashed_occurrence_counts`): 1.26x on bunny, **0.59x on dragon** -- random atomics into a
-    2^23-slot table lose to the radix sort (`r18_twin_validate.txt`).
+    2^23-slot table lose to the radix sort (`r18_twin_validate.txt`). **Specific to that table**:
+    round 20's `point_duplicate_mask` hash (`int32` slots at 2n, one CAS a point) beat two chained
+    sorts at every size to 4 M points, while its region-boundary hash lost 0.74x at `dragon`
+    (§16.23). Probe the table shape; do not generalise either result.
   - Taken instead: `_pair_halfedges` and the two edge-manifold predicates write their keys with
     `adjacency.face_edge_keys` rather than `faces_to_edges` + `hash_indices_rows` -- the fused
     kernel existed and three callers did not use it. `halfedge_twins` 1.13-1.16x byte-identical;
@@ -6653,3 +6681,128 @@ heat family 1.02-1.04x, Chamfer flat. What generalises:
 - Declined, with reasons at the sites: merging `nearest_point_via_mesh` with
   `query_nearest_via_mesh` (a launch argument on a launch-bound k = 1 path, §16.18's 0.96-0.97x),
   merging the Jacobi/dominance kernels behind flags (a shared `jacobi_row` helper instead).
+
+### 16.22 Benchmark round 20 sweep (2026-09-26)
+
+Full sweep at `a2ec2e5` against round 18's at `192406c`: gap 97.2 -> 68.2 ms, 746 wins of 928, no
+regression (the five slower cells re-measured at 1.00-1.02x). The top 39 ms of what remains is
+floors -- list returns, device-bound traversals, and settle solves bound by their round count. Two
+declines, measured (`plans/benchmark-round-20-data/probes/`):
+
+- **Folding a CG round's dots in every block past `CG_FOLD_MAX_BLOCKS = 256` tiles is a loss**,
+  though the unfolded path's third node looks like the cost. On transport's stacked 70 756-row
+  settle solve (277 tiles, just over the cap) a round is 10.4 us `cg_matvec_dots` + 7.2 us
+  `cg_coefficients` + 5.1 us `cg_update`, uncaptured. Raising the cap to 512 / 1 024 or doubling
+  the span until the column fits under 256 blocks measured 0.90-0.97x on transport, 0.82-0.85x on
+  `transport_scale[sphere_med]`, 0.65x at `[sphere_large]` and 0.84-0.86x on
+  `heat_geodesic[sphere_large]`: the redundant per-block fold and per-thread `float64` divisions
+  cost more than the node. An empty in-graph launch is 1.1 us; a `float64` block reduction adds
+  0.9-1.5 us and a `wp.vec3d` one 2.2-3.5 us -- twice a scalar's, the same as three scalars.
+- **The heat Poisson solve's Chebyshev degree is at its optimum.** Degree 2 / 4 / 8 / 12 against
+  Jacobi at 2 562, 40 962 and 163 842 rows: 12 wins or ties (degree 8 is 3 % ahead at 2 562), so the
+  small `heat_geodesic` row's 231 polynomial launches are this method's floor.
+
+### 16.23 Round 20's items and the pass around them (2026-09-26)
+
+Every R20 item landed, byte-identical on the CPU oracle against a detached `a2ec2e5` worktree
+(`/tmp/tw20base`) over ~3 300 outputs in eleven gates; on CUDA the only differences are the ones a
+second baseline run also shows (ear-clip face order, the orientation propagation on `boy` /
+`mobius`, float atomics in `cluster_accumulate` and the remesh passes). Clock: harness A/B, one
+pytest process per module, min of 2 rounds (`plans/benchmark-round-20-data/ab21_*.txt`): median
+1.02x over 566 cells, 51 cells at 1.5x or better, and every cell under 0.93x either re-measured
+level alone or has identical counts and device time in both arms (next paragraph).
+
+- **R20-1** `extrude_polygon` / `sweep_polygon` wall a full `n - 2` triangulation from the ring
+  edges (the derived boundary is the fallback, and still raises `sweep_polygon`'s non-simple-ring
+  `ValueError`): **3.1-3.3x / 2.8x**. `_PARAMETRIC_LATTICE_DEVICE_FROM` fell 9 216 -> 625 samples,
+  re-probed quiet: host and device tie at 400 samples and the device leads from 900.
+- **R20-2** `point_duplicate_mask` is one `atomic_cas` table of `int32` point indices at >= 2n slots,
+  bitwise compare, `atomic_min` to the class's first index: 14 launches / 21 allocs / 2 readbacks ->
+  2 / 3 / 0, **8-12x to 1M points, 33x at 4M, 6.6x on a 1.1M-point axis lattice**
+  (`probes/r20_points_dup_ab.txt`, quiet). `-0.0 == +0.0` and identical NaN rows merge, as before.
+  **So §16.19's "hash loses to sort at the large end" is a fact about that table, not a rule**: the
+  same round's region-boundary hash lost 0.74x at `dragon` (`probes/r20_region_boundary_quiet.txt`)
+  and the sort shipped there. Probe each table shape.
+- **R20-3** `crease_edges` 10 / 16 -> 7 / 9 (one `crease_flags` kernel on
+  `predicates.vector_angle`, the predicate `face_adjacency_angles` already uses): 1.07-1.40x.
+- **R20-4** `boundary_edges` 1.00-1.52x (keys straight from faces, one emit);
+  `region_boundary_edges` 9 / 16 / 2 -> 3 / 4 / 1, **2.54x** (one sort of every halfedge key, the
+  seam a run of two straddling the region).
+- **R20-5** `faces_left_of_contour` hooks faces across twins in the thread -- no dual-edge list,
+  cursor, trim or readback, pre-hook kept (`ecl_prehook_pair` / `ecl_hook_pair`, now shared
+  `@wp.func`s in `connected_components`): **1.51x**.
+- **R20-6** `cluster_decimate` 6 -> 4 readbacks (`unique_faces(max_index=)`, a new public keyword
+  that skips the validating reduction; both counts read from one 2-slot buffer the compaction
+  kernel publishes into a prefix view of a worst-case buffer): 1.05-1.35x.
+- **R20-7** `is_watertight` 21 / 25 / 4 -> 12 / 12 / 2, **1.58-1.65x**; `is_volume` 2.0-2.1x;
+  `is_vertex_manifold` / `is_edge_manifold` 1.4x; `face_self_intersecting_mask` 1.40-1.45x (one
+  fixed-stride broad phase, no count pass, no readback). **Fusing the narrow phase into the walk
+  stays declined, re-measured: 0.91x on `sphere_med`, 0.27x on `tangle_2`.**
+- **R20-8** `mesh_collision_pairs` deep 8 / 11 / 2 -> 4 / 5 / 2, `mesh_with_mesh` 9 / 13 / 3 ->
+  4 / 6 / 2 (narrow phase inside the segment kernel): 1.0-1.4x. `mesh_with_plane` computes the
+  plane dots in-kernel.
+- **R20-9** the discarded `counts_to_offsets` total is gone; no other call site in the tree
+  discards one (22 checked).
+
+**What generalises from the extras** (each byte-identical, counts at the benchmark's point):
+
+- **`radix_sort_pairs(end_bit=)` is the cheapest lever found this round** (§13.1). Taken where a
+  packed key's radix is known: the flip loop's regroup (**88 -> 55 us a replay** on
+  `tangle_torus_small`, 134 -> 108 on `tangle_torus`; §20.3's lead is priced and closed below),
+  `sorted_undirected_edge_keys`, the deleted-face keys, the voxel buckets, the candidate-triangle
+  keys, and `unique_1d(max_value=)` -- a new public keyword `edges_unique`, `unique_faces`,
+  `cluster_decimate`, `split_nonmanifold`'s labels and `submeshes_from_face_groups` pass. The pair
+  radix (`INDEX_RADIX_PAIR`) needs all 64 bits, so a function with no vertex bound gains nothing.
+- **`adjacency.sorted_face_edge_keys(faces, *, n_vertices=None)`** (new, public) names the run four
+  modules repeated: pack straight into the sort's double-width buffer -- no staging copy, which at
+  `lucy` is 670 MB -- and sort only the bits a known radix needs. `face_adjacency(edges_paired=)`,
+  `halfedge_twins`, `face_connected_component_labels` and `validation`'s sorted keys use it.
+- **`face_connected_component_labels` hooks the union-find straight off the sorted keys**
+  (`sorted_pair_prehook` / `sorted_pair_hook`): no compaction, no readback, no edge table.
+  1.46-2.39x to `happy_buddha`; the first cut wrote a `(3n, 2)` edge table and read **0.80x at
+  `lucy`**, the key staging copy was another 0.07, and it is 0.97x there now. A saving that removes
+  a readback and adds `O(n)` traffic shrinks with the mesh and can invert: measure the top of the
+  axis.
+- `cut_along_edges` 14 / 23 / 3 -> 9 / 12 / 2 (union-find over halfedges; the root-flag scan's
+  ascending ranks *are* `unique_1d`'s sorted inverse): 1.64-1.99x. `isotropic_remesh` ~15 readbacks
+  fewer on the saddles (the collapse pass shares `cluster_decimate`'s compaction): 1.11-1.13x.
+  `statistical_outlier_mask` 3 -> 1 readbacks (a `float64` device threshold; can move an ulp,
+  identical on 30 masks): 1.26-1.44x. `fit_plane` / `principal_axes` fold the centroid division
+  into their consumers. `voxel_down_sample` 2 -> 1 readbacks. `unique_1d` one allocation fewer
+  everywhere. `kernels/triangles.sort_face_indices` deleted (no caller left).
+
+**The cells that read slower, and why none is code.** A first A/B ran all fifteen modules in one
+pytest process and showed ~24 cells under 0.93x -- `face_adjacency_angles[dragon]` 0.47x twice,
+`mean_edge_length[dragon]` 0.61x twice, a dozen more. **Every one of them is level when its module
+runs in its own process** (0.96-1.14x); the round's sweep is one process per module for this reason,
+and a multi-module A/B inherits the preceding modules' allocator and cache state, so a cell's arm
+depends on what ran before it. Of 366 per-module cells, two stayed under 0.93x across three runs
+(`radius_outlier_mask[sphere_small 4.0]` 0.86x, `intrinsic_delaunay[sphere_large]` 0.91x); both
+have identical launch, allocation and readback counts and identical device time in the census,
+and `radius_outlier_mask`'s code is untouched -- order effects inside the module.
+
+**Two traps the pass hit, both caught by re-measuring rather than trusting the report:**
+
+- **A BVH walk's box formed in the kernel from the face corners was 4.5x slower than the identical
+  walk reading a stored box** -- same candidates, same registers (37-38), no spills. Two reviewers
+  fused the box into their broad phases independently and both were device regressions
+  (`face_self_intersecting_mask` 0.27 -> 0.53 ms, `mesh_collision_pairs` deep 0.16 -> 0.29 ms)
+  hidden under a host saving. Both now launch `triangles.face_aabb_bounds` first (4 us). The cause
+  is not the box: across five spellings of one walk over the same BVH the time ranged 97-523 us
+  (`mesh_query_aabb` vs `bvh_query_aabb`, a literal vs a runtime cap), which is nvcc code-generation
+  variance rather than a rule (§14.2). **Time a new BVH-walk kernel against its predecessor's
+  device time; never assume a fusion that removes a launch is free on the device.**
+- **Four of seven reviewers stopped mid-edit on an API spend limit**, and a docstring rewrap one of
+  them ran had folded function bodies into two docstrings (`tests/test_creation.py`,
+  `benchmarks/test_creation.py`) -- `SyntaxError`, found only when the suite collected. After any
+  bulk docstring edit, `ast.parse` every changed file; after an interrupted pass, re-run every
+  gate against the final tree, since a reviewer's saved `new` outputs describe a mid-state.
+
+**Platform facts the pass confirmed** (both devices): a kernel-scope `wp.array2d` indexed once
+(`table[1]`) is a contiguous rank-1 view that can be handed to a `@wp.func` taking a `wp.array`,
+and writes through it land in the parent -- which lets a helper that emits into a flat buffer
+(`proximity.mesh_aabb_collect`) fill one row of a `(2, n)` pair table with no expansion pass; a
+Python-scope gather (`wp.indexedarray`) passes straight to a kernel parameter annotated
+`wp.indexedarray[T]`, removing the gather copy when the consumer only reads; `wp.copy`'s offsets on
+a contiguous rank-2 array count scalar elements, not rows; and `.numpy()` on a strided column view
+is one readback plus an internal contiguous copy.

@@ -468,7 +468,6 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
         {"new_cand", "new_count", "new_opp", "new_src", "new_state", "new_tgt"}
     ),
     ("energies", "scatter_edge_halfedges"): frozenset({"cursor"}),
-    ("selection", "open_dual_edges_and_seeds"): frozenset({"cursor"}),
     ("repair", "emit_degree3_replacement"): frozenset({"cursor"}),
     ("repair", "emit_straighten_faces"): frozenset({"cursor"}),
     # ``counter`` and ``overflow`` are the work list the capped first pass hands the tiled second
@@ -488,9 +487,6 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     # the prolongation smoother's ``-w D^-1 (A P0)`` is a row scaling of a product that has just
     # been built and is not needed unscaled.
     ("algorithms.multigrid", "scale_rows"): frozenset({"values"}),
-    # ``parents`` is the union-find forest, pre-hooked in place from the identity the caller built
-    # and then handed to ``ecl_hook_edges`` -- the same buffer before and after, not an answer.
-    ("algorithms.connected_components", "ecl_init_parent_edges"): frozenset({"parents"}),
     # ``state`` is the ``wp.capture_while`` loop's own [rounds run, condition] pair, read and
     # incremented across launches -- the ``rdp_begin_round`` / ``rdp_split_spans`` case below,
     # under the same name.

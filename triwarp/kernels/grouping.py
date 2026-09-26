@@ -1,7 +1,8 @@
 import warp as wp
 
 from triwarp.kernels import array as kernel_array
-from triwarp.kernels.array import OverloadTable
+from triwarp.kernels.array import OverloadTable, sort3
+from triwarp.kernels.triangles import corner_triple
 
 
 @wp.kernel
@@ -23,6 +24,25 @@ def sorted_run_start(sorted_values: wp.array[wp.Int], i: wp.int32) -> wp.bool:
     if i == 0:
         return True
     return sorted_values[i] != sorted_values[i - 1]
+
+
+@wp.func
+def sorted_run_of_length(
+    sorted_values: wp.array[wp.Int], n: wp.int32, i: wp.int32, length: wp.int32
+) -> wp.bool:
+    # Does position ``i`` begin a run of *exactly* ``length`` equal values among the first ``n``?
+    # ``mark_group_starts``' rule as a function, for the kernels that read the verdict at a sorted
+    # position without materializing a flag array first (``boundary``'s halfedge masks,
+    # ``selection``'s region seam).
+    if i + length > n:
+        return False  # run would extend past the data
+    if not sorted_run_start(sorted_values, i):
+        return False  # not the start of a run
+    if sorted_values[i] != sorted_values[i + length - 1]:
+        return False  # run shorter than ``length``
+    if i + length < n and sorted_values[i] == sorted_values[i + length]:
+        return False  # run longer than ``length``
+    return True
 
 
 @wp.kernel
@@ -288,6 +308,16 @@ def pack_undirected_edge_keys(
     out_keys[i] = kernel_array.pack_edge_key(edges[i, 0], edges[i, 1], base)
 
 
+@wp.func
+def pack_index_digit(
+    packed: wp.uint64, power: wp.uint64, value: wp.int32, max_index: wp.uint64
+) -> tuple[wp.uint64, wp.uint64]:
+    # One digit of the mixed-radix row key: ``value`` (reinterpreted as ``uint32``) times the
+    # running ``power`` of the radix, and the power for the next digit. Every row packing in this
+    # module accumulates through it, so the keys agree bit for bit whatever the caller's layout.
+    return packed + wp.uint64(wp.uint32(value)) * power, power * max_index
+
+
 @wp.kernel
 def pack_indices(
     indices: wp.array2d[wp.int32], max_index: wp.uint64, out_packed: wp.array[wp.uint64]
@@ -297,11 +327,28 @@ def pack_indices(
     packed_value = wp.uint64(0)
     power = wp.uint64(1)
     for i in range(indices_row.shape[0]):
-        digit = wp.uint64(wp.uint32(indices_row[i]))
-        packed_value = packed_value + digit * power
-        power = power * max_index
+        packed_value, power = pack_index_digit(packed_value, power, indices_row[i], max_index)
 
     out_packed[tid] = packed_value
+
+
+@wp.kernel
+def pack_sorted_face_keys(
+    faces: wp.array[wp.int32], max_index: wp.uint64, out_packed: wp.array[wp.uint64]
+) -> None:
+    # A face's orientation-free key: its three corners in ascending order, packed as
+    # ``pack_indices`` packs a three-column row. Sorting in registers and packing in the same
+    # thread drops the ``(n, 3)`` table of sorted rows a separate sort launch would write for this
+    # one to read.
+    f = wp.int32(wp.tid())
+    a, b, c = corner_triple(faces, f)
+    s0, s1, s2 = sort3(a, b, c)
+    packed = wp.uint64(0)
+    power = wp.uint64(1)
+    packed, power = pack_index_digit(packed, power, s0, max_index)
+    packed, power = pack_index_digit(packed, power, s1, max_index)
+    packed, power = pack_index_digit(packed, power, s2, max_index)
+    out_packed[f] = packed
 
 
 @wp.kernel

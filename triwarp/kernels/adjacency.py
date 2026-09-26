@@ -1,6 +1,7 @@
 import warp as wp
 
 from triwarp.constants import FLOAT32_INF_CONSTANT
+from triwarp.kernels.algorithms.connected_components import ecl_hook_pair, ecl_prehook_pair
 from triwarp.kernels.array import pack_edge_key
 from triwarp.kernels.predicates import vector_angle
 from triwarp.kernels.triangles import corner_triple
@@ -40,6 +41,47 @@ def face_edge_keys(
     # keys over a fixed-capacity buffer, differing only in a sentinel key past the live faces.
     f = wp.int32(wp.tid())
     write_face_edge_keys(faces, f, 3 * f, base, out_keys)
+
+
+@wp.func
+def sorted_pair_slot(sorted_keys: wp.array[wp.uint64], i: wp.int32) -> tuple[wp.int32, wp.bool]:
+    """
+    Classify sorted position ``i`` of the packed halfedge keys by the run of equal keys it is in.
+
+    Returns ``(first, unpaired_start)``: ``first`` is the sorted position of the first member when
+    ``i`` belongs to a run of *exactly* two keys -- one undirected edge shared by two faces, the
+    rows ``grouping.group(keys, 2)`` emits and so the rows of ``face_adjacency`` -- and ``-1``
+    otherwise; ``unpaired_start`` is ``True`` on the first position of every other run (a boundary
+    edge, or one shared by three or more faces), so a kernel can flag a non-paired edge exactly
+    once. A kernel launched over every sorted position can therefore act on each adjacency pair
+    with no compacted pair table and no host read of its length. Every neighbour read is guarded
+    by its own branch, because a kernel-scope ``and`` does not short-circuit.
+    """
+    n = sorted_keys.shape[0]
+    key = sorted_keys[i]
+    prev_same = wp.bool(False)
+    if i > 0:
+        prev_same = sorted_keys[i - 1] == key
+    next_same = wp.bool(False)
+    if i + 1 < n:
+        next_same = sorted_keys[i + 1] == key
+    first = wp.int32(-1)
+    unpaired_start = wp.bool(False)
+    if not prev_same:
+        third_same = wp.bool(False)
+        if i + 2 < n:
+            third_same = sorted_keys[i + 2] == key
+        if next_same and not third_same:
+            first = i
+        else:
+            unpaired_start = True
+    elif not next_same:
+        before_same = wp.bool(False)
+        if i > 1:
+            before_same = sorted_keys[i - 2] == key
+        if not before_same:
+            first = i - 1
+    return first, unpaired_start
 
 
 @wp.func
@@ -118,6 +160,42 @@ def edge_pairs_to_face_pairs_and_table_edges(
     first = edge_groups[tid, 0]
     out_edges[tid, 0] = edges_sorted[first, 0]
     out_edges[tid, 1] = edges_sorted[first, 1]
+
+
+@wp.func
+def sorted_pair_faces(
+    sorted_keys: wp.array[wp.uint64], order: wp.array[wp.int32], i: wp.int32
+) -> tuple[wp.int32, wp.int32]:
+    # The face-adjacency graph as one edge per sorted halfedge, for a union-find: a pair's first
+    # member gives the ``edge_pairs_to_face_pairs`` pair, every other position a self-loop on its
+    # own face, which the union-find ignores. No pair table is compacted, so nothing is sized by a
+    # host read, and the labels -- each component's smallest face id -- are the ones the compacted
+    # adjacency gives.
+    first, _unpaired_start = sorted_pair_slot(sorted_keys, i)
+    f0 = order[i] // 3
+    f1 = f0
+    if first == i:
+        f1 = order[i + 1] // 3
+    return f0, f1
+
+
+@wp.kernel
+def sorted_pair_prehook(
+    sorted_keys: wp.array[wp.uint64], order: wp.array[wp.int32], parents: wp.array[wp.int32]
+) -> None:
+    # ``connected_components.ecl_init_parent_edges`` over ``sorted_pair_faces``' edges, formed in
+    # the thread: no ``(3 n_faces, 2)`` edge table is written only to be read back twice.
+    f0, f1 = sorted_pair_faces(sorted_keys, order, wp.int32(wp.tid()))
+    ecl_prehook_pair(parents, f0, f1)
+
+
+@wp.kernel
+def sorted_pair_hook(
+    sorted_keys: wp.array[wp.uint64], order: wp.array[wp.int32], parents: wp.array[wp.int32]
+) -> None:
+    # ``connected_components.ecl_hook_edges`` over the same edges, after ``sorted_pair_prehook``.
+    f0, f1 = sorted_pair_faces(sorted_keys, order, wp.int32(wp.tid()))
+    ecl_hook_pair(parents, f0, f1)
 
 
 @wp.func

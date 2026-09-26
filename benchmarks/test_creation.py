@@ -60,11 +60,10 @@ its cost is the host-side allocation and launch floor every triwarp wrapper shar
 therefore wins at a low section count and loses by orders of magnitude at a high one, and open3d's
 tight C++ loops win outright at small sizes while falling behind above a few thousand sections.
 
-The parametric-surface groups are flat for the same reason above
-``creation._PARAMETRIC_LATTICE_DEVICE_FROM``. The bottom of their axis sits *below* that gate,
-where the device path's flat floor of launches and readbacks loses to the host build — the
-dispatch is what keeps both ends. ``icosphere`` generates its connectivity in closed form, so it is
-``subdivisions + 2`` launches and sits on the same floor.
+The parametric-surface groups are flat for the same reason: every resolution they time sits above
+``creation._PARAMETRIC_LATTICE_DEVICE_FROM``, where the device lattice's flat floor of launches and
+readbacks beats the host build, which is quadratic in the resolution. ``icosphere`` generates its
+connectivity in closed form, so it is ``subdivisions + 2`` launches and sits on the same floor.
 
 ``extrude_polygon`` only ever exercises the *convex* fast path (a single fan), which is why the ear
 clipper is benchmarked directly on a non-convex star ring — the same reasoning that gives
@@ -725,12 +724,11 @@ def test_parametric_surface(bench_lib: BenchLibrary, surface: str, resolution: i
     lattice does the most identification work, and ``dini`` is a plain open patch that does none.
     The axis is the resolution, quadratic in both.
 
-    **Below the device gate the triwarp side is host-bound and the module docstring's floor does
-    not apply**: nearly all of the call is ``_parametric_lattice``'s NumPy -- a ``meshgrid``, the
-    canonicalising ``where`` chain and one ``np.unique`` over ``resolution ** 2`` keys -- against
-    one launch to evaluate the map. Read a change in this group as a change to the host prologue
-    unless the sample count is small. VTK evaluates its map in a per-point C++ loop and then *welds
-    by distance*, which is the part triwarp does combinatorially and for free.
+    Every resolution here is above the device gate, so the triwarp side is the device lattice's flat
+    floor: one launch marking the canonical keys and the surviving triangles, one scan, two
+    readbacks sizing the outputs, one launch emitting them and one evaluating the map. VTK evaluates
+    its map in a per-point C++ loop and then *welds by distance*, which is the part triwarp does
+    combinatorially and for free.
     """
     if bench_lib.kind == "pyvista":
         name = "ParametricBoy" if surface == "boy" else "ParametricDini"

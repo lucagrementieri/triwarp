@@ -395,6 +395,30 @@ def test_is_edge_manifold_radix_is_invariant_to_an_oversized_base(
     assert answers == ({True} if allow_boundary_edges else {True, False})
 
 
+@pytest.mark.parametrize(("offset", "n_vertices"), [(-100, None), (0, "tight")])
+def test_is_edge_manifold_rejects_out_of_range_indices(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh], offset: int, n_vertices: str | None
+) -> None:
+    """
+    Not a library comparison: the documented ``ValueError`` from the folded range check.
+
+    The check rides on the key pass: a negative index with no bound given, and an index reaching a
+    given bound, both raise, while ``validate=False`` skips it and a valid buffer passes it.
+    """
+    mesh_tm, mesh_wp = icosahedron
+    faces_np = mesh_tm.faces.astype(np.int32).ravel()
+    bad_np = faces_np.copy()
+    bad_np[4] = offset if offset < 0 else len(mesh_tm.vertices)
+    bound = None if n_vertices is None else len(mesh_tm.vertices)
+    bad_wp = wp.array(bad_np, dtype=wp.int32, device=mesh_wp.device)
+    with pytest.raises(ValueError, match="faces must be non-negative indices"):
+        tw.validation.is_edge_manifold(bad_wp, n_vertices=bound)
+    if offset < 0:
+        # Unvalidated, the negative index is packed like any other and the call returns.
+        assert isinstance(tw.validation.is_edge_manifold(bad_wp, validate=False), bool)
+    assert tw.validation.is_edge_manifold(mesh_wp.indices, n_vertices=bound)
+
+
 def test_is_vertex_manifold_precomputed_shortcut(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     _, mesh_wp = icosahedron
     adjacency, adjacency_edges = tw.adjacency.face_adjacency(mesh_wp.indices, return_edges=True)

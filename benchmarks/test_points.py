@@ -668,11 +668,10 @@ def test_radius_outlier_mask(bench_case: BenchCase, radius_scale: float) -> None
 @pytest.mark.benchlibs("triwarp", "open3d", "meshlib")
 def test_point_duplicate_mask(bench_case: BenchCase) -> None:
     """
-    Exact positional dedup: two ``unique_1d`` rounds over 64-bit keys, then a first-occurrence pass.
+    Exact positional dedup: one hashed pass over a table of point indices, then a mask launch.
 
-    The most expensive of the module's four masks and the only one that is not a single map -- two
-    open-addressing hash builds and two sorts of the unique values, so it is the row to read for a
-    change to ``grouping``'s uniqueness machinery from the point-cloud side.
+    Two launches and two allocations with no readback: each point probes an open-addressing table,
+    compares a candidate's bits against its own, and lowers its class slot to the smallest index.
 
     open3d's ``remove_duplicated_points`` answers the same question with an
     ``unordered_map<Vector3d>`` on one core and copies the survivors out; the mask here is compared
@@ -685,11 +684,6 @@ def test_point_duplicate_mask(bench_case: BenchCase) -> None:
     tree rather than a hash, so unlike the other two rows its cost is a *search* -- which is why
     the tree is dropped per round the way the ``nearest_neighbor_distance`` row drops it, rather
     than being reused across rounds and pricing the query alone.
-
-    At the large end triwarp leads both references by several times, but at the small end it is
-    several times behind them -- the two hash builds and two sorts have a fixed cost the reference
-    searches do not, so this group's ratio *inverts* below a few thousand points. That is the shape
-    to watch here rather than the large-cloud number.
     """
     if bench_case.kind == "meshlib":
         cloud_ml = _cloud_ml(bench_case)  # held in a name: MeshLib's trees point into it

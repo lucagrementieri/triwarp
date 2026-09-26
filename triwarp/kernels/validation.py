@@ -1,19 +1,69 @@
 import warp as wp
 
 from triwarp.constants import INT32_MAX_CONSTANT
+from triwarp.kernels.adjacency import edge_endpoints, sorted_pair_slot, write_face_edge_keys
+from triwarp.kernels.intersection import candidate_pair_intersects
 from triwarp.kernels.predicates import vector_angle
+from triwarp.kernels.proximity import mesh_aabb_collect
+
+
+@wp.func
+def directed_edge(
+    faces: wp.array[wp.int32], edges: wp.array2d[wp.int32], e: wp.int32
+) -> tuple[wp.int32, wp.int32]:
+    """
+    Endpoints of directed edge ``e`` in ``faces_to_edges`` row order.
+
+    The caller's table row when ``edges`` is given, else corner ``e % 3`` of face ``e // 3`` read
+    off ``faces`` -- the row that table would hold. ``edges`` is a null descriptor (shape 0) when
+    the caller passed none.
+    """
+    if edges.shape[0] > 0:
+        return edges[e, 0], edges[e, 1]
+    base = (e // 3) * 3
+    corner = e % 3
+    return faces[base + corner], faces[base + (corner + 1) % 3]
 
 
 @wp.kernel
 def edge_pair_winding_mask(
+    faces: wp.array[wp.int32],
     edges: wp.array2d[wp.int32],
     edge_groups: wp.array2d[wp.int32],
     out_consistent: wp.array[wp.bool],
 ) -> None:
     tid = wp.int32(wp.tid())
-    i0 = edge_groups[tid, 0]
-    i1 = edge_groups[tid, 1]
-    out_consistent[tid] = edges[i0, 1] == edges[i1, 0]
+    _a0, b0 = directed_edge(faces, edges, edge_groups[tid, 0])
+    a1, _b1 = directed_edge(faces, edges, edge_groups[tid, 1])
+    out_consistent[tid] = b0 == a1
+
+
+@wp.kernel
+def sorted_pair_winding_violation(
+    faces: wp.array[wp.int32],
+    edges: wp.array2d[wp.int32],
+    sorted_keys: wp.array[wp.uint64],
+    order: wp.array[wp.int32],
+    require_pairs: wp.bool,
+    out_violation: wp.array[wp.int32],
+) -> None:
+    """
+    Raise ``out_violation[0]`` when a shared edge's two faces traverse it the same way.
+
+    ``edge_pair_winding_mask``'s per-pair test, read straight off the sorted keys (each pair's
+    first member does it), so a predicate needs no compacted group table and no host read of its
+    length. With ``require_pairs`` a run that is not exactly two keys also raises the flag: the
+    "every edge shared by exactly two faces" half of ``is_volume``.
+    """
+    i = wp.int32(wp.tid())
+    first, unpaired_start = sorted_pair_slot(sorted_keys, i)
+    if unpaired_start and require_pairs:
+        out_violation[0] = 1
+    if first == i:
+        _a0, b0 = directed_edge(faces, edges, order[i])
+        a1, _b1 = directed_edge(faces, edges, order[i + 1])
+        if b0 != a1:
+            out_violation[0] = 1
 
 
 @wp.func
@@ -45,6 +95,30 @@ def edge_manifold(count: wp.int32, allow_boundary: wp.bool) -> wp.bool:
     if allow_boundary:
         return count <= wp.int32(2)
     return count == wp.int32(2)
+
+
+@wp.kernel
+def face_edge_keys_checked(
+    faces: wp.array[wp.int32],
+    base: wp.uint64,
+    bound: wp.int32,
+    out_keys: wp.array[wp.uint64],
+    out_flags: wp.array[wp.int32],
+) -> None:
+    """
+    ``adjacency.face_edge_keys`` plus the range check of the indices it packs.
+
+    Raises ``out_flags[1]`` when a corner index is negative or reaches ``bound``, so the check
+    rides on the pass that reads the faces anyway and shares the verdict's readback, where a
+    separate ``reduce.minmax`` would add a launch and a readback of its own. ``out_flags[0]`` is
+    left to ``edge_share_count_violation``.
+    """
+    f = wp.int32(wp.tid())
+    write_face_edge_keys(faces, f, 3 * f, base, out_keys)
+    for k in range(3):
+        v = faces[3 * f + k]
+        if v < 0 or v >= bound:
+            out_flags[1] = 1
 
 
 @wp.kernel
@@ -96,6 +170,16 @@ def face_edge_manifold_mask(
     )
 
 
+@wp.func
+def corner_link(
+    faces: wp.array[wp.int32], f0: wp.int32, f1: wp.int32, v: wp.int32
+) -> tuple[wp.int32, wp.int32]:
+    """Link the ``v`` corners of edge-adjacent faces ``f0`` and ``f1`` in the corner graph."""
+    return wp.int32(3) * f0 + local_index(faces, f0, v), wp.int32(3) * f1 + local_index(
+        faces, f1, v
+    )
+
+
 @wp.kernel
 def build_corner_adjacency_edges(
     faces: wp.array[wp.int32],
@@ -114,16 +198,50 @@ def build_corner_adjacency_edges(
     r = wp.int32(wp.tid())
     f0 = adjacency[r, 0]
     f1 = adjacency[r, 1]
-    a = adjacency_edges[r, 0]
-    b = adjacency_edges[r, 1]
-    la0 = local_index(faces, f0, a)
-    la1 = local_index(faces, f1, a)
-    lb0 = local_index(faces, f0, b)
-    lb1 = local_index(faces, f1, b)
-    out_edges[2 * r, 0] = wp.int32(3) * f0 + la0
-    out_edges[2 * r, 1] = wp.int32(3) * f1 + la1
-    out_edges[2 * r + 1, 0] = wp.int32(3) * f0 + lb0
-    out_edges[2 * r + 1, 1] = wp.int32(3) * f1 + lb1
+    a0, a1 = corner_link(faces, f0, f1, adjacency_edges[r, 0])
+    b0, b1 = corner_link(faces, f0, f1, adjacency_edges[r, 1])
+    out_edges[2 * r, 0] = a0
+    out_edges[2 * r, 1] = a1
+    out_edges[2 * r + 1, 0] = b0
+    out_edges[2 * r + 1, 1] = b1
+
+
+@wp.kernel
+def corner_edges_from_sorted_keys(
+    faces: wp.array[wp.int32],
+    sorted_keys: wp.array[wp.uint64],
+    order: wp.array[wp.int32],
+    require_pairs: wp.bool,
+    out_edges: wp.array2d[wp.int32],
+    out_violation: wp.array[wp.int32],
+) -> None:
+    """
+    Corner-graph edges read straight off the sorted halfedge keys, one per sorted position.
+
+    ``build_corner_adjacency_edges`` with no face-adjacency table between them.
+
+    Both members of an exact pair write one link each at their own slot -- the pair's first
+    shared-edge endpoint from its first member, the second from its second -- which are the two
+    links the adjacency row would have produced, taken from the same first-member edge. Every
+    other position writes a self-loop, a no-op to the union-find, so the buffer needs no
+    compaction and its size is known without a host read. The component labels are each
+    component's smallest corner id whatever order or multiplicity the unions come in, so they
+    equal the adjacency path's exactly. With ``require_pairs`` a run that is not exactly two keys
+    raises ``out_violation[0]``: the edge half of ``is_watertight``, folded into the same pass.
+    """
+    i = wp.int32(wp.tid())
+    first, unpaired_start = sorted_pair_slot(sorted_keys, i)
+    if unpaired_start and require_pairs:
+        out_violation[0] = 1
+    if first < 0:
+        out_edges[i, 0] = i
+        out_edges[i, 1] = i
+        return
+    e0 = order[first]
+    a, b = edge_endpoints(faces, e0)
+    c0, c1 = corner_link(faces, e0 // 3, order[first + 1] // 3, wp.where(i == first, a, b))
+    out_edges[i, 0] = c0
+    out_edges[i, 1] = c1
 
 
 @wp.kernel
@@ -181,6 +299,87 @@ def vertex_manifold_violation(
 
 
 @wp.kernel
+def collect_self_intersection_candidates(
+    mesh_id: wp.uint64,
+    face_lower: wp.array[wp.vec3],
+    face_upper: wp.array[wp.vec3],
+    max_hits: wp.int32,
+    out_targets: wp.array[wp.int32],
+    out_counts: wp.array[wp.int32],
+) -> None:
+    """
+    Broad phase of a mesh's self-intersection test: face ``f``'s candidates at ``f * max_hits``.
+
+    One traversal per face over its own bounding box, taking at most ``max_hits`` candidates in
+    traversal order (``proximity.mesh_aabb_collect``, the same walk and the same cap as
+    ``proximity.query_mesh_aabb_count`` / ``query_mesh_aabb_neighbors``), written into a
+    fixed-stride slot block. The fixed stride is what spares the count pass, the scan and the
+    host read of the total that a packed candidate list needs, and the second traversal that
+    fills it; the unused tail of each block is simply never read.
+
+    The boxes are ``triangles.face_aabb_bounds``' stored buffers, not formed here from the
+    corners: the identical walk over the identical candidates measured several times slower with
+    the box formed in the kernel.
+    """
+    f = wp.int32(wp.tid())
+    out_counts[f] = mesh_aabb_collect(
+        mesh_id, face_lower[f], face_upper[f], max_hits, wp.bool(True), f * max_hits, out_targets
+    )
+
+
+@wp.kernel
+def self_intersection_marks(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    targets: wp.array[wp.int32],
+    counts: wp.array[wp.int32],
+    max_hits: wp.int32,
+    mark_faces: wp.bool,
+    out_marks: wp.array[wp.bool],
+) -> None:
+    """
+    Narrow phase over ``collect_self_intersection_candidates``' slot blocks, one thread per slot.
+
+    ``intersection.candidate_pair_intersects`` decides each live candidate. ``mark_faces`` selects
+    the answer: the per-face mask marks both faces of every intersecting candidate (idempotent
+    ``True`` stores); the predicate stores ``True`` at ``out_marks[0]``, and a thread finding the
+    flag already raised skips its test. One kernel serves both, so the mask and the predicate
+    cannot disagree about a pair. The narrow phase stays one thread per pair rather than inside
+    the traversal: fused, a thread runs up to ``max_hits`` ``float64`` tests serially while holding
+    the traversal state, and measured several times slower.
+    """
+    s = wp.int32(wp.tid())
+    f = s // max_hits
+    if s % max_hits >= counts[f]:
+        return
+    if not mark_faces:
+        if out_marks[0]:
+            return
+    target = targets[s]
+    if candidate_pair_intersects(vertices, faces, vertices, faces, f, target):
+        if mark_faces:
+            out_marks[f] = True
+            out_marks[target] = True
+        else:
+            out_marks[0] = True
+
+
+@wp.func
+def pair_flip_sign(
+    faces: wp.array[wp.int32], f0: wp.int32, f1: wp.int32, a: wp.int32, b: wp.int32
+) -> wp.int32:
+    """
+    Z2 flip bit of an edge-adjacent face pair sharing edge ``(a, b)``.
+
+    ``0`` when the two faces traverse it in opposite directions (compatible orientations), ``1``
+    when a flip is required.
+    """
+    d0 = edge_forward_in_face(faces, f0, a, b)
+    d1 = edge_forward_in_face(faces, f1, a, b)
+    return wp.where(d0 == d1, wp.int32(1), wp.int32(0))
+
+
+@wp.kernel
 def build_signed_face_edges(
     faces: wp.array[wp.int32],
     adjacency: wp.array2d[wp.int32],
@@ -188,28 +387,47 @@ def build_signed_face_edges(
     out_edges: wp.array2d[wp.int32],
     out_sign: wp.array[wp.int32],
 ) -> None:
-    """
-    Face-pair edges with a Z2 flip bit for orientability propagation.
-
-    ``sign == 0`` when the two faces already traverse the shared edge in opposite
-    directions (compatible orientations), ``sign == 1`` when a flip is required.
-    """
-    # The five opening statements match ``build_corner_adjacency_edges`` above, and that is
-    # *not* an unfactored duplicate: they are this kernel's own argument list unpacked -- the
-    # adjacency row's two faces and the two endpoints of the edge they share -- so a shared
-    # ``@wp.func`` would name what the two signatures already say and cost a longer call than the
-    # four reads it replaced. The two kernels diverge at the line after, which is the whole point
-    # of each.
+    """Face-pair edges with a Z2 flip bit (``pair_flip_sign``) for orientability propagation."""
     r = wp.int32(wp.tid())
     f0 = adjacency[r, 0]
     f1 = adjacency[r, 1]
-    a = adjacency_edges[r, 0]
-    b = adjacency_edges[r, 1]
-    d0 = edge_forward_in_face(faces, f0, a, b)
-    d1 = edge_forward_in_face(faces, f1, a, b)
     out_edges[r, 0] = f0
     out_edges[r, 1] = f1
-    out_sign[r] = wp.where(d0 == d1, wp.int32(1), wp.int32(0))
+    out_sign[r] = pair_flip_sign(faces, f0, f1, adjacency_edges[r, 0], adjacency_edges[r, 1])
+
+
+@wp.kernel
+def signed_face_edges_from_sorted_keys(
+    faces: wp.array[wp.int32],
+    sorted_keys: wp.array[wp.uint64],
+    order: wp.array[wp.int32],
+    out_edges: wp.array2d[wp.int32],
+    out_sign: wp.array[wp.int32],
+) -> None:
+    """
+    ``build_signed_face_edges`` read straight off the sorted halfedge keys, one edge per position.
+
+    A pair's first member writes the row the adjacency table would hold -- the ascending face pair
+    and the flip bit over its first member's edge -- and every other position a self-loop with
+    sign ``0``, which the parity union-find skips and every orientation satisfies. The pair rows
+    keep their adjacency order, so the unions run in the same sequence as over the compacted table.
+    """
+    i = wp.int32(wp.tid())
+    first, _unpaired_start = sorted_pair_slot(sorted_keys, i)
+    e0 = order[i]
+    if first != i:
+        out_edges[i, 0] = e0 // 3
+        out_edges[i, 1] = e0 // 3
+        out_sign[i] = 0
+        return
+    g0 = e0 // 3
+    g1 = order[i + 1] // 3
+    f0 = wp.min(g0, g1)
+    f1 = wp.max(g0, g1)
+    a, b = edge_endpoints(faces, e0)
+    out_edges[i, 0] = f0
+    out_edges[i, 1] = f1
+    out_sign[i] = pair_flip_sign(faces, f0, f1, a, b)
 
 
 @wp.kernel
@@ -230,7 +448,8 @@ def verify_orientation(
 @wp.kernel
 def accumulate_neighbor_normals(
     face_normals: wp.array[wp.vec3],
-    face_adjacency: wp.array2d[wp.int32],
+    sorted_keys: wp.array[wp.uint64],
+    order: wp.array[wp.int32],
     out_neighbor_sum: wp.array[wp.vec3],
     out_max_angle: wp.array[wp.float32],
 ) -> None:
@@ -241,9 +460,18 @@ def accumulate_neighbor_normals(
     # The dihedral angle is ``adjacency.face_adjacency_angles``' -- ``vector_angle`` of the pair's
     # two normals -- taken from the two normals this thread loads anyway, rather than read from a
     # ``(m,)`` table a launch of its own would have written for this pass alone.
-    k = wp.int32(wp.tid())
-    f0 = face_adjacency[k, 0]
-    f1 = face_adjacency[k, 1]
+    #
+    # Launched over the sorted halfedge keys rather than a compacted ``face_adjacency`` table: each
+    # pair's first member (``sorted_pair_slot``) does the pair's work, in the pair's adjacency-row
+    # order, so no table is built and no host read of its length is needed.
+    i = wp.int32(wp.tid())
+    first, _unpaired_start = sorted_pair_slot(sorted_keys, i)
+    if first != i:
+        return
+    e0 = order[i] // 3
+    e1 = order[i + 1] // 3
+    f0 = wp.min(e0, e1)
+    f1 = wp.max(e0, e1)
     normal_0 = face_normals[f0]
     normal_1 = face_normals[f1]
     angle = vector_angle(normal_0, normal_1)

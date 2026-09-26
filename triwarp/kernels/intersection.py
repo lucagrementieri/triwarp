@@ -6,7 +6,8 @@ from triwarp.constants import TOLERANCE_MERGE_CONSTANT, TOLERANCE_ZERO_CONSTANT
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import triangles as kernel_triangles
 from triwarp.kernels.array import OverloadTable, declare_map_signatures, map_probe, map_probe_single
-from triwarp.kernels.predicates import triangles_intersect
+from triwarp.kernels.predicates import point_plane_dot, triangles_intersect
+from triwarp.kernels.proximity import mesh_aabb_collect
 
 SLICE_SIGN_INSIDE = wp.constant(wp.int32(-1))
 SLICE_SIGN_OUTSIDE = wp.constant(wp.int32(1))
@@ -163,14 +164,15 @@ def mesh_with_plane_segment_for_face(
 def mesh_with_plane_segments(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
-    vertex_dots: wp.array[wp.float32],
     plane_normal: wp.vec3,
     plane_origin: wp.vec3,
     out_cut: wp.array[wp.int32],
     out_segments: wp.array2d[wp.vec3],
 ) -> None:
     # ``out_cut`` is a ``0`` / ``1`` flag, the ``int32`` that ``compact_cut_segments``' caller scans
-    # in place, so no mask has to be converted before the scan.
+    # in place, so no mask has to be converted before the scan. Each corner's plane dot is taken
+    # here rather than read from a per-vertex buffer, which would be a map and an allocation for
+    # the same value.
     f = wp.int32(wp.tid())
     i0 = faces[f * 3]
     i1 = faces[f * 3 + 1]
@@ -178,9 +180,15 @@ def mesh_with_plane_segments(
     v0 = vertices[i0]
     v1 = vertices[i1]
     v2 = vertices[i2]
-    s0 = kernel_array.sign_with_tolerance(vertex_dots[i0], TOLERANCE_MERGE_CONSTANT)
-    s1 = kernel_array.sign_with_tolerance(vertex_dots[i1], TOLERANCE_MERGE_CONSTANT)
-    s2 = kernel_array.sign_with_tolerance(vertex_dots[i2], TOLERANCE_MERGE_CONSTANT)
+    s0 = kernel_array.sign_with_tolerance(
+        point_plane_dot(v0, plane_normal, plane_origin), TOLERANCE_MERGE_CONSTANT
+    )
+    s1 = kernel_array.sign_with_tolerance(
+        point_plane_dot(v1, plane_normal, plane_origin), TOLERANCE_MERGE_CONSTANT
+    )
+    s2 = kernel_array.sign_with_tolerance(
+        point_plane_dot(v2, plane_normal, plane_origin), TOLERANCE_MERGE_CONSTANT
+    )
     valid, p0, p1 = mesh_with_plane_segment_for_face(
         plane_normal, plane_origin, v0, v1, v2, s0, s1, s2
     )
@@ -345,6 +353,9 @@ def expand_query_target_pairs(
     target_indices: wp.array[wp.int32],
     out_pairs: wp.array2d[wp.int32],
 ) -> None:
+    # A flat hit list's ``(query, target)`` rows, for ``validation``'s self-intersection broad
+    # phase; the two-mesh entry points emit their candidates directly with
+    # ``query_face_candidate_pairs``.
     q = wp.int32(wp.tid())
     start = offsets[q]
     count = hit_counts[q]
@@ -357,6 +368,45 @@ def expand_query_target_pairs(
         i = i + 1
 
 
+@wp.kernel
+def query_face_candidate_pairs(
+    query_lower: wp.array[wp.vec3],
+    query_upper: wp.array[wp.vec3],
+    mesh_id: wp.uint64,
+    max_hits: wp.int32,
+    offsets: wp.array[wp.int32],
+    out_candidates: wp.array2d[wp.int32],
+) -> None:
+    # The broad phase's second pass, writing each candidate as a *column* of a ``(2, n)`` table:
+    # row 0 the query face, row 1 the target face. Row 1 is a contiguous view, so the BVH walk
+    # emits into it directly, and row 0 is filled beside it -- the ``(query, target)`` pairs with no
+    # flat hit list and no expansion launch between them. The first pass is
+    # ``proximity.query_mesh_aabb_count`` over the same stored boxes.
+    #
+    # The boxes are read from ``triangles.face_aabb_bounds``' buffers rather than formed here from
+    # the face's corners: the identical walk over the identical candidates measured several times
+    # slower with the box formed in the kernel, for one extra launch of a few microseconds.
+    q = wp.int32(wp.tid())
+    base = offsets[q]
+    count = mesh_aabb_collect(
+        mesh_id, query_lower[q], query_upper[q], max_hits, wp.bool(True), base, out_candidates[1]
+    )
+    for c in range(count):
+        out_candidates[0, base + c] = q
+
+
+@wp.func
+def corners_intersect(
+    qa: wp.vec3, qb: wp.vec3, qc: wp.vec3, ta: wp.vec3, tb: wp.vec3, tc: wp.vec3
+) -> wp.bool:
+    # The narrow phase on two faces' corners: two faces that share a vertex are adjacent, not
+    # intersecting, and every other pair is decided by the triangle-triangle test. The one spelling
+    # of that rule; ``candidate_pair_segments`` calls it on corners it goes on to reuse.
+    if triangles_share_vertex(qa, qb, qc, ta, tb, tc):
+        return False
+    return triangles_intersect(qa, qb, qc, ta, tb, tc)
+
+
 @wp.func
 def candidate_pair_intersects(
     query_vertices: wp.array[wp.vec3],
@@ -366,15 +416,11 @@ def candidate_pair_intersects(
     query_face: wp.int32,
     target_face: wp.int32,
 ) -> wp.bool:
-    # The narrow phase of one broad-phase candidate: two faces that share a vertex are adjacent,
-    # not intersecting, and every other pair is decided by the triangle-triangle test. Shared by
-    # the verdict-per-pair kernel below and ``mark_intersecting_pair_masks``, which marks faces
-    # straight from it.
+    # The narrow phase of one broad-phase candidate, by face index. Shared by the verdict kernels
+    # below and ``mark_intersecting_pair_masks``, which marks faces straight from it.
     qa, qb, qc = kernel_triangles.face_vertices(query_vertices, query_faces, query_face)
     ta, tb, tc = kernel_triangles.face_vertices(target_vertices, target_faces, target_face)
-    if triangles_share_vertex(qa, qb, qc, ta, tb, tc):
-        return False
-    return triangles_intersect(qa, qb, qc, ta, tb, tc)
+    return corners_intersect(qa, qb, qc, ta, tb, tc)
 
 
 @wp.kernel
@@ -386,6 +432,9 @@ def filter_intersecting_pairs(
     pairs: wp.array2d[wp.int32],
     out_valid: wp.array[wp.bool],
 ) -> None:
+    # The per-pair verdict over ``(n, 2)`` pair rows, for ``validation``'s self-intersection pair
+    # list; the two-mesh entry points use the ``(2, n)`` candidate table and
+    # ``candidate_pair_flags`` instead.
     tid = wp.int32(wp.tid())
     out_valid[tid] = candidate_pair_intersects(
         query_vertices, query_faces, target_vertices, target_faces, pairs[tid, 0], pairs[tid, 1]
@@ -393,13 +442,48 @@ def filter_intersecting_pairs(
 
 
 @wp.kernel
-def swap_pair_columns(pairs: wp.array2d[wp.int32], out_pairs: wp.array2d[wp.int32]) -> None:
-    # Put a colliding pair back in the caller's (a, b) order. The broad phase queries the *larger*
-    # mesh's faces against the smaller one's BVH, so which input is the query depends on the face
-    # counts and the pair columns come out in that order rather than the caller's.
+def candidate_pair_flags(
+    query_vertices: wp.array[wp.vec3],
+    query_faces: wp.array[wp.int32],
+    target_vertices: wp.array[wp.vec3],
+    target_faces: wp.array[wp.int32],
+    candidates: wp.array2d[wp.int32],
+    out_flags: wp.array[wp.int32],
+) -> None:
+    # ``filter_intersecting_pairs`` over the ``(2, n)`` candidate table, as the ``0`` / ``1``
+    # ``int32`` flag ``compact_candidate_pairs`` scans in place -- so the verdict buffer is also the
+    # scan buffer and no mask-to-index compaction runs in between.
+    p = wp.int32(wp.tid())
+    hit = candidate_pair_intersects(
+        query_vertices,
+        query_faces,
+        target_vertices,
+        target_faces,
+        candidates[0, p],
+        candidates[1, p],
+    )
+    out_flags[p] = wp.where(hit, 1, 0)
+
+
+@wp.kernel
+def compact_candidate_pairs(
+    inclusive: wp.array[wp.int32],
+    candidates: wp.array2d[wp.int32],
+    swapped: wp.bool,
+    out_pairs: wp.array2d[wp.int32],
+) -> None:
+    # The flagged candidates as ``(n_hit, 2)`` rows, in candidate order, from the in-place
+    # inclusive scan of their flags -- and in the caller's ``(a, b)`` column order. The broad phase
+    # queries the *larger* mesh's faces against the smaller one's BVH, so which input is the query
+    # depends on the face counts; ``swapped`` says the query is mesh b and puts the columns back.
     i = wp.int32(wp.tid())
-    out_pairs[i, 0] = pairs[i, 1]
-    out_pairs[i, 1] = pairs[i, 0]
+    slot, kept = kernel_array.scanned_count(inclusive, i)
+    if kept == 0:
+        return
+    query_face = candidates[0, i]
+    target_face = candidates[1, i]
+    out_pairs[slot, 0] = wp.where(swapped, target_face, query_face)
+    out_pairs[slot, 1] = wp.where(swapped, query_face, target_face)
 
 
 @wp.kernel
@@ -408,62 +492,54 @@ def mark_intersecting_pair_masks(
     query_faces: wp.array[wp.int32],
     target_vertices: wp.array[wp.vec3],
     target_faces: wp.array[wp.int32],
-    pairs: wp.array2d[wp.int32],
+    candidates: wp.array2d[wp.int32],
     out_mask_query: wp.array[wp.bool],
     out_mask_target: wp.array[wp.bool],
 ) -> None:
-    # The narrow phase and the marking in one pass over the broad-phase candidates: flag both faces
-    # of each candidate pair that intersects (idempotent ``True`` writes), so a mask needs no
-    # per-pair verdict buffer and no compaction. Written as a kernel rather than two
-    # ``scatter.mark_membership_mask`` calls over ``pairs[:, k]`` because such a column is a
-    # *strided* view, and Warp's Python-scope gather reads an index buffer as if contiguous
-    # (CLAUDE.md section 3.4). A single mesh's self-intersection mask passes the same mesh and the
-    # same mask for both sides.
+    # The narrow phase and the marking in one pass over the ``(2, n)`` broad-phase candidates: flag
+    # both faces of each candidate pair that intersects (idempotent ``True`` writes), so a mask
+    # needs no per-pair verdict buffer and no compaction. Written as a kernel rather than two
+    # ``scatter.mark_membership_mask`` calls over the candidate rows, which would be two launches
+    # where this is one.
     p = wp.int32(wp.tid())
-    a = pairs[p, 0]
-    b = pairs[p, 1]
+    a = candidates[0, p]
+    b = candidates[1, p]
     if candidate_pair_intersects(query_vertices, query_faces, target_vertices, target_faces, a, b):
         out_mask_query[a] = True
         out_mask_target[b] = True
 
 
-# Launched over ``filter_intersecting_pairs``'s survivors, so ``triangle_intersection_segment``
-# below recomputes each pair's normals, edge vectors and plane-distance projections that
-# ``triangles_intersect`` already derived one launch earlier. **Fusing the two is declined.** This
-# kernel is a single-digit percentage of the whole ``mesh_with_mesh`` call, flat across the face
-# count rather than a falling share, and that figure *bounds* the saving rather than being it,
-# since the segment extraction's ordering and division are unique to it; the broad-phase AABB query
-# kernels are the overwhelming majority of the same call. And ``filter_intersecting_pairs`` backs
-# call sites that never need a segment at all (``mesh_collision_pairs``,
-# ``validation.is_self_intersecting``), so a single fused kernel would need a
-# caller-selected tail rather than a clean merge.
 @wp.kernel
-def triangle_pair_segments(
+def candidate_pair_segments(
     query_vertices: wp.array[wp.vec3],
     query_faces: wp.array[wp.int32],
     target_vertices: wp.array[wp.vec3],
     target_faces: wp.array[wp.int32],
-    pairs: wp.array2d[wp.int32],
+    candidates: wp.array2d[wp.int32],
     out_segments: wp.array2d[wp.vec3],
     out_cut: wp.array[wp.int32],
 ) -> None:
-    # The segment *and* whether it is a real one, in a pass that already knows both, as the ``0`` /
-    # ``1`` flag ``compact_cut_segments``' caller scans.
+    # The narrow phase, the segment *and* whether it is a real one, over the ``(2, n)`` broad-phase
+    # candidates, as the ``0`` / ``1`` flag ``compact_cut_segments``' caller scans. A candidate that
+    # fails ``candidate_pair_intersects`` is flagged out before any segment is computed, so this is
+    # ``candidate_pair_flags`` with the segment extraction as its tail, and ``mesh_with_mesh`` runs
+    # no separate verdict pass, compaction or gather ahead of it.
     #
-    # These were two launches, and the second read ``out_segments`` back to measure it. That was
-    # a latent hazard as well as a cost: this kernel writes the row only when the narrow phase
-    # succeeds and the buffer is ``wp.empty``, so a rejected pair had its length test applied to
-    # uninitialised memory, where two values far enough apart would pass it and emit a segment
-    # for a pair that does not intersect. **Not a defect anyone has observed** -- a fresh pool
-    # allocation reads back as zeros here, so both arms agree segment-for-segment on grazing and
-    # deeply interpenetrating sphere pairs alike -- but it depended on the allocator rather than
-    # on the geometry. Deciding validity where the narrow phase decides it makes the rejected
-    # rows unreadable instead of merely unlikely to survive. The removed launch measures flat on
-    # ``mesh_with_mesh`` -- the call is dominated by the broad phase -- so this is a correctness
-    # argument, not a speed one.
+    # ``triangle_intersection_segment`` recomputes each pair's normals, edge vectors and
+    # plane-distance projections that ``triangles_intersect`` already derived; sharing them would
+    # need the segment extraction's ordering and division threaded through the predicate, which
+    # the verdict-only callers (``mesh_collision_pairs``, ``validation``) never want.
+    #
+    # The row is written only when the narrow phase succeeds and the buffer is ``wp.empty``, so the
+    # validity decision lives here, where the narrow phase decides it: a rejected row is never read.
     tid = wp.int32(wp.tid())
-    qa, qb, qc = kernel_triangles.face_vertices(query_vertices, query_faces, pairs[tid, 0])
-    ta, tb, tc = kernel_triangles.face_vertices(target_vertices, target_faces, pairs[tid, 1])
+    out_cut[tid] = 0
+    query_face = candidates[0, tid]
+    target_face = candidates[1, tid]
+    qa, qb, qc = kernel_triangles.face_vertices(query_vertices, query_faces, query_face)
+    ta, tb, tc = kernel_triangles.face_vertices(target_vertices, target_faces, target_face)
+    if not corners_intersect(qa, qb, qc, ta, tb, tc):
+        return
     valid, p0, p1 = triangle_intersection_segment(qa, qb, qc, ta, tb, tc)
     if valid:
         out_segments[tid, 0] = p0
@@ -614,33 +690,26 @@ def resolve_on_plane_faces(
 
 
 @wp.kernel
-def slice_class_counts(
-    inclusive: wp.array[wp.int32],
-    n_faces: wp.int32,
-    n_classes: wp.int32,
-    out_counts: wp.array[wp.int32],
-) -> None:
-    # Per-class counts from the block ends of the inclusive scan: block ``b``'s own count is its
-    # running total minus the previous block's. One launch so the host reads a few bytes once.
-    previous = wp.int32(0)  # dynamic loop below: a bare literal would be a constant (see above)
-    for block in range(n_classes):
-        total = inclusive[(block + 1) * n_faces - 1]
-        out_counts[block] = total - previous
-        previous = total
-
-
-@wp.kernel
 def scatter_slice_class(
-    flags: wp.array[wp.int32],
     inclusive: wp.array[wp.int32],
     n_faces: wp.int32,
     out_indices: wp.array[wp.int32],
+    out_counts: wp.array[wp.int32],
 ) -> None:
-    # A flag-driven compaction over the blocked flag buffer that writes the *face* index rather
-    # than the flag index, so each block comes out addressing faces.
+    # A flag-driven compaction over the blocked flag buffer, scanned in place, that writes the
+    # *face* index rather than the flag index, so each block comes out addressing faces. The last
+    # thread of each block also writes that block's count -- its running total minus the previous
+    # block's -- so the host reads the counts once, after this launch, and no pass of its own
+    # derives them.
     t = wp.int32(wp.tid())
-    if flags[t] != 0:
-        out_indices[inclusive[t] - 1] = t % n_faces
+    slot, flag = kernel_array.scanned_count(inclusive, t)
+    if flag != 0:
+        out_indices[slot] = t % n_faces
+    if (t + 1) % n_faces == 0:
+        previous = wp.int32(0)
+        if t >= n_faces:
+            previous = inclusive[t - n_faces]
+        out_counts[t // n_faces] = inclusive[t] - previous
 
 
 @wp.func
@@ -1015,8 +1084,8 @@ def plane_edge_crossing_points(
 def label_faces_by_plane_side(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
-    vertex_dots: wp.array[wp.float32],
     plane_normal: wp.vec3,
+    plane_origin: wp.vec3,
     tolerance: wp.float32,
     out_above: wp.array[wp.bool],
 ) -> None:
@@ -1024,11 +1093,13 @@ def label_faces_by_plane_side(
     # side for the whole face. Reading the extremum rather than a sum or a centroid keeps a sliver
     # face -- two crossing vertices at dot 0 and one real vertex just off the plane -- on the side
     # its real vertex is on, where a centroid would divide the offset by three and a sum would let
-    # two rounding-level zeros outvote it.
+    # two rounding-level zeros outvote it. The dots are taken here, per corner, rather than read
+    # from a per-vertex buffer: the appended crossing points sit on the plane by construction, so a
+    # buffer over the grown vertex array would be one more map and allocation for the same values.
     f = wp.int32(wp.tid())
     extreme = wp.float32(0.0)
     for corner in range(3):
-        value = vertex_dots[faces[f * 3 + corner]]
+        value = point_plane_dot(vertices[faces[f * 3 + corner]], plane_normal, plane_origin)
         if wp.abs(value) > wp.abs(extreme):
             extreme = value
 
@@ -1090,7 +1161,7 @@ def marching_triangles_segments(
     # otherwise land in the same bucket as a genuine negative value, pass as a "lone corner" against
     # two real opposite-signed neighbours, and feed ``crossing_point`` a ``NaN`` that reaches the
     # returned curve with no filter anywhere downstream (unlike ``mesh_with_mesh``, whose
-    # ``triangle_pair_segments`` rejects a degenerate segment as it writes it).
+    # ``candidate_pair_segments`` rejects a degenerate segment as it writes it).
     if wp.isnan(d0) or wp.isnan(d1) or wp.isnan(d2):
         out_cut[f] = 0
         return

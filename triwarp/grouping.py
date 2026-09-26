@@ -14,7 +14,6 @@ from triwarp.array import bitcast_from_int, bitcast_to_int, gather, sort_pair_in
 from triwarp.constants import INDEX_RADIX_PAIR
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import grouping as kernel_grouping
-from triwarp.kernels import triangles as kernel_triangles
 
 # Unbounded on purpose: ``wp.Scalar`` is itself a ``typing.TypeVar`` rather than a class or a
 # union, so ``bound=wp.Scalar`` bounds a type variable by a type variable -- invalid, and it
@@ -67,14 +66,19 @@ def group(values: wp.array[wp.Int], length: int) -> twt.Array2dInt32:
     # Scan compaction: flag run starts, scan the flags, then emit one right-sized row per group
     # (deterministic ascending-value order, no atomic counter and no (n, length) over-allocation).
     # The emit reads each flag back as a step in the scan, so it compacts and writes in one launch.
-    flags = wp.empty(n, dtype=wp.int32, device=device)
+    # The flags are written straight into the tail of the total-terminated offsets buffer and
+    # scanned in place, so its leading zero makes it the exclusive scan with the total at the end.
+    offsets = wp.zeros(n + 1, dtype=wp.int32, device=device)
+    flags = offsets[1:]
     wp.launch(
         kernel_grouping.MARK_GROUP_STARTS[values_buffer.dtype],
         dim=n,
         inputs=[values_buffer, wp.int32(n), wp.int32(length), flags],
         device=device,
     )
-    offsets, n_groups = tw.array.counts_to_offsets(flags, include_total=True)
+    wp.utils.array_scan(flags, flags, inclusive=True)
+    # The group count sizes the output, so it has to come back to the host.
+    n_groups = int(read_scalar(offsets))
     groups = twt.empty_2d((n_groups, length), wp.int32, device=device)
     if n_groups > 0:
         wp.launch(
@@ -134,21 +138,38 @@ def unique_1d(
     *,
     return_inverse: Literal[False] = False,
     return_counts: Literal[False] = False,
+    max_value: int | None = None,
 ) -> wp.array[Scalar]: ...
 @overload
 def unique_1d(
-    data: wp.array[Scalar], *, return_inverse: Literal[True], return_counts: Literal[False] = False
+    data: wp.array[Scalar],
+    *,
+    return_inverse: Literal[True],
+    return_counts: Literal[False] = False,
+    max_value: int | None = None,
 ) -> tuple[wp.array[Scalar], wp.array[wp.int32]]: ...
 @overload
 def unique_1d(
-    data: wp.array[Scalar], *, return_inverse: Literal[False] = False, return_counts: Literal[True]
+    data: wp.array[Scalar],
+    *,
+    return_inverse: Literal[False] = False,
+    return_counts: Literal[True],
+    max_value: int | None = None,
 ) -> tuple[wp.array[Scalar], wp.array[wp.int32]]: ...
 @overload
 def unique_1d(
-    data: wp.array[Scalar], *, return_inverse: Literal[True], return_counts: Literal[True]
+    data: wp.array[Scalar],
+    *,
+    return_inverse: Literal[True],
+    return_counts: Literal[True],
+    max_value: int | None = None,
 ) -> tuple[wp.array[Scalar], wp.array[wp.int32], wp.array[wp.int32]]: ...
 def unique_1d(
-    data: wp.array[Scalar], *, return_inverse: bool = False, return_counts: bool = False
+    data: wp.array[Scalar],
+    *,
+    return_inverse: bool = False,
+    return_counts: bool = False,
+    max_value: int | None = None,
 ) -> (
     wp.array[Scalar]
     | tuple[wp.array[Scalar], wp.array[wp.int32]]
@@ -172,6 +193,11 @@ def unique_1d(
         If ``True``, include the inverse mapping in the return tuple.
     return_counts
         If ``True``, include per-unique occurrence counts in the return tuple.
+    max_value
+        Optional inclusive upper bound on the values of an integer ``data`` whose values are all
+        non-negative -- a packed key's known range. The final sort then orders only the low bits
+        that bound needs, which is cheaper and leaves the result unchanged. It is trusted, not
+        checked: a value above it, or a negative one, sorts out of order.
 
     Returns
     -------
@@ -187,10 +213,18 @@ def unique_1d(
     Raises
     ------
     ValueError
-        If ``data`` is not rank-1 or length is ``> 2**30``.
+        If ``data`` is not rank-1 or length is ``> 2**30``, or if ``max_value`` is negative or
+        given for a floating-point ``data``.
     """
     if int(data.ndim) != 1:
         raise ValueError(f"unique_1d expects a rank-1 array, got ndim={data.ndim}")
+    end_bit = None
+    if max_value is not None:
+        if max_value < 0:
+            raise ValueError(f"max_value must be non-negative, got {max_value}")
+        if data.dtype in (wp.float16, wp.float32, wp.float64):
+            raise ValueError("max_value applies to integer data only")
+        end_bit = max(1, int(max_value).bit_length())
 
     device = data.device
     n = int(data.shape[0])
@@ -221,7 +255,7 @@ def unique_1d(
         data_int = data.view(wp.int32 if key_bytes == 4 else wp.int64)
     else:
         data_int = bitcast_to_int(data, n)
-    return _unique_hash(data, data_int, data.dtype, n, mask, return_inverse, return_counts)
+    return _unique_hash(data, data_int, data.dtype, n, mask, return_inverse, return_counts, end_bit)
 
 
 def _unique_hash(
@@ -232,6 +266,7 @@ def _unique_hash(
     mask: wp.int32,
     return_inverse: bool,
     return_counts: bool,
+    end_bit: int | None,
 ) -> (
     wp.array[Scalar]
     | tuple[wp.array[Scalar], wp.array[wp.int32]]
@@ -281,7 +316,7 @@ def _unique_hash(
         if wp.types.type_size_in_bytes(sort_dtype) == wp.types.type_size_in_bytes(key_dtype)
         else bitcast_from_int(keys_compact, sort_dtype, count=2 * n_unique)
     )
-    wp.utils.radix_sort_pairs(keys_buf, perm_buf, count=n_unique)
+    wp.utils.radix_sort_pairs(keys_buf, perm_buf, count=n_unique, end_bit=end_bit)
 
     if sort_dtype == original_dtype:
         # The sorted prefix of the sort's own scratch, handed back as a view rather than copied out:
@@ -369,13 +404,15 @@ def _hash_insert(
     One slot past the ``mask + 1`` table is reserved for the single key that collides with the
     empty-slot sentinel; see the comment on ``kernel_grouping.hash_insert``. ``occupied`` is stamped
     by the insert itself rather than derived from ``slot_counts`` in a second pass, so it is
-    zero-filled rather than ``wp.empty``.
+    zero-filled rather than ``wp.empty``; it shares one zero-filled allocation with
+    ``slot_counts``, the two ``int32`` tables being adjacent halves of it.
     """
     cap = int(mask) + 2
     device = keys.device
     slot_key = wp.zeros(cap, dtype=keys.dtype, device=device)
-    slot_counts = wp.zeros(cap, dtype=wp.int32, device=device)
-    occupied = wp.zeros(cap, dtype=wp.int32, device=device)
+    counts_and_occupied = wp.zeros(2 * cap, dtype=wp.int32, device=device)
+    slot_counts = twt.as_dense(counts_and_occupied[:cap])
+    occupied = twt.as_dense(counts_and_occupied[cap:])
     wp.launch(
         kernel_grouping.HASH_INSERT[keys.dtype],
         dim=n,
@@ -515,7 +552,7 @@ def unique_rows(
             counts=empty_i32 if return_counts else None,
         )
 
-    _unique_keys, inverse, first_idx, counts = _unique_rows_core(data, return_counts=return_counts)
+    inverse, first_idx, counts = _unique_keys_core(hash_rows(data), return_counts=return_counts)
 
     if not is_vec3:
         twt.ensure_ndim(data, 2)
@@ -529,14 +566,17 @@ def unique_rows(
 
 @overload
 def unique_faces(
-    faces: wp.array[wp.int32], *, return_inverse: Literal[False] = False
+    faces: wp.array[wp.int32],
+    *,
+    return_inverse: Literal[False] = False,
+    max_index: int | None = None,
 ) -> wp.array[wp.int32]: ...
 @overload
 def unique_faces(
-    faces: wp.array[wp.int32], *, return_inverse: Literal[True]
+    faces: wp.array[wp.int32], *, return_inverse: Literal[True], max_index: int | None = None
 ) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]: ...
 def unique_faces(
-    faces: wp.array[wp.int32], *, return_inverse: bool = False
+    faces: wp.array[wp.int32], *, return_inverse: bool = False, max_index: int | None = None
 ) -> wp.array[wp.int32] | tuple[wp.array[wp.int32], wp.array[wp.int32]]:
     """
     Find unique triangular faces up to vertex permutation (orientation-agnostic).
@@ -552,6 +592,12 @@ def unique_faces(
     return_inverse
         If ``True``, also return the inverse mapping from each input face to its slot in the
         unique output.
+    max_index
+        Exclusive upper bound on every vertex index, typically the vertex count. When given it is
+        trusted rather than checked, which skips the range-checking reduction over ``faces`` and
+        its host readback -- only pass it where the bound holds by construction, since a bound
+        below the true maximum makes distinct faces collide silently. When ``None`` (default) the
+        indices are validated and the bound inferred from them.
 
     Returns
     -------
@@ -560,7 +606,15 @@ def unique_faces(
     inverse : wp.array[wp.int32], optional
         Present if ``return_inverse=True``. Length ``n_faces``; ``inverse[i]`` is the unique
         slot of input face ``i``.
+
+    Raises
+    ------
+    ValueError
+        If ``max_index`` is not positive, or -- when it is ``None`` -- if ``faces`` holds a negative
+        index.
     """
+    if max_index is not None and max_index <= 0:
+        raise ValueError(f"max_index must be positive, got {max_index}")
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
@@ -569,53 +623,63 @@ def unique_faces(
             return empty_faces, wp.empty(0, dtype=wp.int32, device=device)
         return empty_faces
 
-    faces2d = faces.reshape((-1, 3))
-    sorted_faces = twt.empty_2d((n_faces, 3), wp.int32, device=device)
+    if max_index is None:
+        # Sorting a face's corners does not change the buffer's extremes, so the range check and
+        # the inferred radix read the input directly. The reduction ends in a host readback.
+        min_index, max_value = tw.reduce.minmax(faces)
+        if min_index < 0:
+            raise ValueError(f"faces must be non-negative, got a minimum of {min_index}")
+        max_index = max_value + 1
+    row_keys = wp.empty(n_faces, dtype=wp.uint64, device=device)
     wp.launch(
-        kernel_triangles.sort_face_indices,
+        kernel_grouping.pack_sorted_face_keys,
         dim=n_faces,
-        inputs=[faces2d, sorted_faces],
+        inputs=[faces, wp.uint64(max_index), row_keys],
         device=device,
     )
-    # Not ``unique_rows(sorted_faces, return_inverse=True)``: that gathers ``sorted_faces`` by the
-    # first-occurrence indices to build its own return, an answer this function has no use for --
-    # it gathers ``faces2d`` (the unsorted rows) by the same indices instead, to keep each
-    # representative's original winding. Sharing the core skips that discarded gather and the
-    # ``first_occurrence_indices`` launch it would otherwise take a second time on the identical
-    # ``inverse``.
-    _unique_keys, inverse, first, _counts = _unique_rows_core(sorted_faces, return_counts=False)
-    unique_faces_out = gather(faces2d, first).reshape((-1,))
+    # Not ``unique_rows`` on the sorted rows: that gathers the sorted rows by the first-occurrence
+    # indices to build its own return, an answer this function has no use for -- it gathers the
+    # unsorted faces by the same indices instead, to keep each representative's original winding.
+    # Three sorted indices below ``max_index`` pack below ``max_index ** 3``.
+    inverse, first, _counts = _unique_keys_core(
+        row_keys, return_counts=False, max_value=min(max_index**3, 1 << 64) - 1
+    )
+    unique_faces_out = gather(faces.reshape((-1, 3)), first).reshape((-1,))
     if return_inverse:
         return unique_faces_out, inverse
     return unique_faces_out
 
 
-def _unique_rows_core(
-    data: twt.ArrayNd, *, return_counts: bool
-) -> tuple[wp.array[wp.uint64], wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32] | None]:
+def _unique_keys_core(
+    row_keys: wp.array[wp.uint64], *, return_counts: bool, max_value: int | None = None
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32] | None]:
     """
-    Shared core of [`unique_rows`][triwarp.grouping.unique_rows]: hash, dedup, find first index.
+    Shared core of [`unique_rows`][triwarp.grouping.unique_rows]: dedup row keys, find first index.
 
-    Returns ``(unique_keys, inverse, first_idx, counts)``. Both callers hash and deduplicate
-    identically; they differ only in what they gather with ``first_idx`` --
+    Returns ``(inverse, first_idx, counts)``. Both callers deduplicate identically; they differ in
+    how they pack the keys and in what they gather with ``first_idx`` --
     [`unique_rows`][triwarp.grouping.unique_rows] gathers ``data`` itself, while
     [`unique_faces`][triwarp.grouping.unique_faces] gathers the un-sorted face buffer to preserve
-    each representative's original vertex order. Requires ``data.shape[0] > 0``.
+    each representative's original vertex order. Requires ``row_keys.shape[0] > 0``. ``max_value``
+    is ``unique_1d``'s key bound, for a caller that packed against a known radix.
     """
-    row_keys = hash_rows(data)
     # Call under a literal in each branch rather than unpacking one union-typed result: the
     # ``return_counts`` overloads of ``unique_1d`` cannot discriminate a runtime bool, so the
     # single-call form hands back a union nothing can narrow.
     if return_counts:
-        unique_keys, inverse, counts = unique_1d(row_keys, return_inverse=True, return_counts=True)
+        unique_keys, inverse, counts = unique_1d(
+            row_keys, return_inverse=True, return_counts=True, max_value=max_value
+        )
     else:
-        unique_keys, inverse = unique_1d(row_keys, return_inverse=True, return_counts=False)
+        unique_keys, inverse = unique_1d(
+            row_keys, return_inverse=True, return_counts=False, max_value=max_value
+        )
         counts = None
     # The class count is the length of the unique-key array ``unique_1d`` just returned; recovering
     # it as ``reduce.max(inverse) + 1`` would be a whole reduction launch and a host sync for a
     # number already in hand.
     first_idx = first_occurrence_indices(inverse, int(unique_keys.shape[0]))
-    return unique_keys, inverse, first_idx, counts
+    return inverse, first_idx, counts
 
 
 def first_occurrence_indices(
@@ -949,14 +1013,25 @@ def sorted_undirected_edge_keys(edges: twt.Array2dInt32, n_vertices: int) -> wp.
     n_edges = int(edges.shape[0])
     if n_edges == 0:
         return wp.empty(0, dtype=wp.uint64, device=device)
-    keys = wp.empty(n_edges, dtype=wp.uint64, device=device)
+    # The keys are packed straight into the leading half of the radix sort's double-width buffer,
+    # and the payload the sort insists on is left uninitialized: nothing reads the permutation, so
+    # seeding it with an identity (``sort_and_argsort``) and staging the keys in a buffer of their
+    # own would be an allocation, a fill and a copy for an answer that is thrown away.
+    keys = wp.empty(2 * n_edges, dtype=wp.uint64, device=device)
     wp.launch(
         kernel_grouping.pack_undirected_edge_keys,
         dim=n_edges,
         inputs=[edges, wp.uint64(n_vertices), keys],
         device=device,
     )
-    return tw.array.sort_and_argsort(keys)[0]
+    # Every key is below ``n_vertices ** 2``, so the sort orders only that many low bits.
+    wp.utils.radix_sort_pairs(
+        keys,
+        wp.empty(2 * n_edges, dtype=wp.int32, device=device),
+        count=n_edges,
+        end_bit=max(1, (n_vertices * n_vertices - 1).bit_length()),
+    )
+    return twt.as_dense(keys[:n_edges])
 
 
 def _pack_unique_result(

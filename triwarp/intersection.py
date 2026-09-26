@@ -34,6 +34,7 @@ from triwarp._device import read_scalar, require_nonempty_mesh, require_same_dev
 from triwarp.constants import TOLERANCE_MERGE
 from triwarp.kernels import intersection as kernel_intersections
 from triwarp.kernels import predicates as kernel_predicates
+from triwarp.kernels import proximity as kernel_proximity
 from triwarp.kernels import triangles as kernel_triangles
 
 
@@ -152,14 +153,12 @@ def mesh_with_plane(
             return empty_segments, wp.empty(0, dtype=wp.int32, device=device)
         return empty_segments
 
-    vertex_dots = _plane_dots(vertices, plane_normal, plane_origin)
-
     cut = wp.empty(n_faces, dtype=wp.int32, device=device)
     segments = twt.empty_2d((n_faces, 2), wp.vec3, device=device)
     wp.launch(
         kernel_intersections.mesh_with_plane_segments,
         dim=n_faces,
-        inputs=[vertices, faces, vertex_dots, plane_normal, plane_origin, cut, segments],
+        inputs=[vertices, faces, plane_normal, plane_origin, cut, segments],
         device=device,
     )
 
@@ -444,187 +443,33 @@ def mesh_with_mesh(
         vertices_a=vertices_a, faces_a=faces_a, vertices_b=vertices_b, faces_b=faces_b
     )
     device = vertices_a.device
-    crossing = _colliding_face_pairs(
+    candidates = _candidate_face_pairs(
         vertices_a, faces_a, vertices_b, faces_b, max_triangle_collisions, "mesh_with_mesh"
     )
-    if crossing is None:
+    if candidates is None:
         return twt.empty_2d((0, 2), wp.vec3, device=device)
-    hit_pairs, query_vertices, query_faces, target_vertices, target_faces, _swapped = crossing
-    n_hit = int(hit_pairs.shape[0])
+    pairs, query_vertices, query_faces, target_vertices, target_faces, _swapped = candidates
+    n_pairs = int(pairs.shape[1])
 
-    segments = twt.empty_2d((n_hit, 2), wp.vec3, device=device)
-    seg_cut = wp.empty(n_hit, dtype=wp.int32, device=device)
-    # One launch: the degeneracy test rides in the kernel that computes the segment, which both
-    # removes a pass over the segment buffer and keeps the test off the rows that pass never
-    # wrote -- see the kernel.
+    segments = twt.empty_2d((n_pairs, 2), wp.vec3, device=device)
+    seg_cut = wp.empty(n_pairs, dtype=wp.int32, device=device)
+    # One launch over the broad-phase candidates: the narrow phase, the segment and its degeneracy
+    # test, so the one compaction below keeps exactly the crossing, non-degenerate pairs.
     wp.launch(
-        kernel_intersections.triangle_pair_segments,
-        dim=n_hit,
+        kernel_intersections.candidate_pair_segments,
+        dim=n_pairs,
         inputs=[
             query_vertices,
             query_faces,
             target_vertices,
             target_faces,
-            hit_pairs,
+            pairs,
             segments,
             seg_cut,
         ],
         device=device,
     )
     return _compact_cut_segments(seg_cut, segments)[0]
-
-
-def _colliding_face_pairs(
-    vertices_a: wp.array[wp.vec3],
-    faces_a: wp.array[wp.int32],
-    vertices_b: wp.array[wp.vec3],
-    faces_b: wp.array[wp.int32],
-    max_triangle_collisions: int,
-    caller: str,
-) -> (
-    tuple[
-        twt.Array2dInt32,
-        wp.array[wp.vec3],
-        wp.array[wp.int32],
-        wp.array[wp.vec3],
-        wp.array[wp.int32],
-        bool,
-    ]
-    | None
-):
-    """
-    Broad phase plus narrow phase for two meshes: the crossing face pairs, or ``None`` if none.
-
-    Shared by [`mesh_with_mesh`][triwarp.intersection.mesh_with_mesh], which goes on to compute a
-    segment per pair, and [`mesh_collision_pairs`][triwarp.intersection.mesh_collision_pairs], which
-    returns the pairs themselves. It exists because the two would otherwise carry the same fifty
-    lines twice, and because those lines contain the one thing a caller must not get wrong: the pair
-    columns are ``(query, target)``, and which input is the query depends on the **face counts**.
-
-    Parameters
-    ----------
-    vertices_a, faces_a, vertices_b, faces_b
-        The two meshes.
-    max_triangle_collisions
-        Broad-phase candidate cap per query triangle.
-    caller
-        Name to report in the empty-mesh guard's message.
-
-    Returns
-    -------
-    tuple | None
-        ``(pairs, query_vertices, query_faces, target_vertices, target_faces, swapped)``, where
-        ``pairs`` is ``(n_hit, 2)`` in ``(query, target)`` order and ``swapped`` says whether the
-        query is mesh **b** -- i.e. whether the columns are the caller's ``(a, b)`` order reversed.
-        ``None`` when either mesh is empty or nothing crosses.
-
-    Raises
-    ------
-    ValueError
-        If ``max_triangle_collisions`` is less than 1.
-    """
-    candidates = _candidate_face_pairs(
-        vertices_a, faces_a, vertices_b, faces_b, max_triangle_collisions, caller
-    )
-    if candidates is None:
-        return None
-    pairs, query_vertices, query_faces, target_vertices, target_faces, swapped = candidates
-    device = pairs.device
-    n_pairs = int(pairs.shape[0])
-    valid = wp.empty(n_pairs, dtype=wp.bool, device=device)
-    wp.launch(
-        kernel_intersections.filter_intersecting_pairs,
-        dim=n_pairs,
-        inputs=[query_vertices, query_faces, target_vertices, target_faces, pairs, valid],
-        device=device,
-    )
-
-    hit_pair_indices = tw.array.flatnonzero(valid)
-    if int(hit_pair_indices.shape[0]) == 0:
-        return None
-    hit_pairs = twt.as_array2d(tw.array.gather(pairs, hit_pair_indices), wp.int32)
-    return hit_pairs, query_vertices, query_faces, target_vertices, target_faces, swapped
-
-
-def _candidate_face_pairs(
-    vertices_a: wp.array[wp.vec3],
-    faces_a: wp.array[wp.int32],
-    vertices_b: wp.array[wp.vec3],
-    faces_b: wp.array[wp.int32],
-    max_triangle_collisions: int,
-    caller: str,
-) -> (
-    tuple[
-        twt.Array2dInt32,
-        wp.array[wp.vec3],
-        wp.array[wp.int32],
-        wp.array[wp.vec3],
-        wp.array[wp.int32],
-        bool,
-    ]
-    | None
-):
-    """
-    Broad phase alone for two meshes: every candidate ``(query, target)`` pair, or ``None``.
-
-    The first half of ``_colliding_face_pairs``, with the same return layout and the same
-    query/target rule, but unfiltered.
-    [`collision_masks`][triwarp.intersection.collision_masks] takes it directly and runs the narrow
-    phase in the kernel that marks its masks, so it never compacts the survivors into a pair list.
-
-    Raises
-    ------
-    ValueError
-        If ``max_triangle_collisions`` is less than 1.
-    """
-    # Before the empty-mesh early return, not after: the three public callers all document this
-    # unconditionally ("Raises: ValueError if max_triangle_collisions is less than 1"), and an empty
-    # mesh plus an invalid cap must not silently return `None` instead.
-    if max_triangle_collisions < 1:
-        raise ValueError("max_triangle_collisions must be >= 1")
-    device = vertices_a.device
-    n_faces_a = int(faces_a.shape[0]) // 3
-    n_faces_b = int(faces_b.shape[0]) // 3
-    if n_faces_a == 0 or n_faces_b == 0:
-        return None
-
-    # The smaller mesh supplies the BVH, so the larger one's faces are the queries.
-    swapped = n_faces_a <= n_faces_b
-    if swapped:
-        target_vertices, target_faces = vertices_a, faces_a
-        query_vertices, query_faces = vertices_b, faces_b
-    else:
-        target_vertices, target_faces = vertices_b, faces_b
-        query_vertices, query_faces = vertices_a, faces_a
-
-    n_query = int(query_faces.shape[0]) // 3
-    require_nonempty_mesh(target_faces, caller)
-    target_mesh = wp.Mesh(points=target_vertices, indices=target_faces)
-
-    query_lower = wp.empty(n_query, dtype=wp.vec3, device=device)
-    query_upper = wp.empty(n_query, dtype=wp.vec3, device=device)
-    wp.launch(
-        kernel_triangles.face_aabb_bounds,
-        dim=n_query,
-        inputs=[query_vertices, query_faces, query_lower, query_upper],
-        device=device,
-    )
-
-    target_indices, offsets, hit_counts = tw.proximity.query_mesh_aabb_with_offsets(
-        target_mesh, query_lower, query_upper, max_hits=max_triangle_collisions
-    )
-    n_pairs = int(target_indices.shape[0])
-    if n_pairs == 0:
-        return None
-
-    pairs = twt.empty_2d((n_pairs, 2), wp.int32, device=device)
-    wp.launch(
-        kernel_intersections.expand_query_target_pairs,
-        dim=n_query,
-        inputs=[offsets, hit_counts, target_indices, pairs],
-        device=device,
-    )
-    return pairs, query_vertices, query_faces, target_vertices, target_faces, swapped
 
 
 def mesh_collision_pairs(
@@ -700,18 +545,58 @@ def mesh_collision_pairs(
     )
     if crossing is None:
         return twt.empty_2d((0, 2), wp.int32, device=device)
-    hit_pairs, _qv, _qf, _tv, _tf, swapped = crossing
-    if not swapped:
-        return hit_pairs
+    return crossing
 
-    ordered = twt.empty_2d((int(hit_pairs.shape[0]), 2), wp.int32, device=device)
+
+def _colliding_face_pairs(
+    vertices_a: wp.array[wp.vec3],
+    faces_a: wp.array[wp.int32],
+    vertices_b: wp.array[wp.vec3],
+    faces_b: wp.array[wp.int32],
+    max_triangle_collisions: int,
+    caller: str,
+) -> twt.Array2dInt32 | None:
+    """
+    Broad phase plus narrow phase for two meshes: the crossing face pairs, or ``None`` if none.
+
+    The pairs are ``(n_hit, 2)`` rows in the caller's ``(a, b)`` column order, in broad-phase
+    candidate order. The candidates are ``(query, target)``, and which input is the query depends
+    on the **face counts**; the compaction puts the columns back, so a caller never sees that order.
+
+    Raises
+    ------
+    ValueError
+        If ``max_triangle_collisions`` is less than 1.
+    """
+    candidates = _candidate_face_pairs(
+        vertices_a, faces_a, vertices_b, faces_b, max_triangle_collisions, caller
+    )
+    if candidates is None:
+        return None
+    pairs, query_vertices, query_faces, target_vertices, target_faces, swapped = candidates
+    device = pairs.device
+    n_pairs = int(pairs.shape[1])
+    # The verdicts are written as ``0`` / ``1`` flags and scanned in place, so one buffer carries
+    # the verdict, its scan and -- at its tail, the one readback -- the crossing count.
+    flags = wp.empty(n_pairs, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_intersections.swap_pair_columns,
-        dim=int(hit_pairs.shape[0]),
-        inputs=[hit_pairs, ordered],
+        kernel_intersections.candidate_pair_flags,
+        dim=n_pairs,
+        inputs=[query_vertices, query_faces, target_vertices, target_faces, pairs, flags],
         device=device,
     )
-    return ordered
+    wp.utils.array_scan(flags, out_array=flags, inclusive=True)
+    n_hit = int(read_scalar(flags))
+    if n_hit == 0:
+        return None
+    hit_pairs = twt.empty_2d((n_hit, 2), wp.int32, device=device)
+    wp.launch(
+        kernel_intersections.compact_candidate_pairs,
+        dim=n_pairs,
+        inputs=[flags, pairs, swapped, hit_pairs],
+        device=device,
+    )
+    return hit_pairs
 
 
 def collision_masks(
@@ -766,9 +651,9 @@ def collision_masks(
     mask_b = wp.zeros(n_faces_b, dtype=wp.bool, device=device)
 
     # The narrow phase runs inside the marking kernel, over the unfiltered candidates: the masks
-    # need no compacted pair list, so the verdict buffer, its compaction and readback, the gather
-    # and the column swap ``mesh_collision_pairs`` pays for are all skipped. The candidate columns
-    # are ``(query, target)``, so ``swapped`` only decides which mask is which.
+    # need no compacted pair list, so the verdict flags, their scan and readback and the compaction
+    # ``mesh_collision_pairs`` pays for are all skipped. The candidates are ``(query, target)``, so
+    # ``swapped`` only decides which mask is which.
     candidates = _candidate_face_pairs(
         vertices_a, faces_a, vertices_b, faces_b, max_triangle_collisions, "mesh_collision_pairs"
     )
@@ -778,7 +663,7 @@ def collision_masks(
     mask_query, mask_target = (mask_b, mask_a) if swapped else (mask_a, mask_b)
     wp.launch(
         kernel_intersections.mark_intersecting_pair_masks,
-        dim=int(pairs.shape[0]),
+        dim=int(pairs.shape[1]),
         inputs=[
             query_vertices,
             query_faces,
@@ -791,6 +676,95 @@ def collision_masks(
         device=device,
     )
     return mask_a, mask_b
+
+
+def _candidate_face_pairs(
+    vertices_a: wp.array[wp.vec3],
+    faces_a: wp.array[wp.int32],
+    vertices_b: wp.array[wp.vec3],
+    faces_b: wp.array[wp.int32],
+    max_triangle_collisions: int,
+    caller: str,
+) -> (
+    tuple[
+        twt.Array2dInt32,
+        wp.array[wp.vec3],
+        wp.array[wp.int32],
+        wp.array[wp.vec3],
+        wp.array[wp.int32],
+        bool,
+    ]
+    | None
+):
+    """
+    Broad phase alone for two meshes: every candidate ``(query, target)`` pair, or ``None``.
+
+    Returns ``(pairs, query_vertices, query_faces, target_vertices, target_faces, swapped)``, where
+    ``pairs`` is a ``(2, n)`` table -- row 0 the query face, row 1 the target face -- and
+    ``swapped`` says whether the query is mesh **b**. The smaller mesh supplies the BVH, so which
+    input is the query depends on the face counts. Every caller runs its narrow phase in the kernel
+    that consumes the candidates.
+
+    Raises
+    ------
+    ValueError
+        If ``max_triangle_collisions`` is less than 1.
+    """
+    # Before the empty-mesh early return, not after: the three public callers all document this
+    # unconditionally ("Raises: ValueError if max_triangle_collisions is less than 1"), and an empty
+    # mesh plus an invalid cap must not silently return `None` instead.
+    if max_triangle_collisions < 1:
+        raise ValueError("max_triangle_collisions must be >= 1")
+    device = vertices_a.device
+    n_faces_a = int(faces_a.shape[0]) // 3
+    n_faces_b = int(faces_b.shape[0]) // 3
+    if n_faces_a == 0 or n_faces_b == 0:
+        return None
+
+    # The smaller mesh supplies the BVH, so the larger one's faces are the queries.
+    swapped = n_faces_a <= n_faces_b
+    if swapped:
+        target_vertices, target_faces = vertices_a, faces_a
+        query_vertices, query_faces = vertices_b, faces_b
+    else:
+        target_vertices, target_faces = vertices_b, faces_b
+        query_vertices, query_faces = vertices_a, faces_a
+
+    n_query = int(query_faces.shape[0]) // 3
+    require_nonempty_mesh(target_faces, caller)
+    target_mesh = wp.Mesh(points=target_vertices, indices=target_faces)
+
+    # Two passes of one BVH walk per query face over its stored box: a count, a scan sizing the
+    # table (its total is the one readback), and a fill writing each candidate as a
+    # ``(query, target)`` column.
+    lower = wp.empty(n_query, dtype=wp.vec3, device=device)
+    upper = wp.empty(n_query, dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_triangles.face_aabb_bounds,
+        dim=n_query,
+        inputs=[query_vertices, query_faces, lower, upper],
+        device=device,
+    )
+    hit_counts = wp.empty(n_query, dtype=wp.int32, device=device)
+    max_hits = wp.int32(max_triangle_collisions)
+    wp.launch(
+        kernel_proximity.query_mesh_aabb_count,
+        dim=n_query,
+        inputs=[lower, upper, target_mesh.id, max_hits, hit_counts],
+        device=device,
+    )
+    offsets, n_pairs = tw.array.counts_to_offsets(hit_counts)
+    if n_pairs == 0:
+        return None
+
+    pairs = twt.empty_2d((2, n_pairs), wp.int32, device=device)
+    wp.launch(
+        kernel_intersections.query_face_candidate_pairs,
+        dim=n_query,
+        inputs=[lower, upper, target_mesh.id, max_hits, offsets, pairs],
+        device=device,
+    )
+    return pairs, query_vertices, query_faces, target_vertices, target_faces, swapped
 
 
 def slice_mesh_with_plane(
@@ -1012,17 +986,7 @@ def split_mesh_with_plane(
     wp.launch(
         kernel_intersections.label_faces_by_plane_side,
         dim=n_out,
-        inputs=[
-            new_vertices,
-            new_faces,
-            # The appended crossing points sit on the plane by construction, so their dots are zero
-            # to rounding; recomputing over the grown buffer is one map and avoids tracking which
-            # tail entries to zero.
-            _plane_dots(new_vertices, plane_normal, plane_origin),
-            plane_normal,
-            wp.float32(tolerance),
-            above,
-        ],
+        inputs=[new_vertices, new_faces, plane_normal, plane_origin, wp.float32(tolerance), above],
         device=device,
     )
     return new_vertices, new_faces, above
@@ -1459,33 +1423,29 @@ def _slice_class_partition(
     Split the classified faces into one index array per kept class.
 
     The classes are disjoint, so their selection flags live as ``n_classes`` blocks of one buffer,
-    which the classifier writes alongside the classes themselves, and one inclusive scan compacts
-    all of them: block ``b``'s indices land contiguously, and the running totals at the block ends
-    give the counts in a single small readback. Each returned array is a contiguous view of one
-    buffer, ascending in face index like the [`flatnonzero`][triwarp.array.flatnonzero] calls it
-    replaces; that buffer is returned too, for a caller that wants several leading blocks at once.
+    which the classifier writes alongside the classes themselves, and one inclusive scan -- in
+    place, so ``flags`` is consumed -- compacts all of them: block ``b``'s indices land
+    contiguously, and the running totals at the block ends give the counts in a single small
+    readback. Each returned array is a contiguous view of one ``n_faces`` buffer, ascending in face
+    index like the [`flatnonzero`][triwarp.array.flatnonzero] calls it replaces; that buffer is
+    returned too, for a caller that wants several leading blocks at once.
     """
     device = flags.device
     blocked = n_classes * n_faces
-    inclusive = wp.empty(blocked, dtype=wp.int32, device=device)
-    wp.utils.array_scan(flags, out_array=inclusive, inclusive=True)
+    inclusive = flags
+    wp.utils.array_scan(inclusive, out_array=inclusive, inclusive=True)
+    # The classes are disjoint, so their indices fit one ``n_faces`` buffer whatever the split,
+    # and the compaction can run before the counts are known.
+    indices = wp.empty(n_faces, dtype=wp.int32, device=device)
     counts = wp.empty(n_classes, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_intersections.slice_class_counts,
-        dim=1,
-        inputs=[inclusive, wp.int32(n_faces), wp.int32(n_classes), counts],
+        kernel_intersections.scatter_slice_class,
+        dim=blocked,
+        inputs=[inclusive, wp.int32(n_faces), indices, counts],
         device=device,
     )
     # The one host synchronization in the slice: these counts size every buffer downstream.
     class_counts = [int(count) for count in counts.numpy()]
-
-    indices = wp.empty(sum(class_counts), dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_intersections.scatter_slice_class,
-        dim=blocked,
-        inputs=[flags, inclusive, wp.int32(n_faces), indices],
-        device=device,
-    )
 
     def block(start: int, count: int) -> wp.array[wp.int32]:
         # Warp rejects a zero-length slice outright, so an empty class gets its own empty buffer.

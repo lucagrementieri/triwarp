@@ -33,8 +33,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import require_same_device
-from triwarp.kernels import array as kernel_array
+from triwarp._device import read_scalar, require_same_device
 from triwarp.kernels import seams as kernel_seams
 
 # Whether the seam predicate compares coordinates rather than texcoord indices. A lookup rather than
@@ -106,25 +105,40 @@ def crease_edges(
     adjacency, adjacency_edges = tw.adjacency.face_adjacency(
         faces, return_edges=True, n_vertices=int(vertices.shape[0])
     )
-    selected = twt.empty_2d((0, 2), wp.int32, device=device)
-    if int(adjacency.shape[0]) > 0:
-        angles = tw.adjacency.face_adjacency_angles(vertices, faces, face_adjacency=adjacency)
-        mask = wp.empty(int(angles.shape[0]), dtype=wp.bool, device=device)
-        # Strictly greater, so ``angle=0`` selects every non-coplanar interior edge.
-        wp.map(kernel_array.greater, angles, wp.float32(math.radians(angle)), out=mask)
-        selected = tw.array.gather(adjacency_edges, tw.array.flatnonzero(mask))
+    n_rows = int(adjacency.shape[0])
+    n_creases = 0
+    # One flag per adjacency row, scanned in place: the total is the scan's last entry.
+    inclusive = wp.empty(n_rows, dtype=wp.int32, device=device)
+    if n_rows > 0:
+        wp.launch(
+            kernel_seams.crease_flags,
+            dim=n_rows,
+            inputs=[vertices, faces, adjacency, wp.float32(math.radians(angle)), inclusive],
+            device=device,
+        )
+        wp.utils.array_scan(inclusive, out_array=inclusive, inclusive=True)
+        n_creases = int(read_scalar(inclusive))
 
-    if not include_boundary:
-        return twt.as_array2d(selected, wp.int32)
-    boundary = tw.boundary.boundary_edges(vertices, faces)
-    if int(boundary.shape[0]) == 0:
-        return twt.as_array2d(selected, wp.int32)
-    if int(selected.shape[0]) == 0:
+    boundary = None
+    n_boundary = 0
+    if include_boundary:
+        boundary = tw.boundary.boundary_edges(vertices, faces)
+        n_boundary = int(boundary.shape[0])
+    if n_creases == 0 and boundary is not None:
         return twt.as_array2d(boundary, wp.int32)
-    # ``array.concatenate`` takes rank-1 arrays only (CLAUDE.md section 3.4); flatten the two
-    # ``(n, 2)`` row buffers, concatenate, and reshape back rather than handing it a rank-2 array.
-    combined = tw.array.concatenate([selected.flatten(), boundary.flatten()])
-    return twt.as_array2d(combined.reshape((-1, 2)), wp.int32)
+
+    # The creases fill the head of the result and the boundary edges, when asked for, its tail.
+    edges = twt.empty_2d((n_creases + n_boundary, 2), wp.int32, device=device)
+    if n_creases > 0:
+        wp.launch(
+            kernel_seams.scatter_crease_edges,
+            dim=n_rows,
+            inputs=[inclusive, adjacency_edges, edges],
+            device=device,
+        )
+    if boundary is not None and n_boundary > 0:
+        wp.copy(edges, boundary, dest_offset=2 * n_creases, count=2 * n_boundary)
+    return edges
 
 
 def cut_along_edges(
@@ -184,7 +198,8 @@ def cut_along_edges(
     TypeError
         If ``edges`` is not a rank-2 ``int32`` array.
     ValueError
-        If ``edges`` does not have two columns, or ``faces`` is not edge-manifold.
+        If ``edges`` does not have two columns, or, when ``twins`` is not given, ``faces`` is not
+        edge-manifold or not consistently wound.
     RuntimeError
         If ``vertices``, ``faces``, ``edges`` and ``twins`` are not all on one device.
 
@@ -219,34 +234,36 @@ def cut_along_edges(
     # a row given in either order match.
     marked_keys = tw.grouping.sorted_undirected_edge_keys(edges, n_vertices)
 
-    union_edges = twt.empty_2d((n_halfedges, 2), wp.int32, device=device)
-    count = wp.zeros(1, dtype=wp.int32, device=device)
+    # Components over the corners, by union-find straight over the halfedges: each halfedge names
+    # one join of the corner graph (a self-loop where its edge is a boundary or marked), formed in
+    # the thread, so no edge list is materialised or compacted. Every root is its component's
+    # smallest corner.
+    key_base = wp.uint64(n_vertices)
+    union_inputs = [faces, twins, marked_keys, key_base]
+    parents = tw.array.arange(n_halfedges, device=device)
+    for kernel in (kernel_seams.corner_union_prehook, kernel_seams.corner_union_hook):
+        wp.launch(kernel, dim=n_halfedges, inputs=[*union_inputs, parents], device=device)
+    roots = wp.empty(n_halfedges, dtype=wp.int32, device=device)
+    root_ranks = wp.empty(n_halfedges, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_seams.corner_union_edges,
+        kernel_seams.corner_roots,
         dim=n_halfedges,
-        inputs=[faces, twins, marked_keys, wp.uint64(n_vertices), union_edges, count],
+        inputs=[parents, roots, root_ranks],
         device=device,
     )
-    _n_union, (graph_edges,) = tw.array.trim_to_count(count, union_edges)
-
-    # Components over the corners. ``validate=False``: both endpoints are halfedge indices this
-    # kernel just produced, so they are in range by construction and the check would only add a
-    # sync.
-    labels = tw.graph.connected_component_labels_from_edges(
-        twt.as_array2d(graph_edges, wp.int32), node_count=n_halfedges, validate=False
-    )
-    unique_labels, corner_index = tw.grouping.unique_1d(labels, return_inverse=True)
-
-    out_vertices = wp.empty(int(unique_labels.shape[0]), dtype=vertices.dtype, device=device)
+    # Scanned in place, a root's flag becomes its rank plus one among the roots in ascending order,
+    # which numbers the output vertices by their smallest corner; the total is the last entry.
+    wp.utils.array_scan(root_ranks, out_array=root_ranks, inclusive=True)
+    out_vertices = wp.empty(int(read_scalar(root_ranks)), dtype=vertices.dtype, device=device)
+    # The union-find is done with ``parents``, so it takes the new face buffer: corner ``h`` of the
+    # flat layout is entry ``h``.
+    corner_index = parents
     wp.launch(
         kernel_seams.SCATTER_CORNER_VALUES[vertices.dtype],
         dim=n_halfedges,
-        inputs=[faces, corner_index, vertices, out_vertices],
+        inputs=[faces, roots, root_ranks, vertices, corner_index, out_vertices],
         device=device,
     )
-    # ``corner_index`` *is* the new face buffer: corner ``h`` of the flat layout is entry ``h``. It
-    # is ``unique_1d``'s own freshly allocated inverse -- not a view of shared scratch, unlike the
-    # unique values -- so it is returned as it is rather than cloned.
     return out_vertices, corner_index
 
 
@@ -326,8 +343,8 @@ def uv_seam_edges(
         If ``match="index"`` is asked for without ``face_texcoords``; if ``face_texcoords`` is
         present but not the same length as ``faces``, or has an entry outside
         ``[0, texcoords.shape[0])``; if ``face_texcoords`` is ``None`` and ``texcoords`` is not
-        length ``3 * n_faces``; if ``faces`` is not edge-manifold; or if ``match`` is neither
-        ``"index"`` nor ``"uv"``.
+        length ``3 * n_faces``; if ``faces`` is not edge-manifold or not consistently wound (when
+        ``twins`` is not given); or if ``match`` is neither ``"index"`` nor ``"uv"``.
     RuntimeError
         If ``faces``, ``texcoords``, ``face_texcoords`` and ``twins`` are not all on one device.
 
@@ -348,8 +365,9 @@ def uv_seam_edges(
       out in ascending canonical-halfedge order, which is face-major and deterministic.
     - **Non-manifold edges** raise, because "the other side" of an edge with three triangles is not
       defined. igl's hash map silently keeps whichever half-edge it saw last.
-    - **Inconsistent winding.** Two same-direction half-edges on one edge pair up here (edges are
-      matched undirected); igl's directed map loses one of them and reports the edge as a boundary.
+    - **Inconsistent winding** raises, like a non-manifold edge, unless ``twins`` is supplied;
+      igl's directed map loses one of two same-direction half-edges and reports the edge as a
+      boundary. A supplied table that pairs same-direction half-edges is classified correctly.
     - **Precision.** The foldover orientation test runs in ``float32``; igl uses the input scalar
       type.
     - igl also takes ``V``, but reads only its row count — the ``n_vertices`` argument here.
@@ -369,10 +387,10 @@ def uv_seam_edges(
     if twins is None:
         twins = tw.halfedge.halfedge_twins(faces, n_vertices=n_vertices)
 
-    # Row ``k`` flags class ``k + 1`` (seam, boundary, foldover). One inclusive scan over the
-    # flattened table numbers all three blocks, and the per-class totals come back in one read.
+    # Row ``k`` flags class ``k + 1`` (seam, boundary, foldover). One inclusive scan of the
+    # flattened table, in place, numbers all three blocks, and its last column holds the running
+    # totals that size them -- read back together in one copy.
     flags = twt.empty_2d((3, n_halfedges), wp.int32, device=device)
-    counts = wp.zeros(3, dtype=wp.int32, device=device)
     wp.launch(
         kernel_seams.classify_uv_halfedges,
         dim=n_halfedges,
@@ -385,22 +403,23 @@ def uv_seam_edges(
             match_uv,
             wp.float32(tolerance * tolerance),
             flags,
-            counts,
         ],
         device=device,
     )
-    inclusive = twt.empty_2d((3, n_halfedges), wp.int32, device=device)
-    wp.utils.array_scan(flags.flatten(), out_array=inclusive.flatten(), inclusive=True)
-    # One readback sizes all three outputs.
-    n_seams, n_boundaries, n_foldovers = (int(count) for count in counts.numpy())
+    inclusive = flags.flatten()
+    wp.utils.array_scan(inclusive, out_array=inclusive, inclusive=True)
+    totals = flags[:, n_halfedges - 1].numpy()
+    n_seams = int(totals[0])
+    n_boundaries = int(totals[1]) - n_seams
+    n_foldovers = int(totals[2]) - int(totals[1])
     seams = twt.empty_2d((n_seams, 4), wp.int32, device=device)
     boundaries = twt.empty_2d((n_boundaries, 2), wp.int32, device=device)
     foldovers = twt.empty_2d((n_foldovers, 4), wp.int32, device=device)
-    if n_seams + n_boundaries + n_foldovers > 0:
+    if int(totals[2]) > 0:
         wp.launch(
             kernel_seams.scatter_uv_halfedges,
             dim=n_halfedges,
-            inputs=[faces, twins, flags, inclusive, counts, seams, boundaries, foldovers],
+            inputs=[faces, twins, inclusive, seams, boundaries, foldovers],
             device=device,
         )
     return seams, boundaries, foldovers
@@ -514,7 +533,8 @@ def uv_seam_vertex_mask(
         without ``face_texcoords``, if ``face_texcoords`` is present but not the same length as
         ``faces`` or has an entry outside ``[0, texcoords.shape[0])``, if ``face_texcoords`` is
         ``None`` and ``texcoords`` is not length ``3 * n_faces``, if ``faces`` is not
-        edge-manifold, or if ``match`` is neither ``"index"`` nor ``"uv"``.
+        edge-manifold or not consistently wound, or if ``match`` is neither ``"index"`` nor
+        ``"uv"``.
     RuntimeError
         If ``faces``, ``texcoords`` and ``face_texcoords`` are not all on one device.
 

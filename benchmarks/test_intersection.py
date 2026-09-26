@@ -486,9 +486,10 @@ def test_mesh_collision_pairs(bench_case: BenchCase, offset_fraction: float) -> 
     """
     The same broad and narrow phase as ``mesh_with_mesh``, stopping before the segments.
 
-    Read the two groups against each other: they share ``_colliding_face_pairs`` verbatim, so the
-    gap is exactly what computing an intersection *segment* per crossing pair costs, plus the
-    degenerate-segment filter. That is the reason this exists as its own group rather than being
+    Read the two groups against each other: they share the broad phase (``_candidate_face_pairs``)
+    verbatim and run the same narrow phase over its candidates, each compacting once, so the gap is
+    what computing an intersection *segment* per crossing pair costs, plus the degenerate-segment
+    filter. That is the reason this exists as its own group rather than being
     assumed cheaper.
 
     meshlib's ``findCollidingTriangleBitsets`` answers the same question and returns the two masks;

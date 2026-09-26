@@ -20,8 +20,7 @@ import warp as wp
 
 import triwarp as tw
 from triwarp._device import read_scalar, require_same_device
-from triwarp.constants import INDEX_RADIX_PAIR, INT32_MAX
-from triwarp.kernels import adjacency as kernel_adjacency
+from triwarp.constants import INT32_MAX
 from triwarp.kernels import halfedge as kernel_halfedge
 
 
@@ -333,15 +332,7 @@ def _pair_halfedges(
     # reduction plus a host readback for a fifth of this call. The keys are written straight from
     # the faces (``adjacency.face_edge_keys``), the same keys ``faces_to_edges(sorted=True)`` plus
     # ``hash_indices_rows`` produce without the ``(3F, 2)`` rows between them.
-    keys = wp.empty(n_halfedges, dtype=wp.uint64, device=device)
-    wp.launch(
-        kernel_adjacency.face_edge_keys,
-        dim=n_halfedges // 3,
-        inputs=[faces, wp.uint64(INDEX_RADIX_PAIR if n_vertices is None else n_vertices)],
-        outputs=[keys],
-        device=device,
-    )
-    sorted_keys, order = tw.array.sort_and_argsort(keys)
+    sorted_keys, order = tw.adjacency.sorted_face_edge_keys(faces, n_vertices=n_vertices)
 
     # Slot 0 counts edge-non-manifold edges, slot 1 edges whose two halfedges run the same way;
     # one buffer so the two rejections cost one readback between them rather than two.

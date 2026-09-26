@@ -1333,6 +1333,42 @@ def test_point_duplicate_mask_separates_one_ulp(device: str) -> None:
     assert int(_unique_bucketed.shape[0]) == 1  # the bucketed key merges all three
 
 
+def _position_hash_slot_np(points_np: np.ndarray, mask: int) -> np.ndarray:
+    """``kernels.points.position_hash_slot`` in NumPy, to construct colliding positions."""
+    bits = points_np.view(np.uint32).astype(np.uint64)
+    bits[points_np == 0.0] = 0  # the two zeros fold together
+    mult = np.uint64(11400714819323198485)
+    with np.errstate(over="ignore"):
+        key = ((bits[:, 0] << np.uint64(32)) | bits[:, 1]) ^ (bits[:, 2] * mult)
+        h = key * mult
+    h ^= h >> np.uint64(32)
+    return (h & np.uint64(mask)).astype(np.int64)
+
+
+def test_point_duplicate_mask_distinct_points_sharing_a_slot(device: str) -> None:
+    """
+    Not a library comparison: a hash collision between *distinct* positions is not a duplicate.
+
+    The table stores point indices and compares a candidate's bits against the prober's own, so
+    two positions landing on one home slot must stay two classes. Four points make an eight-slot
+    table; the first two are distinct positions chosen to share a home slot (asserted through a
+    NumPy transcription of the hash, so the fixture cannot silently stop colliding), the last two
+    repeat them. A mask that trusted the slot would flag rows 1 and 3 alike.
+    """
+    rng = np.random.default_rng(7)
+    candidates_np = rng.random((64, 3)).astype(np.float32)
+    slots_np = _position_hash_slot_np(candidates_np, 7)
+    first = 0
+    second = int(np.flatnonzero(slots_np[1:] == slots_np[first])[0]) + 1
+    points_np = candidates_np[[first, second, first, second]]
+    assert _position_hash_slot_np(points_np[:2], 7).tolist() == [slots_np[first]] * 2
+    assert not np.array_equal(points_np[0], points_np[1])
+
+    duplicate_wp = tw.point_duplicate_mask(points_to_warp(points_np, device)).numpy()
+
+    assert np.array_equal(duplicate_wp, np.array([False, False, True, True]))
+
+
 @pytest.mark.parity("farthest_point_sample", "open3d")
 def test_farthest_point_sample_matches_open3d(device: str) -> None:
     """

@@ -608,22 +608,21 @@ def _collapse_pass(
             current = incidence
             break
 
-        remapped = wp.empty(3 * n_faces, dtype=wp.int32, device=device)
-        valid = wp.empty(n_faces, dtype=wp.bool, device=device)
-        wp.launch(
-            kernel_remesh.remap_faces_with_distinct_mask,
-            dim=n_faces,
-            inputs=[faces, remap, remapped, valid],
-            device=device,
-        )
-        kept = tw.array.flatnonzero(valid)
-        faces = tw.array.gather(remapped.reshape((n_faces, 3)), kept).reshape(-1)
-        vertices, faces, _, surviving = tw.repair.remove_unreferenced_vertices(
-            positions, faces, return_inverse=True
-        )
-        # ``surviving`` is the new-to-old vertex map, so the bands follow the compaction exactly.
-        low = tw.array.gather(low, surviving)
-        high = tw.array.gather(high, surviving)
+        # Drop the faces the collapses degenerated and the vertices no face names any more, in one
+        # scan: the positions and both length bands are compacted together, so neither band is
+        # re-sampled.
+        ranks, faces, n_kept = _compact_remapped_faces(faces, remap, n_vertices)
+        vertices = wp.empty(n_kept, dtype=wp.vec3, device=device)
+        kept_low = wp.empty(n_kept, dtype=wp.float32, device=device)
+        kept_high = wp.empty(n_kept, dtype=wp.float32, device=device)
+        if n_kept > 0:
+            wp.launch(
+                kernel_remesh.compact_collapse_vertices,
+                dim=n_vertices,
+                inputs=[positions, low, high, ranks, vertices, kept_low, kept_high],
+                device=device,
+            )
+        low, high = kept_low, kept_high
 
     return vertices, faces, current
 
@@ -967,6 +966,10 @@ class _FlipTopology:
         self._n_faces = int(faces.shape[0]) // 3
         self._n_corners = self._n_faces * 3
         self._radix = wp.uint64(n_vertices)
+        # A key packs an edge as ``min + max * n_vertices``, so every key is below
+        # ``n_vertices ** 2`` and the sort orders only that many low bits: the stable sort's
+        # permutation is identical, and a 64-bit sort's fixed per-digit passes dominate a regroup.
+        self._key_bits = max(1, (n_vertices * n_vertices - 1).bit_length())
         n = self._n_corners
         # ``radix_sort_pairs`` ping-pongs through the upper half of both buffers, so each is
         # double width and only ``[:n]`` is data. The sorted keys are the duplicate-edge table.
@@ -1016,7 +1019,7 @@ class _FlipTopology:
             inputs=[wp.int32(n), wp.int32(-1), self._order],
             device=self._device,
         )
-        wp.utils.radix_sort_pairs(self._keys, self._order, count=n)
+        wp.utils.radix_sort_pairs(self._keys, self._order, count=n, end_bit=self._key_bits)
         self.built = True
         wp.launch(
             kernel_remesh.mark_edge_pair_starts,
@@ -1208,48 +1211,31 @@ def cluster_decimate(
     # The unique cell keys *are* the clusters, so their count is the answer. Only the keys and the
     # inverse are wanted, so this is ``unique_rows`` without its representative-row gather.
     cell_keys, labels = tw.grouping.unique_1d(
-        tw.grouping.hash_indices_rows(cells, cell_bound, validate=False), return_inverse=True
+        tw.grouping.hash_indices_rows(cells, cell_bound, validate=False),
+        return_inverse=True,
+        max_value=min(cell_bound**3, 1 << 64) - 1,
     )
     n_clusters = int(cell_keys.shape[0])
 
-    remapped = wp.empty(3 * n_faces, dtype=wp.int32, device=device)
-    distinct = wp.empty(n_faces, dtype=wp.bool, device=device)
-    referenced = wp.zeros(n_clusters, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_remesh.cluster_remap_faces,
-        dim=n_faces,
-        inputs=[faces, labels, remapped, distinct, referenced],
-        device=device,
-    )
-    # The output keeps the clusters some surviving face names, in cluster order: an exclusive scan
-    # of their marks is each one's compacted index, and its total -- read back because it sizes
-    # the vertex buffer and the face-key radix -- is the output vertex count.
-    ranks, n_kept = tw.array.counts_to_offsets(referenced)
+    # Welding can map two distinct input faces onto the same triple, which would leave a duplicated
+    # face rather than a manifold one, so the dedup below is part of the algorithm rather than
+    # polish. It runs over the *surviving* faces only, compacted first: at a coarse voxel size
+    # nearly every face collapses, and a dedup over all of them -- padding the collapsed ones into
+    # a class of their own -- hashes and searches the whole input for an answer the size of the
+    # output. A dropped duplicate names the same three vertices as the copy that is kept, so the
+    # vertex compaction stands.
+    ranks, compacted, n_kept = _compact_remapped_faces(faces, labels, n_clusters)
     if n_kept == 0:
         return (
             wp.empty(0, dtype=wp.vec3, device=device),
             wp.empty(0, dtype=wp.int32, device=device),
         )
     kept_vertices = _cluster_positions(
-        vertices, labels, n_clusters, origin, voxel_size, contraction, referenced, ranks, n_kept
+        vertices, labels, n_clusters, origin, voxel_size, contraction, ranks, n_kept
     )
-    # Welding can map two distinct input faces onto the same triple, which would leave a duplicated
-    # face rather than a manifold one, so the dedup is part of the algorithm rather than polish.
-    # It runs over the *surviving* faces only, compacted first: at a coarse voxel size nearly every
-    # face collapses, and a dedup over all of them -- padding the collapsed ones into a class of
-    # their own -- hashes and searches the whole input for an answer the size of the output. A
-    # dropped duplicate names the same three vertices as the copy that is kept, so the vertex
-    # compaction above stands.
-    surviving = tw.array.flatnonzero(distinct)
-    n_surviving = int(surviving.shape[0])
-    compacted = wp.empty(3 * n_surviving, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_remesh.cluster_compact_surviving_faces,
-        dim=n_surviving,
-        inputs=[remapped, surviving, ranks, compacted],
-        device=device,
-    )
-    return kept_vertices, tw.grouping.unique_faces(compacted)
+    # Every entry is a compacted rank below ``n_kept`` by construction, which is the bound the face
+    # dedup would otherwise reduce the buffer to find.
+    return kept_vertices, tw.grouping.unique_faces(compacted, max_index=n_kept)
 
 
 def _cluster_positions(
@@ -1259,14 +1245,14 @@ def _cluster_positions(
     origin: wp.vec3,
     voxel_size: float,
     contraction: Literal["average", "closest"],
-    referenced: wp.array[wp.int32],
     ranks: wp.array[wp.int32],
     n_kept: int,
 ) -> wp.array[wp.vec3]:
     """
     One representative position per referenced cell, by cell mean or by nearest-to-centre.
 
-    Written straight into the compacted slot ``ranks`` gives each cell ``referenced`` marks.
+    Written straight into the compacted slot ``ranks`` gives each cell (see
+    ``_compact_remapped_faces``).
     """
     device = vertices.device
     n_vertices = int(vertices.shape[0])
@@ -1283,7 +1269,7 @@ def _cluster_positions(
         wp.launch(
             kernel_remesh.cluster_compact_means,
             dim=n_clusters,
-            inputs=[sums, counts, referenced, ranks, out],
+            inputs=[sums, counts, ranks, out],
             device=device,
         )
         return out
@@ -1305,10 +1291,53 @@ def _cluster_positions(
     wp.launch(
         kernel_remesh.cluster_compact_representatives,
         dim=n_clusters,
-        inputs=[vertices, representative, referenced, ranks, out],
+        inputs=[vertices, representative, ranks, out],
         device=device,
     )
     return out
+
+
+def _compact_remapped_faces(
+    faces: wp.array[wp.int32], remap: wp.array[wp.int32], n_targets: int
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32], int]:
+    """
+    Faces pushed through a vertex remap, with the collapsed ones dropped and the targets compacted.
+
+    Returns ``(ranks, compacted_faces, n_kept)``. A face survives when its three remapped corners
+    are distinct; the targets kept are those a surviving face names, in target order, and
+    ``compacted_faces`` holds the surviving faces in input order renumbered onto them -- a
+    face-mask ``submesh`` followed by ``repair.remove_unreferenced_vertices``. ``ranks`` is the
+    ``n_targets + 1`` scan ``kernels/remesh.scanned_slot`` reads each target's slot from.
+
+    One marking launch, one scan over the face flags and the target marks together, one compaction
+    that also publishes both counts, and one read of them. The compacted buffer is sized for every
+    face so that launch can publish the counts before the host knows them; the result is its
+    leading view.
+    """
+    device = faces.device
+    n_faces = int(faces.shape[0]) // 3
+    # Behind a leading zero: the face flags, then the target marks, so one inclusive scan of the
+    # tail makes each half an exclusive scan ending in its running total.
+    scan = wp.zeros(1 + n_faces + n_targets, dtype=wp.int32, device=device)
+    marks = scan[1:]
+    wp.launch(
+        kernel_remesh.mark_surviving_faces, dim=n_faces, inputs=[faces, remap, marks], device=device
+    )
+    wp.utils.array_scan(marks, marks, inclusive=True)
+    ranks = twt.as_dense(scan[n_faces:])
+    compacted = wp.empty(3 * n_faces, dtype=wp.int32, device=device)
+    totals = wp.empty(2, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_remesh.compact_surviving_faces,
+        dim=n_faces,
+        inputs=[faces, remap, scan[: n_faces + 1], ranks, compacted, totals],
+        device=device,
+    )
+    # Both counts size what the caller allocates next, so they come back -- together, in one copy.
+    n_kept, n_surviving = (int(count) for count in totals.numpy())
+    if n_surviving == 0:
+        return ranks, wp.empty(0, dtype=wp.int32, device=device), n_kept
+    return ranks, twt.as_dense(compacted[: 3 * n_surviving]), n_kept
 
 
 @overload
@@ -3008,6 +3037,7 @@ def subdivide_to_size(
 
         # Flag the edges that are longer than the target length, measuring each where it is tested.
         long_mask = wp.empty(m, dtype=wp.bool, device=device)
+        rank_buffer = wp.zeros(m + 1, dtype=wp.int32, device=device)
         wp.launch(
             kernel_remesh.mark_long_edges,
             dim=m,
@@ -3018,6 +3048,7 @@ def subdivide_to_size(
                 sizing,
                 wp.bool(sizing is not None),
                 long_mask,
+                rank_buffer[1:],
             ],
             device=device,
         )
@@ -3027,17 +3058,21 @@ def subdivide_to_size(
         # value the edge was tested against, so a run of passes cannot drift the field. Computed
         # before the split because it reads the pre-split edge rows.
         # The ranks are taken once here and shared by the sizing extension and the split.
-        offsets, n_split = tw.array.mask_to_compact_ranks(long_mask)
+        offsets, n_split = _ranks_from_flags(rank_buffer)
+        # Every edge is short enough: we are done. The count is already on the host, so the pass
+        # that finds nothing to split stops here rather than running a split that only copies.
+        if n_split == 0:
+            break
+        # Ran out of passes with over-long edges still present.
+        if i >= max_iter:
+            raise ValueError("max_iter exceeded!")
         next_sizing = (
             None
             if sizing is None
             else _extend_sizing_field(sizing, unique_edges, long_mask, offsets, n_split)
         )
 
-        # ``index`` rides through the split rather than being gathered afterwards, and the "did
-        # anything split" test reads the resulting face count rather than reducing the mask: a face
-        # count strictly grows when a mask is non-empty and is unchanged when it is empty, so this
-        # is exact and costs nothing.
+        # ``index`` rides through the split rather than being gathered afterwards.
         new_vertices, new_faces, new_index = _split_ranked_edges(
             current_vertices,
             current_faces,
@@ -3051,12 +3086,6 @@ def subdivide_to_size(
             None,
             True,
         )
-        # Every edge is short enough: we are done.
-        if int(new_faces.shape[0]) == int(current_faces.shape[0]):
-            break
-        # Ran out of passes with over-long edges still present.
-        if i >= max_iter:
-            raise ValueError("max_iter exceeded!")
         current_vertices, current_faces, index, sizing = (
             new_vertices,
             new_faces,
@@ -3213,18 +3242,19 @@ def subdivide_region_to_size(
         m = int(unique_edges.shape[0])
 
         long_mask = wp.zeros(m, dtype=wp.bool, device=device)
+        rank_buffer = wp.zeros(m + 1, dtype=wp.int32, device=device)
         wp.launch(
             kernel_remesh.mark_long_region_edges,
             dim=3 * n_faces,
             inputs=[current_vertices, unique_edges, region_flags, inverse, max_edge_f],
-            outputs=[long_mask],
+            outputs=[long_mask, rank_buffer[1:]],
             device=device,
         )
 
         # The count drives the stopping test, the budget and the running total. The ranks are the
         # split's own and their scan total is the count, so the split below reuses them rather than
         # scanning the mask a second time; a budget-trimmed mask re-ranks.
-        offsets, n_long = tw.array.mask_to_compact_ranks(long_mask)
+        offsets, n_long = _ranks_from_flags(rank_buffer)
 
         if n_long == 0:
             break
@@ -3450,14 +3480,17 @@ def refine_region_to_density(
 
     for _ in range(max_iter):
         n_faces = int(current_faces.shape[0]) // 3
-        split = wp.empty(n_faces, dtype=wp.int32, device=device)
+        # The flags are written into the tail of the ranks buffer and scanned there, so the emit
+        # reads each face's verdict back as a step in the scan.
+        split_offsets = wp.zeros(n_faces + 1, dtype=wp.int32, device=device)
         wp.launch(
             kernel_remesh.mark_density_splits,
             dim=n_faces,
-            inputs=[current_vertices, current_faces, current_region, scale, alpha_f, split],
+            inputs=[current_vertices, current_faces, current_region, scale, alpha_f],
+            outputs=[split_offsets[1:]],
             device=device,
         )
-        split_offsets, n_split = tw.array.counts_to_offsets(split)
+        _ranks, n_split = _ranks_from_flags(split_offsets)
         if n_split == 0:
             break
 
@@ -3480,7 +3513,6 @@ def refine_region_to_density(
                 current_faces,
                 current_region,
                 scale,
-                split,
                 split_offsets,
                 wp.int32(n_vertices),
             ],
@@ -3557,6 +3589,23 @@ def _vertex_scale_attribute(
     )
     wp.map(kernel_array.divide_if_positive, total, valence, out=total)
     return total
+
+
+def _ranks_from_flags(rank_buffer: wp.array[wp.int32]) -> tuple[wp.array[wp.int32], int]:
+    """
+    Scan the 0/1 flags in ``rank_buffer[1:]`` in place; return the exclusive ranks and their count.
+
+    The buffer is zero-filled and one longer than the flags, so after an inclusive scan of its tail
+    the leading zero makes ``rank_buffer[:n]`` the exclusive ranks and ``rank_buffer[n]`` the
+    count -- ``array.mask_to_compact_ranks`` for a caller whose marking kernel already wrote the
+    flags, which saves converting a mask into them.
+    """
+    n = int(rank_buffer.shape[0]) - 1
+    flags = twt.as_dense(rank_buffer[1:])
+    wp.utils.array_scan(flags, flags, inclusive=True)
+    # The count sizes the split's outputs and decides whether the loop stops, so it has to come
+    # back to the host.
+    return twt.as_dense(rank_buffer[:n]), int(read_scalar(rank_buffer))
 
 
 @overload

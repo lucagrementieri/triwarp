@@ -194,18 +194,10 @@ def centroid(points: wp.array[wp.vec3]) -> wp.array[wp.vec3]:
         Shape ``(1,)`` device array holding the centroid on ``points.device``.
         All-zeros when ``points`` is empty.
     """
-    device = points.device
     n = int(points.shape[0])
-    out = wp.zeros(1, dtype=wp.vec3, device=device)
+    out = _point_sum(points)
     if n == 0:
         return out
-    wp.launch_tiled(
-        kernel_reduce.sum_vec3_1d_tiled,
-        dim=[kernel_reduce.blocks_1d(n)],
-        inputs=[points, out],
-        block_dim=TILE_1D,
-        device=device,
-    )
     wp.map(wp.div, out, wp.float32(n), out=out)
     return out
 
@@ -225,9 +217,9 @@ def gram_matrix(points: wp.array[wp.vec3]) -> wp.array[wp.mat33]:
         Shape ``(1,)`` device array holding the ``3x3`` Gram matrix on
         ``points.device``. All-zeros when ``points`` is empty.
     """
-    # The uncentred Gram matrix is the scatter matrix around a zero center.
-    zero_center = wp.zeros(1, dtype=wp.vec3, device=points.device)
-    return centered_covariance(points, center=zero_center)
+    # The uncentred Gram matrix is the scatter matrix around a zero center, which the kernel
+    # reads off a null center array.
+    return _scatter_matrix(points, None, 1.0)
 
 
 def fit_line(points: wp.array[wp.vec3]) -> wp.vec3:
@@ -312,21 +304,9 @@ def centered_covariance(
         If ``points`` and ``center`` are not all on one device.
     """
     require_same_device(points=points, center=center)
-    device = points.device
-    n = int(points.shape[0])
-    out = wp.zeros(1, dtype=wp.mat33, device=device)
-    if n == 0:
-        return out
-    if center is None:
-        center = centroid(points)
-    wp.launch_tiled(
-        kernel_points.centered_covariance,
-        dim=[kernel_reduce.blocks_1d(n)],
-        inputs=[points, center, out],
-        block_dim=TILE_1D,
-        device=device,
-    )
-    return out
+    if center is not None:
+        return _scatter_matrix(points, center, 1.0)
+    return _scatter_matrix(points, _point_sum(points), float(points.shape[0]))
 
 
 def fit_plane(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
@@ -366,13 +346,14 @@ def fit_plane(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
         # Both zero, so the order is readability rather than behaviour: normal, then centroid.
         return wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.0, 0.0, 0.0)
 
-    # Pass 1: centroid (plane origin) on-device.
-    center = centroid(points)
+    # Pass 1: the point sum on-device; each consumer divides it by ``n`` itself, bit for bit the
+    # centroid ``centroid`` would return, so no division launch runs between the passes.
+    point_sum = _point_sum(points)
 
     # Pass 2: covariance matrix of the centred points. Centring before the
     # outer products (rather than via the sum(x x^T) - n c c^T identity) avoids
     # float32 catastrophic cancellation.
-    cov = centered_covariance(points, center=center)
+    cov = _scatter_matrix(points, point_sum, float(n))
 
     # Pass 3: SVD of the 3x3 covariance and centroid/normal extraction (single thread). Both
     # results land in one buffer and cross to the host in one readback: they are two rows of three
@@ -380,7 +361,10 @@ def fit_plane(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
     # synchronization.
     out_plane = wp.empty(2, dtype=wp.vec3, device=device)
     wp.launch(
-        kernel_points.finalize_fit_plane, dim=1, inputs=[center, cov, out_plane], device=device
+        kernel_points.finalize_fit_plane,
+        dim=1,
+        inputs=[point_sum, wp.float32(n), cov, out_plane],
+        device=device,
     )
     normal, centroid_out = out_plane.numpy()
     return (wp.vec3(*normal), wp.vec3(*centroid_out))
@@ -502,15 +486,15 @@ def principal_axes(points: wp.array[wp.vec3]) -> tuple[wp.mat33, wp.vec3, wp.vec
     if n == 0:
         return wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0), wp.vec3(), wp.vec3()
 
-    center = centroid(points)
-    scatter = centered_covariance(points, center=center)
+    point_sum = _point_sum(points)
+    scatter = _scatter_matrix(points, point_sum, float(n))
     # All three results in one buffer, read back once: fifteen floats is less than a single
     # readback's fixed cost, so three of them bought three synchronizations and nothing else.
     out_frame = wp.empty(5, dtype=wp.vec3, device=device)
     wp.launch(
         kernel_points.finalize_principal_axes,
         dim=1,
-        inputs=[center, scatter, out_frame],
+        inputs=[point_sum, wp.float32(n), scatter, out_frame],
         device=device,
     )
     frame = out_frame.numpy()
@@ -610,15 +594,60 @@ def estimate_normals(
         orient_mode = kernel_points.ORIENT_CENTROID
         reference = wp.vec3(0.0, 0.0, 0.0)
 
-    center = centroid(points)
+    # Only the centroid orientation reads the cloud's centroid, as its raw sum divided in the
+    # kernel; the other two modes pass a null array and skip the reduction.
+    centroid_mode = camera_location is None and orient_reference is None
+    point_sum = _point_sum(points) if centroid_mode else None
     out_normals = wp.empty(n, dtype=wp.vec3, device=device)
     wp.launch(
         kernel_points.estimate_point_normals,
         dim=n,
-        inputs=[points, neighbor_idx, center, orient_mode, reference, out_normals],
+        inputs=[points, neighbor_idx, point_sum, wp.float32(n), orient_mode, reference],
+        outputs=[out_normals],
         device=device,
     )
     return out_normals
+
+
+def _point_sum(points: wp.array[wp.vec3]) -> wp.array[wp.vec3]:
+    """``sum(points)`` as a ``(1,)`` device array, zero when ``points`` is empty."""
+    device = points.device
+    n = int(points.shape[0])
+    out = wp.zeros(1, dtype=wp.vec3, device=device)
+    if n == 0:
+        return out
+    wp.launch_tiled(
+        kernel_reduce.sum_vec3_1d_tiled,
+        dim=[kernel_reduce.blocks_1d(n)],
+        inputs=[points, out],
+        block_dim=TILE_1D,
+        device=device,
+    )
+    return out
+
+
+def _scatter_matrix(
+    points: wp.array[wp.vec3], center: wp.array[wp.vec3] | None, center_divisor: float
+) -> wp.array[wp.mat33]:
+    """
+    ``sum_k outer(x_k - c, x_k - c)`` with ``c = center[0] / center_divisor`` as a ``(1,)`` array.
+
+    ``center`` is either a centroid (``center_divisor = 1.0``, which divides exactly) or the raw
+    point sum with ``n``; ``None`` is the zero center, i.e. the uncentred Gram matrix.
+    """
+    device = points.device
+    n = int(points.shape[0])
+    out = wp.zeros(1, dtype=wp.mat33, device=device)
+    if n == 0:
+        return out
+    wp.launch_tiled(
+        kernel_points.centered_covariance,
+        dim=[kernel_reduce.blocks_1d(n)],
+        inputs=[points, center, wp.float32(center_divisor), out],
+        block_dim=TILE_1D,
+        device=device,
+    )
+    return out
 
 
 def outlier_probability(
@@ -696,7 +725,9 @@ def outlier_probability(
     if n == 0:
         return wp.empty(0, dtype=wp.float32, device=device)
 
-    _mean, standard_distance, _count = _neighbor_distance_moments(neighbor_distance)
+    _mean, standard_distance, _count = _neighbor_distance_moments(
+        neighbor_distance, mean_and_count=False, rms=True
+    )
     plof = wp.empty(n, dtype=wp.float32, device=device)
     wp.launch(
         kernel_points.local_outlier_factor,
@@ -774,68 +805,51 @@ def statistical_outlier_mask(
     if n == 0:
         return out_mask
 
-    mean_distance, _rms, count = _neighbor_distance_moments(neighbor_distance)
+    mean_distance, _rms, count = _neighbor_distance_moments(
+        neighbor_distance, mean_and_count=True, rms=False
+    )
     # Cloud mean and (ddof=1) deviation over the *counted* rows only, exactly as Open3D divides by
-    # its ``valid_distances``. Empty rows contribute zero to both sums, so a plain reduction works.
-    #
-    # The row count and the distance total come back together, from one kernel and one readback:
-    # they are both reductions over the same pass's outputs, and the mask that used to carry the
-    # count between them existed only to be counted. The third reduction below cannot join them --
-    # it needs ``cloud_mean``, which is what these two produce.
-    counted_totals = wp.zeros(2, dtype=wp.float64, device=device)
-    wp.launch_tiled(
+    # its ``valid_distances``. Empty rows contribute zero to every sum, so plain reductions work.
+    # The three slots -- counted rows, distance total, squared deviation -- stay on the device:
+    # the deviation pass reads the mean from the first two and the mask launch the threshold from
+    # all three, so nothing is read back.
+    totals = wp.zeros(3, dtype=wp.float64, device=device)
+    for kernel in (
         kernel_points.accumulate_counted_mean,
-        dim=[kernel_reduce.blocks_1d(n)],
-        inputs=[count, mean_distance, counted_totals],
-        block_dim=TILE_1D,
-        device=device,
-    )
-    counted_np = counted_totals.numpy()
-    counted = int(counted_np[0])
-    if counted < 2:
-        # Too few counted rows for a cloud deviation, but the docstring's "empty or fully
-        # coincident neighbourhood is an outlier" needs no cloud statistic at all -- that half of
-        # `is_statistical_outlier`'s predicate (`count == 0 or mean_distance <= 0.0`) still applies
-        # per point. `threshold=inf` disables only the distance-based third of it, rather than
-        # returning an all-`False` mask that silently drops the other two.
-        wp.map(
-            kernel_points.is_statistical_outlier,
-            mean_distance,
-            count,
-            wp.float32(math.inf),
-            out=out_mask,
+        kernel_points.accumulate_counted_deviation,
+    ):
+        wp.launch_tiled(
+            kernel,
+            dim=[kernel_reduce.blocks_1d(n)],
+            inputs=[count, mean_distance],
+            outputs=[totals],
+            block_dim=TILE_1D,
+            device=device,
         )
-        return out_mask
-    cloud_mean = float(counted_np[1]) / float(counted)
-    deviations = wp.empty(n, dtype=wp.float32, device=device)
-    wp.map(
-        kernel_points.centered_square_if_counted,
-        mean_distance,
-        count,
-        wp.float32(cloud_mean),
-        out=deviations,
-    )
-    cloud_std = math.sqrt(float(tw.reduce.sum(deviations)) / float(counted - 1))
-
-    wp.map(
-        kernel_points.is_statistical_outlier,
-        mean_distance,
-        count,
-        wp.float32(cloud_mean + std_ratio * cloud_std),
-        out=out_mask,
+    wp.launch(
+        kernel_points.statistical_outlier_from_totals,
+        dim=n,
+        inputs=[mean_distance, count, totals, wp.float64(std_ratio)],
+        outputs=[out_mask],
+        device=device,
     )
     return out_mask
 
 
 def _neighbor_distance_moments(
-    neighbor_distance: twt.Array2dFloat32,
+    neighbor_distance: twt.Array2dFloat32, *, mean_and_count: bool, rms: bool
 ) -> tuple[wp.array[wp.float32], wp.array[wp.float32], wp.array[wp.int32]]:
-    """Per-row ``(mean, rms, count)`` of a neighbour-distance table, ignoring ``inf`` slots."""
+    """
+    Per-row ``(mean, rms, count)`` of a neighbour-distance table, ignoring ``inf`` slots.
+
+    A moment a caller does not ask for comes back as a length-zero array and is never written.
+    """
     device = neighbor_distance.device
     n = int(neighbor_distance.shape[0])
-    out_mean = wp.empty(n, dtype=wp.float32, device=device)
-    out_rms = wp.empty(n, dtype=wp.float32, device=device)
-    out_count = wp.empty(n, dtype=wp.int32, device=device)
+    n_mean = n if mean_and_count else 0
+    out_mean = wp.empty(n_mean, dtype=wp.float32, device=device)
+    out_rms = wp.empty(n if rms else 0, dtype=wp.float32, device=device)
+    out_count = wp.empty(n_mean, dtype=wp.int32, device=device)
     wp.launch(
         kernel_points.neighbor_distance_moments,
         dim=n,
@@ -981,9 +995,9 @@ def point_duplicate_mask(points: wp.array[wp.vec3]) -> wp.array[wp.bool]:
     each coordinate to about ``2.4e-4`` relative and so merges positions that are merely close;
     reach for that one when a *tolerance* is what you want, and for this one when equality is.
 
-    Two injective 64-bit key rounds do it: the ``x`` and ``y`` bit patterns pack side by side into
-    one ``int64``, that key's equivalence class packs against the ``z`` bits, and the second class
-    identifies the position exactly. Each half is exactly 32 bits, so neither round can collide.
+    One hashed pass does it: each point probes an open-addressing table of point indices and
+    compares a candidate's three coordinate bit patterns against its own, so a hash collision is
+    never read as a duplicate, and the table keeps each position's smallest index.
 
     Parameters
     ----------
@@ -1027,18 +1041,25 @@ def point_duplicate_mask(points: wp.array[wp.vec3]) -> wp.array[wp.bool]:
     if n == 0:
         return out_mask
 
-    key_xy = wp.empty(n, dtype=wp.int64, device=device)
-    wp.map(kernel_points.pack_xy_bits, points, out=key_xy)
-    _unique_xy, class_xy = tw.grouping.unique_1d(key_xy, return_inverse=True)
-
-    key_xyz = wp.empty(n, dtype=wp.int64, device=device)
-    wp.map(kernel_points.pack_class_z_bits, class_xy, points, out=key_xyz)
-    unique_xyz, class_xyz = tw.grouping.unique_1d(key_xyz, return_inverse=True)
-
-    # The class count is the length of the unique-key array in hand, so the representative pass
-    # needs no reduction of its own.
-    first = tw.grouping.first_occurrence_indices(class_xyz, int(unique_xyz.shape[0]))
-    wp.map(kernel_array.mask_not, tw.array.indices_to_mask(first, n), out=out_mask)
+    # One open-addressing table of point indices, at least twice ``n`` slots, a power of two;
+    # the first pass leaves each class slot holding its smallest index and each point its slot.
+    slot_mask = (1 << max(3, (n - 1).bit_length() + 1)) - 1
+    first = wp.full(slot_mask + 1, -1, dtype=wp.int32, device=device)
+    slot = wp.empty(n, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_points.point_duplicate_first,
+        dim=n,
+        inputs=[points, slot_mask],
+        outputs=[first, slot],
+        device=device,
+    )
+    wp.launch(
+        kernel_points.point_duplicate_from_first,
+        dim=n,
+        inputs=[first, slot],
+        outputs=[out_mask],
+        device=device,
+    )
     return out_mask
 
 
@@ -1366,7 +1387,8 @@ def convex_superset_mask(
         device=device,
     )
 
-    shell_vertices = tw.array.gather(points, support)
+    # A view, not a copy: ``support`` is a dense index array, and both kernels read the view.
+    shell_vertices = points[support]
     centroid = wp.empty(1, dtype=wp.vec3, device=device)
     radius = wp.empty(1, dtype=wp.float32, device=device)
     wp.launch(

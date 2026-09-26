@@ -7,7 +7,6 @@ from triwarp.kernels.array import (
     OverloadTable,
     binary_search_sorted_contains,
     pack_edge_key,
-    sort3,
     to_vec3d,
 )
 from triwarp.kernels.halfedge import halfedge_next, halfedge_prev
@@ -78,22 +77,6 @@ def write_row_triple(out: wp.array2d[Any], row: wp.int32, a: Any, b: Any, c: Any
     out[row, 0] = a
     out[row, 1] = b
     out[row, 2] = c
-
-
-@wp.kernel
-def sort_face_indices(faces: wp.array2d[wp.int32], out_sorted: wp.array2d[wp.int32]) -> None:
-    """
-    Write each row's three vertex indices back in ascending order (the row's unoriented key).
-
-    Shared by every caller that groups faces by their unordered vertex set regardless of winding --
-    ``grouping.group_int_rows`` on this output is what finds repeated or matching triangles.
-    """
-    tid = wp.int32(wp.tid())
-    i0, i1, i2 = row_triple(faces, tid)
-    s0, s1, s2 = sort3(i0, i1, i2)
-    out_sorted[tid, 0] = s0
-    out_sorted[tid, 1] = s1
-    out_sorted[tid, 2] = s2
 
 
 @wp.func

@@ -55,6 +55,24 @@ def ecl_hook_edge(parents: wp.array[wp.int32], rep_v: wp.int32, u: wp.int32) -> 
     return rep_v
 
 
+@wp.func
+def ecl_prehook_pair(parents: wp.array[wp.int32], a: wp.int32, b: wp.int32) -> None:
+    # The pre-hook of one graph edge ``(a, b)``: point the larger node at the smaller, if that is
+    # smaller than where it points already. Shared by ``ecl_init_parent_edges`` and every kernel
+    # that forms its edges in the thread instead of reading an edge list (``selection``'s dual
+    # graph across twins); see ``ecl_init_parent_edges`` for why it is load-bearing.
+    if a != b:
+        wp.atomic_min(parents, wp.max(a, b), wp.min(a, b))
+
+
+@wp.func
+def ecl_hook_pair(parents: wp.array[wp.int32], a: wp.int32, b: wp.int32) -> None:
+    # The hook of one graph edge ``(a, b)``, from wherever the pre-hook left ``parents``: the
+    # counterpart of ``ecl_prehook_pair``, shared the same way. A self-loop unions nothing.
+    if a != b:
+        ecl_hook_edge(parents, find_representative(parents, a), b)
+
+
 @wp.kernel
 def ecl_init_parent(
     offsets: wp.array[wp.int32], indices: wp.array[wp.int32], out_parents: wp.array[wp.int32]
@@ -100,10 +118,7 @@ def ecl_init_parent_edges(edges: wp.array2d[wp.int32], parents: wp.array[wp.int3
     # both before a single CAS runs (``boundary_loops`` on two 65 536-edge rims, 16x; a
     # 40 960-spoke fan, 12x), for one extra launch on an ordinary mesh.
     e = wp.int32(wp.tid())
-    a = edges[e, 0]
-    b = edges[e, 1]
-    if a != b:
-        wp.atomic_min(parents, wp.max(a, b), wp.min(a, b))
+    ecl_prehook_pair(parents, edges[e, 0], edges[e, 1])
 
 
 @wp.kernel
@@ -124,11 +139,7 @@ def ecl_hook_edges(edges: wp.array2d[wp.int32], parents: wp.array[wp.int32]) -> 
     # Unlike ``ecl_hook``, there is no per-row owner to serialize on, so a hub vertex costs one
     # thread per incident edge rather than one thread walking them all.
     e = wp.int32(wp.tid())
-    a = edges[e, 0]
-    b = edges[e, 1]
-    if a == b:
-        return
-    ecl_hook_edge(parents, find_representative(parents, a), b)
+    ecl_hook_pair(parents, edges[e, 0], edges[e, 1])
 
 
 @wp.kernel

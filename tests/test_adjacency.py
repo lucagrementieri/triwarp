@@ -1041,3 +1041,31 @@ def test_face_connected_component_labels_matches_pyvista(
 
     assert np.unique(labels_doubled_pv).shape[0] == 2
     assert same_partition(labels_doubled_wp.numpy(), labels_doubled_pv)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosphere", "cave_cube", "hemisphere"])
+@pytest.mark.parametrize("bounded", [False, True])
+def test_sorted_face_edge_keys(
+    request: pytest.FixtureRequest, mesh_name: str, bounded: bool
+) -> None:
+    """
+    Class A against ``numpy.argsort(kind="stable")`` of trimesh's sorted halfedge rows, packed.
+
+    The bounded arm packs against the vertex count and sorts only the low bits that radix needs;
+    the unbounded arm packs against the pair radix and sorts all 64. Both must give the stable
+    order of the same rows, so the permutation is compared exactly, and the keys against the
+    packing the radix implies.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    edges_np = np.sort(mesh_tm.edges, axis=1).astype(np.uint64)
+    n_vertices = len(mesh_tm.vertices)
+    radix = np.uint64(n_vertices) if bounded else np.uint64(1 << 32)
+    keys_np = edges_np[:, 0] + edges_np[:, 1] * radix
+    order_np = np.argsort(keys_np, kind="stable")
+    assert np.unique(keys_np).shape[0] < keys_np.shape[0]
+
+    sorted_wp, order_wp = tw.adjacency.sorted_face_edge_keys(
+        mesh_wp.indices, n_vertices=n_vertices if bounded else None
+    )
+    assert np.array_equal(order_wp.numpy(), order_np)
+    assert np.array_equal(sorted_wp.numpy(), keys_np[order_np])
