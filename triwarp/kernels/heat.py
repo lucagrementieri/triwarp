@@ -18,7 +18,7 @@ from typing import Any
 import warp as wp
 
 from triwarp.constants import TOLERANCE_ZERO_CONSTANT
-from triwarp.kernels.array import OverloadTable, to_vec2, to_vec2d
+from triwarp.kernels.array import OverloadTable, binary_search_index, cross2, to_vec2, to_vec2d
 from triwarp.kernels.linalg import free_row
 from triwarp.kernels.predicates import (
     stable_length,
@@ -71,6 +71,8 @@ def shifted_system_values(
     values: wp.array[Any],
     diagonal: wp.array[Any],
     scale: wp.float64,
+    edge_sum_and_count: wp.array[wp.float64],
+    from_edges: wp.int32,
     negate: wp.int32,
     out_values: wp.array[Any],
     out_negated: wp.array[Any],
@@ -83,10 +85,21 @@ def shifted_system_values(
     # ``negate`` set, ``-A`` rides along into ``out_negated`` in the same pass: the scalar method's
     # Poisson operator; unset, ``out_negated`` is never touched and may be ``None``. Scalar
     # ``float64`` or ``wp.mat22d`` blocks.
+    #
+    # With ``from_edges`` set the scale is ``scale`` times the default timestep ``h ** 2``, ``h``
+    # the mean unique-edge length from ``upper_edge_length_sum_and_count``'s two sums (``0`` for no
+    # edges), formed on the device so the host never waits for them; ``scale`` is then the sign.
+    # Unset, ``edge_sum_and_count`` is never read and may be ``None``.
     row = wp.int32(wp.tid())
+    factor = scale
+    if from_edges != 0:
+        h = wp.float64(0.0)
+        if edge_sum_and_count[1] > wp.float64(0.0):
+            h = edge_sum_and_count[0] / edge_sum_and_count[1]
+        factor = scale * (h * h)
     for e in range(offsets[row], offsets[row + 1]):
         value = values[e]
-        shifted = scale * value
+        shifted = factor * value
         if columns[e] == row:
             shifted = shifted + diagonal[row]
         out_values[e] = shifted
@@ -224,7 +237,10 @@ def shift_and_orient(
 @wp.kernel
 def splat_curve_normals(
     vertices: wp.array[wp.vec3],
-    segments: wp.array2d[wp.int32],
+    curve_vertices: wp.array[wp.int32],
+    curve_offsets: wp.array[wp.int32],
+    single_curve: wp.int32,
+    closed: wp.int32,
     normals: wp.array[wp.vec3],
     basis_x: wp.array[wp.vec3],
     basis_y: wp.array[wp.vec3],
@@ -234,9 +250,31 @@ def splat_curve_normals(
     # tangent direction perpendicular to it -- to the two vertices it connects, weighted by half the
     # segment's length. Diffusing normals rather than an indicator is what makes the result signed:
     # the field arrives at a point already knowing which side of the curve it is on.
-    s = wp.int32(wp.tid())
-    a = segments[s, 0]
-    b = segments[s, 1]
+    #
+    # One thread per entry ``k`` of the packed ``curve_vertices``, owning the segment that starts
+    # there: to the next entry of its curve, or -- the last entry of a ``closed`` curve of two or
+    # more -- back to the curve's first. The curve is ``curve_offsets``' CSR row holding ``k`` (the
+    # whole buffer with ``single_curve`` set, when ``curve_offsets`` may be ``None``); an entry in
+    # no row starts nothing. So the segment list is never built, and the offsets are never read
+    # back to build it; on the CPU device the threads run in the order that list had.
+    k = wp.int32(wp.tid())
+    begin = wp.int32(0)
+    end = curve_vertices.shape[0]
+    if single_curve == 0:
+        curve = binary_search_index(curve_offsets, k) - 1
+        if curve < 0 or curve >= curve_offsets.shape[0] - 1:
+            return
+        begin = curve_offsets[curve]
+        # Clamped to the buffer, as slicing it by a row past its end would be.
+        end = wp.min(curve_offsets[curve + 1], end)
+    a = curve_vertices[k]
+    b = a
+    if k + 1 < end:
+        b = curve_vertices[k + 1]
+    elif closed != 0 and end - begin >= 2:
+        b = curve_vertices[begin]
+    else:
+        return
     edge = vertices[b] - vertices[a]
     length = wp.length(edge)
     if length <= TOLERANCE_ZERO_CONSTANT:
@@ -311,26 +349,14 @@ def scatter_free_rhs(
     # already in the Poisson sign convention (``-div`` for the ``-L`` operator):
     # ``vertex_field_divergence`` accumulates it negated.
     #
-    # **Not factored with ``gather_free_solution`` below or with
-    # ``smoothing.scatter_free_scalar``, deliberately, and the near-duplicate scan's 0.917 on the
-    # last pair is a false positive worth knowing about.** After ``linalg.free_row`` -- which is
-    # already the shared guard, and is what makes the statement-run scan's biggest group (nine
-    # sites) an extraction rather than a duplicate -- each of the three is *one assignment*, and
-    # the three assignments are three different operations:
-    #
-    #   * this one **compacts** (full-length -> reduced), into a rank-2 destination's row 0;
-    #   * ``gather_free_solution`` **expands** (reduced -> full-length) and writes an explicit
-    #     zero at every pinned entry, which is why it tests ``fixed_mask`` directly instead of
-    #     calling ``free_row`` at all;
-    #   * ``smoothing.scatter_free_scalar`` expands from a rank-1 source and **leaves** the pinned
-    #     entries alone, because there they hold boundary values the caller set.
-    #
-    # So the pair the scan matched at 0.917 runs in *opposite directions*, and what is left to
-    # share after the guard is the destination's rank and the pinned-entry policy -- which is the
-    # whole of what distinguishes them. This is the same verdict, for the same reason, as
-    # ``holes.fill_dp_span``'s written decline about the prologue it shares with its tiled sibling:
-    # a helper here would cost more at the three call sites than it removes. Recorded because a
-    # text-keyed scan cannot see a direction and will match this pair again.
+    # **Not factored with ``gather_free_solution`` below, deliberately.** After
+    # ``linalg.free_row`` -- already the shared guard -- each is *one assignment*, and the two run
+    # in *opposite directions*: this one **compacts** (full-length -> reduced) into a rank-2
+    # destination's row 0, where ``gather_free_solution`` **expands** (reduced -> full-length) and
+    # writes an explicit zero at every pinned entry, which is why it tests ``fixed_mask`` directly
+    # instead of calling ``free_row``. What is left to share after the guard is the direction and
+    # the pinned-entry policy, the whole of what distinguishes them. Recorded because a text-keyed
+    # duplicate scan cannot see a direction and will match this pair again.
     i = wp.int32(wp.tid())
     ri = free_row(fixed_mask, free_map, i)
     if ri < 0:
@@ -527,10 +553,7 @@ def log_map_from_angles(
         # zero, so the magnitude still means what it should.
         out_log[v] = wp.vec2(r, 0.0)
         return
-    angle = wp.atan2(
-        reference[0] * outward[1] - reference[1] * outward[0],
-        reference[0] * outward[0] + reference[1] * outward[1],
-    )
+    angle = wp.atan2(cross2(reference, outward), wp.dot(reference, outward))
     out_log[v] = wp.vec2(r * wp.cos(angle), r * wp.sin(angle))
 
 
@@ -551,6 +574,8 @@ def _register_overloads() -> None:
                 wp.array[d],
                 wp.array[d],
                 wp.float64,
+                wp.array[wp.float64],
+                wp.int32,
                 wp.int32,
                 wp.array[d],
                 wp.array[d],

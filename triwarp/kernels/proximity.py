@@ -51,31 +51,6 @@ def closest_point_query(
     return p, max_dist, wp.int32(-1)
 
 
-@wp.func
-def write_closest_point_query(
-    mesh_id: wp.uint64,
-    points: wp.array[wp.vec3],
-    max_dist: wp.float32,
-    tid: wp.int32,
-    out_closest: wp.array[wp.vec3],
-    out_distance: wp.array[wp.float32],
-    out_face: wp.array[wp.int32],
-) -> tuple[wp.float32, wp.int32]:
-    # ``closest_point_query`` plus the three-slot publication every caller performs on its answer,
-    # returning the two components a fused caller then re-reads from registers rather than from the
-    # buffers it just wrote.
-    #
-    # The publication protocol, not just the query, is what the three kernels share:
-    # ``closest_point_on_mesh`` below and ``registration``'s two ICP correspondence passes wrote
-    # the identical four statements, and the two ICP ones already carried a comment saying they
-    # were "two kernels over one shared query" -- which only a shared function can keep true.
-    closest, distance, face = closest_point_query(mesh_id, points[tid], max_dist)
-    out_closest[tid] = closest
-    out_distance[tid] = distance
-    out_face[tid] = face
-    return distance, face
-
-
 @wp.kernel
 def closest_point_on_mesh(
     mesh_id: wp.uint64,
@@ -86,7 +61,10 @@ def closest_point_on_mesh(
     out_face: wp.array[wp.int32],
 ) -> None:
     tid = wp.int32(wp.tid())
-    write_closest_point_query(mesh_id, points, max_dist, tid, out_closest, out_distance, out_face)
+    closest, distance, face = closest_point_query(mesh_id, points[tid], max_dist)
+    out_closest[tid] = closest
+    out_distance[tid] = distance
+    out_face[tid] = face
 
 
 @wp.kernel

@@ -1,14 +1,9 @@
 import warp as wp
 
 from triwarp.kernels.array import inverse_or_one, to_vec3d
-from triwarp.kernels.laplacian import cot_entries_from_l2, face_half_cotangents, operator_row
+from triwarp.kernels.laplacian import face_half_cotangents, operator_row
 from triwarp.kernels.linalg import free_row, selected_row, solve_normal_equations
-from triwarp.kernels.predicates import (
-    closest_point_on_segment,
-    doublearea_from_lengths,
-    plane_basis,
-    squared_edge_lengths,
-)
+from triwarp.kernels.predicates import closest_point_on_segment, plane_basis
 from triwarp.kernels.scatter import add_corner_triple
 from triwarp.kernels.triangles import corner_triple
 
@@ -40,7 +35,7 @@ def edge_cotan_add(
     # Accumulate each face corner's cotangent into its opposite unique edge; the two incident faces
     # sum to the cotangent edge weight cot(alpha) + cot(beta).
     #
-    # The per-corner cotangent is ``laplacian.py``'s generic half-cotangent formula (its own
+    # The per-corner cotangent is ``laplacian.face_half_cotangents`` (its own
     # denominator/degenerate-triangle guard, rather than a second independent one derived from the
     # raw cross product) doubled back to a full cotangent, since this accumulator -- unlike
     # ``laplacian.cotmatrix`` -- wants ``cot(alpha) + cot(beta)`` rather than the half-cotangent
@@ -49,13 +44,7 @@ def edge_cotan_add(
     # contribution from this triangle is the angle *opposite* that edge -- i.e. the angle at the
     # corner not on it -- which is why the three half-cotangents land rotated by one slot below.
     f = wp.int32(wp.tid())
-    v0, v1, v2 = corner_triple(faces, f)
-    p0 = vertices[v0]
-    p1 = vertices[v1]
-    p2 = vertices[v2]
-    l2_0, l2_1, l2_2 = squared_edge_lengths(p0, p1, p2)
-    dbl_area = doublearea_from_lengths(wp.sqrt(l2_0), wp.sqrt(l2_1), wp.sqrt(l2_2))
-    half_cotan0, half_cotan1, half_cotan2 = cot_entries_from_l2(l2_0, l2_1, l2_2, dbl_area)
+    half_cotan0, half_cotan1, half_cotan2 = face_half_cotangents(vertices, faces, f)
     two = wp.float32(2.0)
     add_corner_triple(out_w, inverse, f, two * half_cotan2, two * half_cotan0, two * half_cotan1)
 
@@ -310,17 +299,17 @@ def least_squares_rows(
     v = wp.int32(wp.tid())
     start = offsets[v]
     end = offsets[v + 1]
-    in_region = free_mask[v]
-    count = wp.where(in_region, wp.int32(1), wp.int32(0))
+    # ``free_degree``'s count, fused into the weight sum's walk; ``v`` is in R exactly when it is
+    # non-zero -- free itself, or next to a free vertex.
+    count = wp.where(free_mask[v], wp.int32(1), wp.int32(0))
     sum_w = wp.float64(0.0)
     for k in range(start, end):
         e = incident[k]
         sum_w += edge_weight(weights, e, unit)
         if free_mask[incident_neighbor(unique_edges, e, v)]:
-            in_region = True
             count += 1
     out_free_degree[v] = count
-    if not in_region or sum_w == wp.float64(0.0):
+    if count == 0 or sum_w == wp.float64(0.0):
         out_row_sums[v] = wp.float64(0.0)
         return
     out_row_sums[v] = sum_w
@@ -1568,6 +1557,23 @@ def relax_approx_step(
     out_positions[vertex] = limit_near_initial(moved, initial[vertex], max_displacement)
 
 
+@wp.func
+def band_field_value(
+    field: wp.array[wp.float64],
+    free: wp.array[wp.bool],
+    free_map: wp.array[wp.int32],
+    solution: wp.array[wp.float64],
+    j: wp.int32,
+) -> wp.float64:
+    # The rim band's harmonic field at vertex ``j``: the reduced solve's answer on a free vertex,
+    # the boundary value it was pinned to otherwise -- read in place, so the full-length field is
+    # never assembled. A branch rather than ``wp.where``, whose eager arms would index ``solution``
+    # at a pinned vertex's meaningless rank.
+    if free[j]:
+        return solution[free_map[j]]
+    return field[j]
+
+
 @wp.kernel
 def project_to_zero_isoline(
     positions: wp.array[wp.vec3],
@@ -1576,15 +1582,18 @@ def project_to_zero_isoline(
     vertex_faces: wp.array[wp.int32],
     field: wp.array[wp.float64],
     free: wp.array[wp.bool],
+    free_map: wp.array[wp.int32],
+    solution: wp.array[wp.float64],
     damping: wp.float32,
     out_positions: wp.array[wp.vec3],
 ) -> None:
     # Pull each free vertex onto the field's zero level set, which is where the region's rim curve
-    # wants to be. Inside one triangle the level set is a straight segment between the crossings on
-    # the two edges out of the *apex* -- the corner whose sign differs from the other two -- so the
-    # nearest point of the whole curve to this vertex is the nearest over its incident triangles'
-    # segments. Damped rather than snapped, because the field is recomputed from the moved positions
-    # on the next pass and a full step oscillates.
+    # wants to be; the field is ``band_field_value``'s, the pinned values in ``field`` and the free
+    # ones in ``solution`` at their ``free_map`` ranks. Inside one triangle the level set is a
+    # straight segment between the crossings on the two edges out of the *apex* -- the corner whose
+    # sign differs from the other two -- so the nearest point of the whole curve to this vertex is
+    # the nearest over its incident triangles' segments. Damped rather than snapped, because the
+    # field is recomputed from the moved positions on the next pass and a full step oscillates.
     vertex = wp.int32(wp.tid())
     current = positions[vertex]
     if not free[vertex]:
@@ -1595,14 +1604,17 @@ def project_to_zero_isoline(
     best_distance = wp.float32(3.4028235e38)
     for slot in range(offsets[vertex], offsets[vertex + 1]):
         first, second, third = corner_triple(faces, vertex_faces[slot])
-        value_first = field[first]
-        value_second = field[second]
-        value_third = field[third]
+        value_first = band_field_value(field, free, free_map, solution, first)
+        value_second = band_field_value(field, free, free_map, solution, second)
+        value_third = band_field_value(field, free, free_map, solution, third)
         # The apex is the corner alone on its side of zero. When every corner shares a sign the
         # level set misses the triangle entirely.
         apex = first
         left = second
         right = third
+        value_apex = value_first
+        value_left = value_second
+        value_right = value_third
         if value_second * value_third > wp.float64(0.0):
             if value_first * value_second > wp.float64(0.0):
                 continue
@@ -1610,14 +1622,19 @@ def project_to_zero_isoline(
             apex = second
             left = third
             right = first
+            value_apex = value_second
+            value_left = value_third
+            value_right = value_first
         else:
             apex = third
             left = first
             right = second
+            value_apex = value_third
+            value_left = value_first
+            value_right = value_second
 
-        value_apex = field[apex]
-        gap_left = value_apex - field[left]
-        gap_right = value_apex - field[right]
+        gap_left = value_apex - value_left
+        gap_right = value_apex - value_right
         apex_position = positions[apex]
         # A gap of exactly zero means ``apex`` and that neighbour already share the same (zero)
         # field value, so by linearity the whole edge between them -- not one interior point on
@@ -1656,9 +1673,79 @@ def row_slot(
     return wp.int32(-1)
 
 
+@wp.func
+def band_corner_seen(
+    faces: wp.array[wp.int32],
+    vf_indices: wp.array[wp.int32],
+    ring_start: wp.int32,
+    k: wp.int32,
+    corner: wp.int32,
+    j: wp.int32,
+) -> wp.bool:
+    # Whether vertex ``j``, corner ``corner`` of ring face ``vf_indices[k]``, already appeared as a
+    # corner of an earlier ring face or of an earlier corner of this one: the first sighting of
+    # each neighbour is the one that counts it.
+    for q in range(ring_start, k):
+        a, b, c = corner_triple(faces, vf_indices[q])
+        if a == j or b == j or c == j:
+            return True
+    f = vf_indices[k]
+    for earlier in range(corner):
+        if faces[f * 3 + earlier] == j:
+            return True
+    return False
+
+
+@wp.kernel
+def band_pattern(
+    fixed_mask: wp.array[wp.bool],
+    free_map: wp.array[wp.int32],
+    vf_offsets: wp.array[wp.int32],
+    vf_indices: wp.array[wp.int32],
+    faces: wp.array[wp.int32],
+    fill: wp.int32,
+    pattern_offsets: wp.array[wp.int32],
+    out_counts: wp.array[wp.int32],
+    out_columns: wp.array[wp.int32],
+) -> None:
+    # The sparsity of the rim band's Dirichlet system, read off the vertex-face rings: free row
+    # ``ri`` holds its diagonal and one column per distinct free vertex sharing a face with it --
+    # exactly the free-free block ``linalg.assemble_interior_system`` extracts from a mesh-wide
+    # cotangent Laplacian, whose triplets pair every two corners of a face, with the columns sorted
+    # as that CSR stores them. Launched twice, with a warp-uniform ``fill``: ``0`` writes each
+    # row's length into ``out_counts`` (the tail of the ``n_free + 1`` offsets, ``out_columns``
+    # unused), ``1`` inserts the columns in order into the rows ``pattern_offsets`` sized
+    # (``out_counts`` unused). Band-sized work in place of a whole-mesh matrix build.
+    v = wp.int32(wp.tid())
+    ri = free_row(fixed_mask, free_map, v)
+    if ri < 0:
+        return
+    start = wp.int32(0)
+    if fill != wp.int32(0):
+        start = pattern_offsets[ri]
+        out_columns[start] = ri
+    width = wp.int32(1)
+    ring_start = vf_offsets[v]
+    for k in range(ring_start, vf_offsets[v + 1]):
+        f = vf_indices[k]
+        for corner in range(3):
+            j = faces[f * 3 + corner]
+            if j != v and not fixed_mask[j]:
+                if not band_corner_seen(faces, vf_indices, ring_start, k, corner, j):
+                    if fill != wp.int32(0):
+                        column = free_map[j]
+                        slot = start + width
+                        while slot > start and out_columns[slot - 1] > column:
+                            out_columns[slot] = out_columns[slot - 1]
+                            slot -= 1
+                        out_columns[slot] = column
+                    width += 1
+    if fill == wp.int32(0):
+        out_counts[ri] = width
+
+
 @wp.kernel
 def band_dirichlet_values(
-    free_vertices: wp.array[wp.int32],
     fixed_mask: wp.array[wp.bool],
     free_map: wp.array[wp.int32],
     vf_offsets: wp.array[wp.int32],
@@ -1671,19 +1758,21 @@ def band_dirichlet_values(
     out_values: wp.array[wp.float64],
     out_rhs: wp.array2d[wp.float64],
 ) -> None:
-    # One thread per free vertex: row ``ri`` of the Dirichlet system ``(-L)_uu x = (-L)_ub field``
-    # that ``linalg.assemble_interior_system`` extracts from a mesh-wide ``-cotmatrix``, written
-    # into that extraction's *existing* pattern from the current half-cotangent table. The
-    # connectivity -- and so the pattern and the free set -- is fixed across
-    # ``smooth_region_boundary``'s passes while the weights move, so only the band's rows are
-    # recomputed instead of the whole mesh's matrix and its extraction. The weight of the edge
+    # One thread per vertex, free ones only: row ``ri`` of the Dirichlet system
+    # ``(-L)_uu x = (-L)_ub field`` that ``linalg.assemble_interior_system`` would extract from a
+    # mesh-wide ``-cotmatrix``, written into ``band_pattern``'s sparsity (the same one) from the
+    # current half-cotangents. The connectivity -- and so the pattern and the free set -- is fixed
+    # across ``smooth_region_boundary``'s passes while the weights move, so only the band's rows are
+    # computed, every pass, and the whole mesh's matrix never is. The weight of the edge
     # opposite corner ``e`` is ``laplacian.face_half_cotangents``' column ``e`` for the current
     # ``positions`` (``kernels/laplacian.cotmatrix_triplets``' convention), formed here for the
     # band's own faces rather than read from a whole-mesh table, and cast to ``float64`` as
     # ``cotmatrix`` casts it; the off-diagonal is ``-w``, the diagonal ``sum w``, and a pinned
     # neighbour moves ``w * field_j`` to the right-hand side.
-    ri = wp.int32(wp.tid())
-    v = free_vertices[ri]
+    v = wp.int32(wp.tid())
+    ri = free_row(fixed_mask, free_map, v)
+    if ri < 0:
+        return
     start = offsets[ri]
     end = offsets[ri + 1]
     for e in range(start, end):
@@ -1711,21 +1800,6 @@ def band_dirichlet_values(
     if slot >= 0:
         out_values[slot] += diagonal
     out_rhs[0, ri] = rhs
-
-
-@wp.kernel
-def scatter_free_scalar(
-    fixed_mask: wp.array[wp.bool],
-    free_map: wp.array[wp.int32],
-    solution: wp.array[wp.float64],
-    out_field: wp.array[wp.float64],
-) -> None:
-    # Write the reduced solve's answer back over the free entries, leaving the pinned ones as the
-    # boundary values they were set to. The scalar sibling of ``scatter_free_solution``.
-    vertex = wp.int32(wp.tid())
-    row = free_row(fixed_mask, free_map, vertex)
-    if row >= 0:
-        out_field[vertex] = solution[row]
 
 
 @wp.func

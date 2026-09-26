@@ -1547,14 +1547,15 @@ def test_smooth_region_boundary_leaves_connectivity_and_the_rest_alone(device: s
 
 def test_smooth_region_boundary_later_passes_match_a_rebuild(device: str) -> None:
     """
-    Triwarp against triwarp: the in-place rewrite of the band's system against a full rebuild.
+    Triwarp against triwarp: the in-place rewrite of the band's system against a fresh one.
 
     Every pass after the first rewrites the first pass's Dirichlet system from the new cotangents
-    (``kernels/smoothing.band_dirichlet_values``) rather than assembling a mesh-wide
-    ``-cotmatrix`` and extracting it again. A call of one pass takes only the assembling route, so
-    chaining single-pass calls is the rebuild, and the meshlib comparison above carries the oracle
-    for the rebuild. The two differ by the warm start and the solver tolerance, far under float32
-    rounding of the positions -- a wrong corner, sign or pinned term in the rewrite would not.
+    (``kernels/smoothing.band_dirichlet_values``) into the same operator, whose solver state -- and
+    its first pass's Jacobi diagonal -- carries over. A call of one pass builds its operator fresh,
+    so chaining single-pass calls is the rebuild, and the meshlib comparison above carries the
+    oracle for it; ``test_smooth_region_boundary_system_matches_the_cotmatrix_extraction`` pins
+    the system itself. The two differ by the warm start and the solver tolerance, far under float32
+    rounding of the positions -- a stale value or right-hand side in the rewrite would not.
     """
     mesh_tm = tm.creation.icosphere(subdivisions=4, radius=1.0)
     vertices_np = np.asarray(mesh_tm.vertices)
@@ -1571,6 +1572,72 @@ def test_smooth_region_boundary_later_passes_match_a_rebuild(device: str) -> Non
     displacement_np = np.linalg.norm(rewritten_np - vertices_np, axis=1)
     assert displacement_np.max() > 1e-2
     assert np.allclose(rewritten_np, rebuilt_wp.numpy(), rtol=0.0, atol=1e-5)
+
+
+def test_smooth_region_boundary_system_matches_the_cotmatrix_extraction(device: str) -> None:
+    """
+    Triwarp against triwarp: the band-sized Dirichlet system against the mesh-wide extraction.
+
+    ``smooth_region_boundary`` assembles its band's system from the free vertices' vertex-face
+    rings (``kernels/smoothing.band_pattern`` and ``band_dirichlet_values``) rather than
+    extracting it from a mesh-wide ``-cotmatrix`` with
+    [`assemble_interior_system`][triwarp.linalg.assemble_interior_system], which carries the
+    oracle here. The pattern -- offsets and sorted columns -- must match exactly, and the values
+    and right-hand side to summation order. The band holds a vertex whose ring meets another free
+    vertex through two faces, so a neighbour counted twice would show in the offsets.
+    """
+    mesh_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
+    vertices_np = np.asarray(mesh_tm.vertices)
+    faces_np = np.asarray(mesh_tm.faces)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np.ravel(), device)
+    centers_np = vertices_np[faces_np].mean(axis=1)
+    region_np = centers_np[:, 0] + 0.3 * np.sin(5.0 * centers_np[:, 1]) > 0.1
+    inside_np = np.zeros(len(vertices_np), dtype=bool)
+    inside_np[faces_np[region_np].ravel()] = True
+    outside_np = np.zeros(len(vertices_np), dtype=bool)
+    outside_np[faces_np[~region_np].ravel()] = True
+    free_np = inside_np & outside_np
+    fixed_wp = wp.array(~free_np, dtype=wp.bool, device=device)
+    field_np = np.where(inside_np, -1.0, 1.0)[None, :]
+    field_wp = wp.array(field_np, dtype=wp.float64, device=device)
+    free_map_wp, n_free = tw.linalg.free_partition(fixed_wp)
+    assert n_free > 10
+
+    operator = wps.bsr_scale(tw.laplacian.cotmatrix(vertices_wp, faces_wp, dtype=wp.float64), -1.0)
+    system_wp, rhs_wp = tw.linalg.assemble_interior_system(
+        operator, fixed_wp, free_map_wp, field_wp, n_free
+    )
+
+    vertex_faces = tw.adjacency.vertex_face_adjacency(faces_wp)
+    offsets_wp, columns_wp = tw.smoothing._band_pattern(
+        faces_wp, vertex_faces, fixed_wp, free_map_wp, n_free
+    )
+    values_wp = wp.empty(columns_wp.shape[0], dtype=wp.float64, device=device)
+    band_rhs_wp = wp.empty((1, n_free), dtype=wp.float64, device=device)
+    wp.launch(
+        kernel_smoothing.band_dirichlet_values,
+        dim=len(vertices_np),
+        inputs=[
+            fixed_wp,
+            free_map_wp,
+            vertex_faces[1],
+            vertex_faces[0],
+            faces_wp,
+            vertices_wp,
+            field_wp,
+            offsets_wp,
+            columns_wp,
+        ],
+        outputs=[values_wp, band_rhs_wp],
+        device=device,
+    )
+    nnz = int(system_wp.nnz_sync())
+    row_lengths_np = np.diff(offsets_wp.numpy())
+    assert row_lengths_np.max() > row_lengths_np.min()
+    assert np.array_equal(offsets_wp.numpy(), system_wp.offsets.numpy()[: n_free + 1])
+    assert np.array_equal(columns_wp.numpy(), system_wp.columns.numpy()[:nnz])
+    assert np.allclose(values_wp.numpy(), system_wp.values.numpy()[:nnz], rtol=1e-12, atol=1e-12)
+    assert np.allclose(band_rhs_wp.numpy(), rhs_wp.numpy(), rtol=1e-12, atol=1e-12)
 
 
 def test_project_to_zero_isoline_handles_an_exact_field_tie(device: str) -> None:
@@ -1606,6 +1673,9 @@ def test_project_to_zero_isoline_handles_an_exact_field_tie(device: str) -> None
     # incident face.
     offsets_wp = wp.array([0, 0, 1, 1], dtype=wp.int32, device=device)
     vertex_faces_wp = wp.array([0], dtype=wp.int32, device=device)
+    # The free vertex's field value arrives as the reduced solve's answer, at its rank 0.
+    free_map_wp = wp.array([0, 0, 1], dtype=wp.int32, device=device)
+    solution_wp = wp.array([1.0], dtype=wp.float64, device=device)
     out_wp = wp.empty(3, dtype=wp.vec3, device=device)
     wp.launch(
         kernel_smoothing.project_to_zero_isoline,
@@ -1617,9 +1687,11 @@ def test_project_to_zero_isoline_handles_an_exact_field_tie(device: str) -> None
             vertex_faces_wp,
             field_wp,
             free_wp,
+            free_map_wp,
+            solution_wp,
             1.0,
-            out_wp,
         ],
+        outputs=[out_wp],
         device=device,
     )
     out_np = out_wp.numpy()

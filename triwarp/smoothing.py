@@ -2468,56 +2468,93 @@ def smooth_region_boundary(
     if n_free == 0:
         return positions
     field_2d = twt.as_array2d(field, wp.float64)
-    # The first pass extracts the band's Dirichlet system from the mesh-wide ``-cotmatrix``, and
-    # every later one rewrites that same system's values and right-hand side from the new
-    # cotangents (``band_dirichlet_values``): the connectivity, the free set and so the pattern are
-    # the same every pass and only the weights move. Keeping one operator object also keeps one
-    # conjugate-gradient state across the passes, whose recorded loop every pass after the first
-    # replays; its Jacobi diagonal is the first pass's, which moves the rate by a little and the
-    # answer not at all. Each pass warm-starts from the previous pass's field.
-    operator = wps.bsr_scale(laplacian.cotmatrix(positions, faces, dtype=wp.float64), -1.0)
-    system, rhs = twl.assemble_interior_system(operator, fixed_mask, free_map, field_2d, n_free)
-    free_vertices = tw.array.flatnonzero(free)
+    # The band's Dirichlet system is built band-sized, from the vertex-face rings: its sparsity
+    # once (the connectivity, and so the free set, is the same every pass), and its values and
+    # right-hand side every pass from the current cotangents (``band_dirichlet_values``). Keeping
+    # one operator object also keeps one conjugate-gradient state across the passes, whose recorded
+    # loop every pass after the first replays; its Jacobi diagonal is the first pass's, which moves
+    # the rate by a little and the answer not at all. Each pass warm-starts from the previous pass's
+    # field.
+    ring = [fixed_mask, free_map, offsets, vf_indices, faces]
+    pattern_offsets, columns = _band_pattern(
+        faces, (vf_indices, offsets), fixed_mask, free_map, n_free
+    )
+    nnz = int(columns.shape[0])
+    system = _csr_matrix(
+        n_free, pattern_offsets, columns, wp.empty(nnz, dtype=wp.float64, device=device)
+    )
+    rhs = twt.as_array2d(wp.empty((1, n_free), dtype=wp.float64, device=device), wp.float64)
     solution = twt.as_array2d(wp.zeros((1, n_free), dtype=wp.float64, device=device), wp.float64)
     nxt = wp.empty(n_vertices, dtype=wp.vec3, device=device)
-    # Every pass rewrites only the free entries, so the pinned ones keep the boundary values they
-    # start with: one copy of the field, not one per pass.
-    solved = wp.clone(field[0])
-    for iteration in range(iterations):
-        if iteration > 0:
-            wp.launch(
-                kernel_smoothing.band_dirichlet_values,
-                dim=n_free,
-                inputs=[
-                    free_vertices,
-                    fixed_mask,
-                    free_map,
-                    offsets,
-                    vf_indices,
-                    faces,
-                    positions,
-                    field_2d,
-                    system.offsets,
-                    system.columns,
-                ],
-                outputs=[system.values, rhs],
-                device=device,
-            )
-        twl.solve_spd_columns(system, rhs, solution, tol=twl.CG_TOLERANCE)
+    for _ in range(iterations):
         wp.launch(
-            kernel_smoothing.scatter_free_scalar,
+            kernel_smoothing.band_dirichlet_values,
             dim=n_vertices,
-            inputs=[fixed_mask, free_map, solution[0], solved],
+            inputs=[*ring, positions, field_2d, pattern_offsets, columns],
+            outputs=[system.values, rhs],
             device=device,
         )
+        twl.solve_spd_columns(system, rhs, solution, tol=twl.CG_TOLERANCE)
+        # The projection reads the field as the pinned values plus the solve's answer, in place.
         wp.launch(
             kernel_smoothing.project_to_zero_isoline,
             dim=n_vertices,
-            inputs=[positions, faces, offsets, vf_indices, solved, free, _ISOLINE_DAMPING, nxt],
+            inputs=[
+                positions,
+                faces,
+                offsets,
+                vf_indices,
+                field[0],
+                free,
+                free_map,
+                solution[0],
+                _ISOLINE_DAMPING,
+            ],
+            outputs=[nxt],
             device=device,
         )
         positions, nxt = nxt, positions
     return positions
+
+
+def _band_pattern(
+    faces: wp.array[wp.int32],
+    vertex_faces: tuple[wp.array[wp.int32], wp.array[wp.int32]],
+    fixed_mask: wp.array[wp.bool],
+    free_map: wp.array[wp.int32],
+    n_free: int,
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]:
+    """
+    CSR offsets and sorted columns of the rim band's Dirichlet system.
+
+    The free-free block of the mesh's cotangent Laplacian over the unpinned vertices, derived from
+    their vertex-face rings alone.
+    """
+    device = faces.device
+    n_vertices = int(fixed_mask.shape[0])
+    vf_indices, offsets = vertex_faces
+    ring = [fixed_mask, free_map, offsets, vf_indices, faces]
+    pattern_offsets = wp.zeros(n_free + 1, dtype=wp.int32, device=device)
+    pattern_counts = twt.as_dense(pattern_offsets[1:])
+    wp.launch(
+        kernel_smoothing.band_pattern,
+        dim=n_vertices,
+        inputs=[*ring, wp.int32(0), None],
+        outputs=[pattern_counts, None],
+        device=device,
+    )
+    wp.utils.array_scan(pattern_counts, pattern_counts, inclusive=True)
+    # The one readback of the assembly: the entry count, which sizes the columns.
+    nnz = int(read_scalar(pattern_offsets, n_free))
+    columns = wp.empty(nnz, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_smoothing.band_pattern,
+        dim=n_vertices,
+        inputs=[*ring, wp.int32(1), pattern_offsets],
+        outputs=[None, columns],
+        device=device,
+    )
+    return pattern_offsets, columns
 
 
 def _incident_vertex_mask(

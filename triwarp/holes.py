@@ -1727,13 +1727,14 @@ def fillable_loop_mask(
             inputs=[packed.flat_loops, packed.loop_id, wp.int32(n_vertices), counts, fillable],
             device=device,
         )
-        loop_of_vertex = wp.full(n_vertices, -1, dtype=wp.int32, device=device)
-        position = wp.zeros(n_vertices, dtype=wp.int32, device=device)
+        # Each vertex's ``(loop, position along it)``, uninitialized: an entry is written exactly
+        # where the count is 1, and the chord test reads the count first.
+        loop_slots = wp.empty(n_vertices, dtype=wp.vec2i, device=device)
         wp.launch(
             kernel_holes.scatter_fillable_loop_slots,
             dim=packed.total,
             inputs=[packed.flat_loops, packed.loop_id, packed.starts, counts],
-            outputs=[fillable, loop_of_vertex, position],
+            outputs=[fillable, loop_slots],
             device=device,
         )
         # Over the faces' corners, not the unique edges: the test is order-free and idempotent, so
@@ -1741,7 +1742,7 @@ def fillable_loop_mask(
         wp.launch(
             kernel_holes.clear_loops_with_chords,
             dim=int(faces.shape[0]) // 3,
-            inputs=[faces, loop_of_vertex, position, packed.sizes, fillable],
+            inputs=[faces, counts, loop_slots, packed.sizes, fillable],
             device=device,
         )
     return fillable

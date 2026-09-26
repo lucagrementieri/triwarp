@@ -23,6 +23,7 @@ from tests.conversions import (
     points_to_warp,
     trimesh_to_meshlib,
 )
+from triwarp.kernels import registration as kernel_registration
 
 
 def _make_point_clouds(rng: np.random.Generator, n: int = 200) -> tuple[np.ndarray, np.ndarray]:
@@ -1399,17 +1400,17 @@ def test_robust_scale_matches_the_host_mad(device: str, n_valid: int) -> None:
     assert scale == expected
 
 
-def test_nearest_into_matches_query_nearest(device: str) -> None:
+def test_correspondence_pass_matches_query_nearest(device: str) -> None:
     """
-    Triwarp against triwarp: the ICP loop's hoisted nearest search against ``query_nearest``.
+    Triwarp against triwarp: the ICP loops' cloud correspondence search against ``query_nearest``.
 
-    Both ICP loops issue ``query_nearest``'s ``k = 1`` BVH-backend launch themselves, over the
-    collapsed-triangle mesh and into buffers they allocate once, so the two must agree exactly;
-    ``query_nearest`` carries the oracle in ``tests/test_neighbors.py``. The distances must also
-    equal a radius-deepening walk over a caller's ``wp.Bvh`` to the bit, which is the search the
-    loops used before. The queries sit both on and well off the cloud so that walk takes more than
-    its first radius on some rows. The step-applying variant is checked against moving the
-    queries first and searching from there.
+    Both ICP loops search a point-cloud target inside their own correspondence pass
+    (``kernel_registration.icp_match``), over the collapsed-triangle mesh ``query_nearest``'s
+    ``k = 1`` BVH-backend search builds, so the two must agree exactly; ``query_nearest`` carries
+    the oracle in ``tests/test_neighbors.py``. The distances must also equal a radius-deepening
+    walk over a caller's ``wp.Bvh`` to the bit. The queries sit both on and well off the cloud so
+    that walk takes more than its first radius on some rows, and the point-to-plane pass moves
+    them by a step first, which is checked against moving them and searching from there.
     """
     rng = np.random.default_rng(21)
     target_np = rng.standard_normal((400, 3)).astype(np.float32)
@@ -1418,32 +1419,48 @@ def test_nearest_into_matches_query_nearest(device: str) -> None:
     ).astype(np.float32)
     target_wp = points_to_warp(target_np, device)
     queries_wp = points_to_warp(queries_np, device)
-
     target_index = tw.registration._target_index(target_wp)
-    rows = (
-        wp.empty((200, 1), dtype=wp.int32, device=device),
-        wp.empty((200, 1), dtype=wp.float32, device=device),
+
+    def search(step_np: np.ndarray) -> tuple[wp.array, wp.array, wp.array, wp.array]:
+        step_wp = wp.array([wp.mat44(*step_np.ravel())], dtype=wp.mat44, device=device)
+        outputs = (
+            wp.empty(200, dtype=wp.vec3, device=device),
+            wp.empty(200, dtype=wp.vec3, device=device),
+            wp.empty(200, dtype=wp.float32, device=device),
+            wp.empty(200, dtype=wp.int32, device=device),
+        )
+        wp.launch(
+            kernel_registration.point_to_plane_correspondence_pass,
+            dim=200,
+            inputs=[target_index.id, target_wp, queries_wp, step_wp, True, 0.0],
+            outputs=list(outputs),
+            device=device,
+        )
+        return outputs
+
+    moved_wp, closest_wp, distance_wp, index_wp = search(np.eye(4, dtype=np.float32))
+    nearest_wp, nearest_distance_wp = tw.neighbors.query_nearest(
+        target_wp, queries_wp, 1, backend="bvh"
     )
-    tw.registration._nearest_into(target_wp, queries_wp, target_index, rows)
-    index_wp, distance_wp = tw.neighbors.query_nearest(target_wp, queries_wp, 1, backend="bvh")
     _walk_index_wp, walk_distance_wp = tw.neighbors.query_nearest(
         target_wp, queries_wp, 1, accelerator=tw.neighbors.bvh_from_points(target_wp)
     )
-
-    assert np.array_equal(rows[0].numpy()[:, 0], index_wp.numpy())
-    assert np.array_equal(rows[1].numpy()[:, 0], distance_wp.numpy())
-    assert np.array_equal(rows[1].numpy()[:, 0], walk_distance_wp.numpy())
-    assert np.unique(index_wp.numpy()).shape[0] > 100
+    assert np.array_equal(moved_wp.numpy(), queries_np)
+    assert np.array_equal(index_wp.numpy(), nearest_wp.numpy())
+    assert np.array_equal(distance_wp.numpy(), nearest_distance_wp.numpy())
+    assert np.array_equal(distance_wp.numpy(), walk_distance_wp.numpy())
+    assert np.array_equal(closest_wp.numpy(), target_np[nearest_wp.numpy()])
+    assert np.unique(nearest_wp.numpy()).shape[0] > 100
 
     step_np = np.eye(4, dtype=np.float32)
     step_np[:3, 3] = (0.3, -0.2, 0.1)
-    step_wp = wp.array([wp.mat44(*step_np.ravel())], dtype=wp.mat44, device=device)
-    moved_wp = wp.empty(200, dtype=wp.vec3, device=device)
-    tw.registration._nearest_into(target_wp, queries_wp, target_index, rows, step_wp, moved_wp)
+    moved_wp, closest_wp, distance_wp, index_wp = search(step_np)
     assert np.allclose(moved_wp.numpy(), queries_np + step_np[:3, 3], atol=1e-6)
-    index_wp, distance_wp = tw.neighbors.query_nearest(target_wp, moved_wp, 1, backend="bvh")
-    assert np.array_equal(rows[0].numpy()[:, 0], index_wp.numpy())
-    assert np.array_equal(rows[1].numpy()[:, 0], distance_wp.numpy())
+    nearest_wp, nearest_distance_wp = tw.neighbors.query_nearest(
+        target_wp, moved_wp, 1, backend="bvh"
+    )
+    assert np.array_equal(index_wp.numpy(), nearest_wp.numpy())
+    assert np.array_equal(distance_wp.numpy(), nearest_distance_wp.numpy())
 
 
 @pytest.mark.parametrize(

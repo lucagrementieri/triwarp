@@ -37,22 +37,35 @@ def mark_referenced(faces: wp.array[wp.int32], out_flags: wp.array[wp.int32]) ->
 @wp.kernel
 def compact_referenced(
     vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
     inclusive: wp.array[wp.int32],
     out_remap: wp.array[wp.int32],
     out_vertices: wp.array[wp.vec3],
     out_inverse: wp.array[wp.int32],
+    out_faces: wp.array[wp.int32],
 ) -> None:
-    # The old-to-new map, the compacted positions and the new-to-old map from the in-place scan of
-    # the referenced flags, in one pass: ``flatnonzero``, the ``-1`` fill, the index scatter and the
-    # position gather ``remove_unreferenced_vertices`` otherwise runs one launch each.
-    v = wp.int32(wp.tid())
-    slot, referenced = scanned_count(inclusive, v)
-    if referenced == 0:
-        out_remap[v] = -1
+    # The old-to-new map, the compacted positions, the new-to-old map and the remapped faces from
+    # the in-place scan of the referenced flags, in one pass: ``flatnonzero``, the ``-1`` fill, the
+    # index scatter, the position gather and ``array.remap_indices`` would be one launch each.
+    # Launched over ``max(n_vertices, len(faces))``. A face entry reads the scan rather than
+    # ``out_remap``, which another thread of this launch writes: every vertex a face names was
+    # marked, so its new index is its exclusive scan value, which is what ``out_remap`` holds. A
+    # negative sentinel passes through unchanged (``array.gather_1d_skip_negative``).
+    t = wp.int32(wp.tid())
+    if t < faces.shape[0]:
+        index = faces[t]
+        if index >= 0:
+            index = inclusive[index] - 1
+        out_faces[t] = index
+    if t >= vertices.shape[0]:
         return
-    out_remap[v] = slot
-    out_vertices[slot] = vertices[v]
-    out_inverse[slot] = v
+    slot, referenced = scanned_count(inclusive, t)
+    if referenced == 0:
+        out_remap[t] = -1
+        return
+    out_remap[t] = slot
+    out_vertices[slot] = vertices[t]
+    out_inverse[slot] = t
 
 
 @wp.func
@@ -380,10 +393,13 @@ def degree3_fan_tables(
     out_counts: wp.array[wp.int32],
     out_link_sums: wp.array[wp.int32],
     out_fans: wp.array2d[wp.int32],
+    out_kept: wp.array[wp.int32],
 ) -> None:
     # One pass over the halfedges gathers everything ``remove_degree3_vertices`` asks of a vertex,
     # in place of a whole one-ring CSR: its corner count (its face count), its first three outgoing
-    # halfedges in arrival order, and a telescoping sum over its link.
+    # halfedges in arrival order, and a telescoping sum over its link. It also sets every face's
+    # kept flag to ``1`` for ``emit_degree3_replacement`` to clear, one store per face from its
+    # first halfedge, in place of a fill.
     #
     # The link sum adds ``x - y`` for the edge ``x -> y`` opposite each outgoing halfedge. Around an
     # interior vertex those edges form a closed cycle, so every link vertex is added once and
@@ -402,6 +418,8 @@ def degree3_fan_tables(
     if slot < 3:
         out_fans[v, slot] = h
     wp.atomic_add(out_link_sums, v, x - y)
+    if h % 3 == 0:
+        out_kept[h // 3] = 1
 
 
 @wp.func
@@ -637,17 +655,17 @@ def select_and_flatten_degree3(
     # be neighbours (a tetrahedron is four of them, each adjacent to the other three), and moving
     # both at once puts neither in the other's *new* plane. Doing it anyway maps the regular
     # tetrahedron to a mirrored fraction of itself -- every normal flipped and the signed volume
-    # negated -- which is why the caller runs ``select_independent_degree3`` first rather than
-    # launching this over every candidate.
+    # negated -- which is why this selects an independent set first rather than moving every
+    # candidate.
     #
     # The divisor is a literal 3 because ``selected`` implies interior valence 3; the ring walk is
     # over ``ring_offsets`` all the same, so a stale mask cannot make it read past the ring.
     # The selection and the move it implies, in one pass. They are the same thread's decision about
     # the same vertex, so running them apart cost a launch and a full round trip of the selection
     # mask through global memory to tell this kernel what the previous one had just decided. No
-    # ``out_count`` here, unlike ``select_independent_degree3``: this caller's loop reads the
-    # remaining candidate count instead, and the positions are written for *every* vertex because
-    # the caller ping-pongs two buffers and an unwritten slot would hold an iteration-old value.
+    # selection count here: this caller's loop reads the remaining candidates instead, and the
+    # positions are written for *every* vertex because the caller ping-pongs two buffers and an
+    # unwritten slot would hold an iteration-old value.
     #
     # Measured 1.12x on ``flatten_degree3_vertices`` at 3 413 flattened vertices, byte-identical.
     # The ring walk is done twice in the taken branch -- once to decide, once to average -- and
@@ -696,10 +714,9 @@ def _declare_map_kernels() -> None:
     builtins are declared there).
 
     One op: ``is_interior_degree3``, mapped over ``(ring_offsets[:-1], ring_offsets[1:],
-    is_boundary)`` by both ``repair.remove_degree3_vertices`` and
-    ``repair.flatten_degree3_vertices``. The length-1 row is not speculative -- a ring CSR over a
-    one-vertex mesh makes both offset slices length 1, and the broadcast mask is part of the cache
-    key, so that call would fork the module on first use.
+    is_boundary)`` by ``repair.flatten_degree3_vertices``. The length-1 row is not speculative -- a
+    ring CSR over a one-vertex mesh makes both offset slices length 1, and the broadcast mask is
+    part of the cache key, so that call would fork the module on first use.
     """
     dense, single = map_probe, map_probe_single
     declare_map_signatures(

@@ -7,7 +7,6 @@ from triwarp.kernels import array as kernel_array
 from triwarp.kernels.algorithms import bfs as kernel_bfs
 from triwarp.kernels.array import declare_map_signatures, map_probe, map_probe_single
 from triwarp.kernels.reduce import block_chunk_1d, block_min
-from triwarp.kernels.transform import transform_point_mat44
 
 # Iterative-deepening k-nearest search. A scan at radius ``r`` enumerates every point within
 # Euclidean distance ``r``, so a row whose k-th distance is at most ``r`` is provably the exact
@@ -549,28 +548,27 @@ def _row_helpers(row_size: int) -> _RowHelpers:
 _ROW_HELPERS = {row_size: _row_helpers(row_size) for row_size in KNN_ROW_BUCKETS}
 
 
-def _bvh_row_search(row_size: int) -> wp.Function:
-    """
-    Generate the ``K = row_size`` register-row BVH search, one ``@wp.func`` per bucket.
+def _bvh_nearest_row_kernel(row_size: int, name: str):
+    """``K = row_size`` register-row variant of ``query_bvh_nearest_neighbors``."""
+    vec_distances, vec_indices, row_reset, row_kth, row_write = _ROW_HELPERS[row_size]
 
-    Deepens a ball around ``q`` until the row's ``k``-th distance is certified, leaving the row in
-    the caller's registers (``wp.ref``, as the row helpers take it). Shared by the plain row kernel
-    and its query-moving variant, which differ only in where ``q`` comes from.
-    """
-    vec_distances, vec_indices, row_reset, row_kth, _row_write = _ROW_HELPERS[row_size]
-
-    def _search(
+    def _kernel(
         points: wp.array[wp.vec3],
+        queries: wp.array[wp.vec3],
         bvh_id: wp.uint64,
-        q: wp.vec3,
         k: wp.int32,
         max_radius: wp.float32,
         initial_radius: wp.float32,
         min_bound: wp.vec3,
         max_bound: wp.vec3,
-        row_distances: wp.ref[vec_distances],
-        row_indices: wp.ref[vec_indices],
+        out_indices: wp.array2d[wp.int32],
+        out_distances: wp.array2d[wp.float32],
     ) -> None:
+        tid = wp.int32(wp.tid())
+        q = queries[tid]
+        row_indices = vec_indices()
+        row_distances = vec_distances()
+
         r_hard, r = search_radius_bounds(q, min_bound, max_bound, max_radius, initial_radius)
         # The ball enumeration and its certificate are ``knn_bvh_scan``'s, which this factory
         # cannot call because the row lives in registers rather than in the output arrays; the
@@ -610,45 +608,6 @@ def _bvh_row_search(row_size: int) -> wp.Function:
             if r < 0.0:
                 break  # certified exact, or the scan was already complete
 
-    return wp.func(_search, name=f"knn_bvh_row_search{row_size}")
-
-
-_BVH_ROW_SEARCHES = {row_size: _bvh_row_search(row_size) for row_size in KNN_ROW_BUCKETS}
-
-
-def _bvh_nearest_row_kernel(row_size: int, name: str):
-    """``K = row_size`` register-row variant of ``query_bvh_nearest_neighbors``."""
-    vec_distances, vec_indices, _row_reset, _row_kth, row_write = _ROW_HELPERS[row_size]
-    row_search = _BVH_ROW_SEARCHES[row_size]
-
-    def _kernel(
-        points: wp.array[wp.vec3],
-        queries: wp.array[wp.vec3],
-        bvh_id: wp.uint64,
-        k: wp.int32,
-        max_radius: wp.float32,
-        initial_radius: wp.float32,
-        min_bound: wp.vec3,
-        max_bound: wp.vec3,
-        out_indices: wp.array2d[wp.int32],
-        out_distances: wp.array2d[wp.float32],
-    ) -> None:
-        tid = wp.int32(wp.tid())
-        q = queries[tid]
-        row_indices = vec_indices()
-        row_distances = vec_distances()
-        row_search(
-            points,
-            bvh_id,
-            q,
-            k,
-            max_radius,
-            initial_radius,
-            min_bound,
-            max_bound,
-            row_distances,
-            row_indices,
-        )
         row_write(row_distances, row_indices, tid, k, out_indices, out_distances)
 
     # ``enable_backward=False`` is mandatory, not a choice: the row helpers take ``wp.ref``
@@ -668,55 +627,6 @@ def bvh_nearest_kernel(k: int) -> wp.Kernel:
         if k <= row_size:
             return _BVH_NEAREST_ROW_KERNELS[row_size]
     return query_bvh_nearest_neighbors
-
-
-def _bvh_nearest_after_step_kernel():
-    """``query_bvh_nearest_neighbors_row1`` over queries moved by a rigid step first."""
-    vec_distances, vec_indices, _row_reset, _row_kth, row_write = _ROW_HELPERS[1]
-    row_search = _BVH_ROW_SEARCHES[1]
-
-    def _kernel(
-        points: wp.array[wp.vec3],
-        queries: wp.array[wp.vec3],
-        step: wp.array[wp.mat44],
-        bvh_id: wp.uint64,
-        max_radius: wp.float32,
-        initial_radius: wp.float32,
-        min_bound: wp.vec3,
-        max_bound: wp.vec3,
-        out_indices: wp.array2d[wp.int32],
-        out_distances: wp.array2d[wp.float32],
-        out_moved: wp.array[wp.vec3],
-    ) -> None:
-        # Moves query ``tid`` by ``step[0]``, publishes it into ``out_moved`` and finds its nearest
-        # point: ``icp_point_to_plane``'s cloud loop applies each iteration's rigid step at the
-        # next correspondence search, as its mesh loop does in
-        # ``registration.mesh_correspondence_pass``, rather than in a transform launch of its own.
-        # A variant of its own rather than two optional arguments on the shared k-NN kernels,
-        # which measured 1-3 % on their other callers at 2 562 queries.
-        tid = wp.int32(wp.tid())
-        q = transform_point_mat44(queries[tid], step[0])
-        out_moved[tid] = q
-        row_indices = vec_indices()
-        row_distances = vec_distances()
-        row_search(
-            points,
-            bvh_id,
-            q,
-            1,
-            max_radius,
-            initial_radius,
-            min_bound,
-            max_bound,
-            row_distances,
-            row_indices,
-        )
-        row_write(row_distances, row_indices, tid, 1, out_indices, out_distances)
-
-    return wp.kernel(_kernel, name="query_bvh_nearest_after_step", enable_backward=False)
-
-
-query_bvh_nearest_after_step = _bvh_nearest_after_step_kernel()
 
 
 @wp.func
@@ -986,29 +896,6 @@ def query_nearest_via_mesh(
     # grid's deferred ones, which saves a ``DEFERRED_ROW`` pre-fill of the output.
     tid = wp.int32(wp.tid())
     index, distance = mesh_nearest_point(mesh_id, points, queries[tid], max_radius)
-    out_indices[tid, 0] = index
-    out_distances[tid, 0] = distance
-
-
-@wp.kernel
-def query_nearest_via_mesh_after_step(
-    mesh_id: wp.uint64,
-    points: wp.array[wp.vec3],
-    queries: wp.array[wp.vec3],
-    step: wp.array[wp.mat44],
-    max_radius: wp.float32,
-    out_indices: wp.array2d[wp.int32],
-    out_distances: wp.array2d[wp.float32],
-    out_moved: wp.array[wp.vec3],
-) -> None:
-    # ``query_nearest_via_mesh`` over queries moved by ``step[0]`` first, publishing the moved
-    # point: ``icp`` / ``icp_point_to_plane``'s cloud loops apply each iteration's rigid step at the
-    # next correspondence search, as their mesh loop does in
-    # ``registration.mesh_correspondence_pass``, rather than in a transform launch of its own.
-    tid = wp.int32(wp.tid())
-    q = transform_point_mat44(queries[tid], step[0])
-    out_moved[tid] = q
-    index, distance = mesh_nearest_point(mesh_id, points, q, max_radius)
     out_indices[tid, 0] = index
     out_distances[tid, 0] = distance
 

@@ -1500,6 +1500,39 @@ def test_simplify_closed_matches_reference(device: str, tol: float) -> None:
     )
 
 
+@pytest.mark.parametrize("cap", [0, 10**9])
+@pytest.mark.parametrize("repeated", [False, True])
+def test_simplify_closed_through_both_round_forms(
+    device: str, cap: int, repeated: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Class A, against the recursive NumPy port of the closed loop, through both round forms.
+
+    ``closed=True`` reaches its closing point by wrapping the index over ``n + 1`` entries; an
+    input that already repeats its first point (``repeated``) leaves the last entry a dead slot
+    the seed must settle unkept, where a missed slot would add a spurious index ``n``. ``cap``
+    forces the one-block form (``10**9``) or the captured launches (``0``) as in
+    ``test_simplify_block_and_round_loop_match_reference``.
+    """
+    monkeypatch.setattr(kernel_polyline, "RDP_ONE_BLOCK_MAX", cap)
+    angle = np.linspace(0.0, 2.0 * np.pi, 400, endpoint=False)
+    radius = 1.0 + 0.3 * np.sin(7.0 * angle)
+    pts_np = np.stack([radius * np.cos(angle), radius * np.sin(angle), 0.1 * angle], axis=1)
+    closed_np = _closed_from(pts_np)
+    input_np = closed_np if repeated else pts_np
+    simplified_wp, indices_wp = tw.polyline.polyline_simplify(
+        points_to_warp(input_np, device), 0.02, closed=True
+    )
+    simplified_np, indices_np = _simplify_np(closed_np, 0.02)
+    # Non-vacuous: the loop keeps both ends of the seam and drops a real share of the rest.
+    assert 10 < indices_np.shape[0] < pts_np.shape[0] - 100
+    assert indices_np[-1] == pts_np.shape[0]
+    assert np.array_equal(indices_wp.numpy(), indices_np.astype(np.int32))
+    assert np.allclose(
+        simplified_wp.numpy(), simplified_np.astype(np.float32), rtol=1e-5, atol=1e-5
+    )
+
+
 @pytest.mark.parity("polyline_simplify", "meshlib", "pyvista")
 @pytest.mark.parametrize("tolerance", [0.8, 2.4])
 def test_simplify_matches_the_two_decimators(device: str, tolerance: float) -> None:

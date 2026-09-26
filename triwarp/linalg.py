@@ -1787,7 +1787,13 @@ class _BatchedCg:
         #   path only;
         # * rows 6-9, the recurrence's scalars, double-buffered: ``cg_update`` reads the ``old``
         #   rows in every block and writes the ``new`` ones, and ``cg_matvec_dots`` carries them.
-        scalars = wp.zeros((10, self._n_columns), dtype=wp.float64, device=device)
+        #
+        # The loop's integer state leads the same allocation, two ``float64`` words holding the
+        # ``int32`` words (``_INT_WORDS``), so the loop condition, the count and rows 0-1 are one
+        # contiguous span a host result reads in one readback (``host_result``).
+        head = wp.zeros(_INT_WORDS + 10 * self._n_columns, dtype=wp.float64, device=device)
+        self._head = twt.as_dense(head[: _INT_WORDS + 2 * self._n_columns])
+        scalars = twt.as_dense(head[_INT_WORDS:]).reshape((10, self._n_columns))
         self._residual_tolerance = twt.as_array2d(scalars[0:2], wp.float64)
         self._atol_sq = twt.as_dense(scalars[0])
         self._dots = twt.as_array2d(scalars[1:3], wp.float64)
@@ -1799,7 +1805,12 @@ class _BatchedCg:
         # The round-loop state (``kernels/array.py``'s ``LOOP_ROUND`` / ``LOOP_CONDITION``, seeded
         # by ``cg_seed`` at the start of every solve) and, after it, the rounds that took a step --
         # the iteration count a solve reports -- so the host cadence's condition read carries it.
-        self._ints = wp.zeros(kernel_array.LOOP_STATE_SIZE + 1, dtype=wp.int32, device=device)
+        self._ints = wp.array(
+            ptr=head.ptr, dtype=wp.int32, shape=(kernel_array.LOOP_STATE_SIZE + 1,), device=device
+        )
+        # A view by pointer holds no reference to its storage; this one keeps ``head`` alive for as
+        # long as it -- or any slice of it handed to a caller -- is.
+        self._ints._ref = head
         self._state = twt.as_dense(self._ints[: kernel_array.LOOP_STATE_SIZE])
         self._iterations = twt.as_dense(self._ints[kernel_array.LOOP_STATE_SIZE :])
         # The live rows of ``u`` and ``w`` per column, for ``bsr_mv`` on the heavy-row path.
@@ -1848,11 +1859,11 @@ class _BatchedCg:
         # The caller's right-hand side at pitch ``n``, re-read by ``_initialize`` on every call. A
         # solver built without one (``_cached_solver``'s) is handed it by ``solve``.
         self._rhs_flat: wp.array[wp.float64] | None = None if rhs is None else rhs.flatten()
-        # The device-side loop's recorded graph. Every launch in ``_iteration`` reads buffers this
-        # state owns and never rebinds, and ``_initialize`` resets the loop condition before every
-        # run, so one recording serves every call: re-recording it per call would repay the
-        # capture of every launch in the body, plus the graph instantiation, for an identical
-        # graph.
+        # The device-side loop's recorded graph: ``_seed`` -- which resets the loop condition --
+        # then the loop. Every launch in both reads buffers this state owns and never rebinds, so
+        # one recording serves every call: re-recording it per call would repay the capture of
+        # every launch in the body, plus the graph instantiation, for an identical graph. Only
+        # ``_initialize``, which reads the caller's operands, is issued per call.
         self._graph = None
 
         # The settle monitor ``solve_spd_settled`` runs (``check_rounds``, ``change_tolerance``,
@@ -2063,12 +2074,17 @@ class _BatchedCg:
         elif self._cycle is not None:
             self._cycle.apply(self._r, self._u)
 
-    def _initialize(self) -> None:
-        """Seed the residual from the caller's operands, then the tolerances and the recurrence."""
+    def _initialize(self, initial: wp.array[Any] | None) -> None:
+        """
+        Seed the residual from the caller's operands: the one launch that reads them.
+
+        ``initial``, when given, is the caller's initial guess, which the launch copies into this
+        state's own solution buffer as it reads it (``solve``); otherwise that buffer already holds
+        it. Whenever the state holds a Jacobi inverse diagonal the initial scaling rides in the same
+        launch, into ``_scaled`` -- ``u`` itself under Jacobi, the polynomial's input under
+        Jacobi-Chebyshev -- exactly as ``cg_update`` does it every round.
+        """
         tile = int(kernel_cg.CG_TILE)
-        # Whenever the state holds a Jacobi inverse diagonal the initial scaling rides in the
-        # residual's launch, into ``_scaled`` -- ``u`` itself under Jacobi, the polynomial's input
-        # under Jacobi-Chebyshev -- exactly as ``cg_update`` does it every round.
         jacobi = self._inv_diag is not None
         wp.launch_tiled(
             kernel_cg.CG_INITIAL[self._dtype, self._round_values.dtype],
@@ -2078,17 +2094,36 @@ class _BatchedCg:
                 wp.int32(self._stride),
                 wp.int32(self._span),
                 wp.int32(1 if jacobi else 0),
+                wp.int32(0 if initial is None else 1),
                 self._matrix.offsets,
                 self._matrix.columns,
                 self._round_values,
                 self._rhs_flat,
-                self._solution_flat,
+                self._solution_flat if initial is None else initial,
                 self._inv_diag,
             ],
-            outputs=[self._r, self._scaled, self._p, self._s, self._partials],
+            outputs=[
+                None if initial is None else self._solution_flat,
+                self._r,
+                self._scaled,
+                self._p,
+                self._s,
+                self._partials,
+            ],
             block_dim=tile,
             device=self._device,
         )
+
+    def _seed(self) -> None:
+        """
+        Everything a solve does after the residual and before its first round.
+
+        The tolerances and the recurrence's seeds, the preconditioner's first apply and the settle
+        monitor's reset. None of it reads the caller's operands, so on the device-side path it is
+        recorded into the replayed graph ahead of the loop rather than issued on every call -- under
+        the Jacobi-Chebyshev polynomial that is a dozen launches a solve.
+        """
+        tile = int(kernel_cg.CG_TILE)
         wp.launch_tiled(
             kernel_cg.cg_seed,
             dim=(self._n_columns,),
@@ -2115,14 +2150,15 @@ class _BatchedCg:
         if self._settle is not None:
             self._settle_state.zero_()
 
-    def __call__(self):
+    def __call__(self, initial: wp.array[Any] | None = None):
         """
         Run the solve, returning ``warp.optim.linear.cg``'s three values on its own terms.
 
         Device arrays under ``check_every == 0``, host scalars otherwise, exactly as
-        [`solve_spd_columns`][triwarp.linalg.solve_spd_columns] documents.
+        [`solve_spd_columns`][triwarp.linalg.solve_spd_columns] documents. ``initial`` is
+        ``_initialize``'s.
         """
-        self._initialize()
+        self._initialize(initial)
         # The device-side loop needs a conditional CUDA graph, so a CPU-resident system takes the
         # host cadence even where the machine has a GPU -- ``_supported_check_every`` can only see
         # the *machine*, not which device these arrays are on.
@@ -2130,6 +2166,7 @@ class _BatchedCg:
         if check_every == 0 and not self._device.is_cuda:
             check_every = CG_CHECK_EVERY_FALLBACK
         if check_every > 0:
+            self._seed()
             return self._run_with_host_checks(check_every)
         if self._graph is None:
             condition = self._state[kernel_array.LOOP_CONDITION_VIEW]
@@ -2140,6 +2177,7 @@ class _BatchedCg:
             # most ``check_rounds - 1`` idle rounds at the very end.
             body = self._iteration if self._settle is None else self._settle_block
             with wp.ScopedCapture(self._device) as capture:
+                self._seed()
                 wp.capture_while(condition, body)
             self._graph = capture.graph
         wp.capture_launch(self._graph)
@@ -2150,15 +2188,14 @@ class _BatchedCg:
         Run against a caller's operands through this solver's own solution buffer.
 
         The recorded graph writes ``x`` through a pointer taken at record time, so a solver that
-        outlives one call cannot hand the graph the caller's buffer; it copies the initial guess in
-        and the answer out instead, two copies against a recording. ``rhs`` is read only by
-        ``_initialize``, which runs outside the graph, so it is taken as given. Both are the flat
-        ``n_columns * n`` views of the caller's contiguous buffers.
+        outlives one call cannot hand the graph the caller's buffer; the initial guess is copied in
+        by the residual's own launch and the answer copied out, against a recording. ``rhs`` is
+        read only by ``_initialize``, which runs outside the graph, so it is taken as given. Both
+        are the flat ``n_columns * n`` views of the caller's contiguous buffers.
         """
         self._rhs_flat = rhs
-        wp.copy(self._solution_flat, solution)
         try:
-            result = self()
+            result = self(solution)
         finally:
             # Not held past the call: the caller's right-hand side is not this solver's to keep.
             self._rhs_flat = None
@@ -2181,7 +2218,7 @@ class _BatchedCg:
             # The monitor's check is the cadence: it is what can stop the loop early.
             check_every = self._settle[0]
         done = 0
-        ints = None
+        head = None
         while done < self._maxiter:
             block = min(check_every, self._maxiter - done)
             for _ in range(block):
@@ -2189,29 +2226,39 @@ class _BatchedCg:
             done += block
             if self._settle is not None:
                 self._settle_check()
-            # The condition and the iteration count share one buffer, so the last check's read
-            # is also the count's.
-            ints = self._ints.numpy()
-            if not int(ints[int(kernel_array.LOOP_CONDITION)]):
+            # The condition, the iteration count and the result rows share one span, so the last
+            # check's read is also the result's.
+            head = self._head.numpy()
+            if not int(_head_ints(head)[int(kernel_array.LOOP_CONDITION)]):
                 break
-        return self.host_result(ints)
+        return self.host_result(head)
 
-    def host_result(self, ints: Any = None) -> tuple[int, float, float]:
+    def host_result(self, head: Any = None) -> tuple[int, float, float]:
         """
         Read the last solve's ``(iterations, residual, tolerance)`` back as host scalars.
 
-        Two readbacks -- the integer state and the two scalar rows -- where reading the three
-        returned device arrays one at a time takes three; ``ints`` is a read of ``_ints`` the
-        caller already holds, which saves the first.
+        One readback of the span holding the integer state and the two scalar rows, where reading
+        the three returned device arrays one at a time takes three; ``head`` is a read of that span
+        the caller already holds, which saves it.
         """
-        if ints is None:
-            ints = self._ints.numpy()
-        residual_tolerance = self._residual_tolerance.numpy()
+        if head is None:
+            head = self._head.numpy()
+        rows = np.asarray(head[_INT_WORDS:]).reshape((2, self._n_columns))
         return (
-            int(ints[kernel_array.LOOP_STATE_SIZE]),
-            math.sqrt(float(residual_tolerance[1].max())),
-            math.sqrt(float(residual_tolerance[0].max())),
+            int(_head_ints(head)[kernel_array.LOOP_STATE_SIZE]),
+            math.sqrt(float(rows[1].max())),
+            math.sqrt(float(rows[0].max())),
         )
+
+
+# ``float64`` words at the head of a ``_BatchedCg``'s scalar buffer that hold its ``int32`` loop
+# state and iteration count.
+_INT_WORDS = (kernel_array.LOOP_STATE_SIZE + 2) // 2
+
+
+def _head_ints(head: Any) -> Any:
+    """Reinterpret the head of a host read of a ``_BatchedCg``'s scalars as its ``int32`` words."""
+    return np.ascontiguousarray(head[:_INT_WORDS]).view(np.int32)
 
 
 # ``_cached_solver``'s states, keyed weakly by the operator they solve, so a state -- its buffers,

@@ -6615,3 +6615,41 @@ on a box shared by three reviewers. Probes are `plans/benchmark-round-19-data/pr
   loaded the live tree in both arms. Give concurrent reviewers' probe helpers unique names, and
   assert the *submodule's* `__file__` -- the lazy `__init__` means `triwarp.__file__` proves nothing
   about which `triwarp.polyline` was imported.
+
+### 16.21 The round-17/18/19 kernel de-duplication pass (2026-09-26)
+
+Every kernel changed in `1999468..e34051f` read against the rest of `kernels/`, by five reviewers
+with disjoint file ownership, counts as evidence and CPU byte-identity against a detached
+`e34051f` worktree; every probed output is byte-identical on CPU. Quiet-box clock afterwards
+(alternating processes, min of 3), `icosphere(5)` / a 3 000-point ring: `polyline_normal` 1.58x,
+`polyline_simplify(closed=True)` 1.32x, `smooth_region_boundary` 1.40x, `marching_triangles`
+1.23x, `remove_unreferenced_vertices` 1.16x, `polyline_radius(closed=True)` 1.15x, ICP and the
+heat family 1.02-1.04x, Chamfer flat. What generalises:
+
+- **A band-sized question was answered with a mesh-sized matrix.** `smooth_region_boundary`
+  assembled `-cotmatrix` for the whole mesh to extract a system over a few hundred rim unknowns;
+  its pattern now comes from the vertex-face rings (`band_pattern`, a count and a fill pass of one
+  kernel). §16.5's densify-the-whole-mesh shape again.
+- **A `_BatchedCg` solve's prologue replays with its loop.** `cg_seed`, the preconditioner's first
+  apply and the settle reset are recorded ahead of `capture_while` in the same graph, so a cached
+  solve issues only `cg_initial` (which also copies the initial guess in): a Chebyshev `solve_spd`
+  13 -> 1 launches, 2.6-2.9x on a short solve. The loop state and count share the float64 scalar
+  buffer's head, so a host result is one readback.
+- **`heat_operators`' timestep leaves the edge sum and count on the device** and
+  `shifted_system_values` forms the mean itself: no readback; `vector_heat_operators` builds its
+  lumped mass once. `heat_signed_distance` derives curve segments per thread (binary search into
+  the offsets) instead of a host loop over a readback.
+- **A compaction is one kernel over an int32 flag scanned in place**, not a bool mask +
+  `flatnonzero` + one gather per output buffer (`intersection`'s three segment producers,
+  `polyline_simplify`); unused optional outputs pass `None` and test `shape[0]` (a null
+  descriptor's shape reads 0 on both devices).
+- **`closed=True` wraps the index** in `polyline_simplify` / `polyline_radius` too, and
+  `loop_point` (one select) replaces `wrap_index` (two modulos) wherever the index is at most `n`.
+- **Both ICP loops share one correspondence search** (`icp_match`, warp-uniform cloud/mesh) and one
+  stopping rule (`continue_icp_loop`); the per-correspondence normal gather is gone (normals read
+  from the target's table at the index).
+- **`reduce.block_barrier`** is the one spelling of a discarded block reduction used as a barrier
+  (CG one-block kernels, the stitch DP tile, the RDP and ear-clip block loops).
+- Declined, with reasons at the sites: merging `nearest_point_via_mesh` with
+  `query_nearest_via_mesh` (a launch argument on a launch-bound k = 1 path, §16.18's 0.96-0.97x),
+  merging the Jacobi/dominance kernels behind flags (a shared `jacobi_row` helper instead).

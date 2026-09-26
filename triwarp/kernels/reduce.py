@@ -76,6 +76,14 @@ def block_sum(value: Any):
 
 
 @wp.func
+def block_barrier() -> None:
+    # A full block barrier: a block-wide reduction synchronizes before and after, and Warp spells
+    # no bare ``__syncthreads``, so this is the one name for "every lane sees the writes before
+    # it". The sum itself is discarded.
+    _ = block_sum(wp.int32(0))
+
+
+@wp.func
 def block_min(value: Any):
     """Minimum of a scalar ``value`` over the block's lanes."""
     return wp.tile_min(wp.tile(value))[0]
@@ -147,7 +155,7 @@ def blocks_1d(n: int) -> int:
     It is also the launch width for the *lane-strided* reductions outside this module --
     ``registration.transform_and_accumulate_cost`` / ``accumulate_procrustes_moments`` /
     ``accumulate_point_to_plane``, ``points.centered_covariance``,
-    ``polyline.accumulate_newell_normal`` / ``accumulate_turning_angle`` /
+    ``polyline.accumulate_turning_angle`` /
     ``accumulate_radius_frame`` / ``accumulate_loop_frame`` -- which own the same
     [`ITEMS_PER_BLOCK_1D`][triwarp.kernels.reduce.ITEMS_PER_BLOCK_1D] chunk per block but partition
     it across lanes with ``wp.block_dim()`` rather than loading tiles from it.

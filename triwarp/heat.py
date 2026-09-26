@@ -36,10 +36,8 @@ live in [`triwarp.laplacian`][triwarp.laplacian], tangent frames in
 
 from __future__ import annotations
 
-import itertools
 from typing import Any, cast
 
-import numpy as np
 import warp as wp
 import warp.optim.linear as wpl
 import warp.sparse as wps
@@ -211,80 +209,7 @@ def heat_operators(
             "cot_entries and use_robust are mutually exclusive: use_robust rebuilds the "
             "half-cotangent table from mollified edge lengths."
         )
-    # Per-face half-cotangent weights (float32, O(1) and safe) reused for both the Laplacian and
-    # the divergence. The cotangent stiffness follows the igl convention (negative diagonal, so
-    # ``-L`` is positive semi-definite) but is assembled here in float64.
-    if use_robust:
-        # Mollified lengths: one global constant added to every edge so no triangle is degenerate.
-        # The gradient and divergence stages below still use the extrinsic positions, so this makes
-        # the *solves* robust rather than turning the whole method intrinsic.
-        lengths, _ = mollify_intrinsic(vertices, faces)
-        cot_entries = cotmatrix_entries_intrinsic(lengths)
-    elif cot_entries is None:
-        cot_entries = cotmatrix_entries(vertices, faces)
-    # ``cotmatrix`` casts the shared float32 half-cotangent weights to float64 and assembles the
-    # operator natively in a single build, avoiding a recast rebuild (see cotmatrix's kernel note).
-    laplacian = cotmatrix(vertices, faces, cot_entries=cot_entries, dtype=wp.float64)
-    if t is None:
-        # The unique-edge average, which is what ``igl::heat_geodesics`` uses for its timestep --
-        # read off the Laplacian's own sparsity, which already holds the unique edges.
-        h = _mean_edge_length(vertices, laplacian)
-        t = h * h
-
-    # The divergence kernel this bundle feeds (``kernels/heat.py::unit_gradient_divergence``) is
-    # hardcoded ``wp.array2d[wp.float32]`` -- ``cotmatrix`` above accepts either precision because
-    # it casts internally, but this tuple's own ``cot_entries`` field is documented and used
-    # downstream as float32 only, so a caller-supplied float64 table must be narrowed before it is
-    # returned rather than passed through at whatever precision it arrived in.
-    if cot_entries.dtype is not wp.float32:
-        narrowed_cot_entries = twt.empty_2d(
-            (int(cot_entries.shape[0]), int(cot_entries.shape[1])),
-            wp.float32,
-            device=vertices.device,
-        )
-        wp.utils.array_cast(cot_entries.flatten(), narrowed_cot_entries.flatten())
-        cot_entries = narrowed_cot_entries
-
-    # Face normals / areas (float32) for the gradient; the lumped mass is built natively in float64
-    # by ``mass_matrix_entries``.
-    normals, areas = face_normals_and_areas(vertices, faces)
-    mass = mass_matrix_entries(vertices, faces, dtype=wp.float64)
-
-    # Heat system (M - t L) and Poisson operator ``-L``, both over the Laplacian's own pattern
-    # (which stores every referenced vertex's diagonal) and written in one pass
-    # (``kernels/heat.shifted_system_values``), so all three operators share one pattern. The two
-    # preconditioners are mesh-only, so they belong here rather than in every solve. See Notes.
-    heat_values = wp.empty_like(laplacian.values)
-    poisson_values = wp.empty_like(laplacian.values)
-    wp.launch(
-        kernel_heat.SHIFTED_SYSTEM_VALUES[wp.float64],
-        dim=int(laplacian.nrow),
-        inputs=[
-            laplacian.offsets,
-            laplacian.columns,
-            laplacian.values,
-            mass,
-            wp.float64(-t),
-            wp.int32(1),
-        ],
-        outputs=[heat_values, poisson_values],
-        device=vertices.device,
-    )
-    heat_system = cast("wps.BsrMatrix[wp.float64]", twl.bsr_with_values(laplacian, heat_values))
-    poisson_system = cast(
-        "wps.BsrMatrix[wp.float64]", twl.bsr_with_values(laplacian, poisson_values)
-    )
-    return (
-        heat_system,
-        twl.jacobi_preconditioner(heat_system),
-        laplacian,
-        poisson_system,
-        twl.chebyshev_preconditioner(poisson_system),
-        # Narrowed to float32 by the block above, whichever precision it arrived in.
-        cast(twt.Array2dFloat32, cot_entries),
-        normals,
-        areas,
-    )
+    return _heat_operators(vertices, faces, t, use_robust=use_robust, cot_entries=cot_entries)[0]
 
 
 def heat_geodesic(
@@ -535,13 +460,23 @@ def heat_signed_distance(
     poisson_system, poisson_preconditioner = scalar[3], scalar[4]
     cot_entries, face_normals = scalar[5], scalar[6]
 
-    # Stage 1: splat each segment's normal onto its endpoints.
-    segments = _curve_segments(curve_vertices, curve_offsets, closed=closed)
+    # Stage 1: splat each segment's normal onto its endpoints, one thread per curve entry, each
+    # finding its own curve in the offsets on the device.
     source = wp.zeros(n_vertices, dtype=wp.vec2d, device=device)
     wp.launch(
         kernel_heat.splat_curve_normals,
-        dim=int(segments.shape[0]),
-        inputs=[vertices, segments, vertex_normals, basis_x, basis_y, source],
+        dim=int(curve_vertices.shape[0]),
+        inputs=[
+            vertices,
+            curve_vertices,
+            curve_offsets,
+            wp.int32(1 if curve_offsets is None else 0),
+            wp.int32(1 if closed else 0),
+            vertex_normals,
+            basis_x,
+            basis_y,
+            source,
+        ],
         device=device,
     )
 
@@ -575,39 +510,6 @@ def heat_signed_distance(
     )
 
 
-def _curve_segments(
-    curve_vertices: wp.array[wp.int32], curve_offsets: wp.array[wp.int32] | None, *, closed: bool
-) -> twt.Array2dInt32:
-    """
-    Expand CSR vertex paths into a flat ``(n_segments, 2)`` list of endpoint pairs.
-
-    Built on the host: a curve on a surface is small (thousands of vertices at most, against the
-    mesh's millions), the offsets have to be read to know where the curves end anyway, and doing it
-    here keeps the splat kernel free of the wrap-around bookkeeping that ``closed`` implies.
-    """
-    indices = curve_vertices.numpy()
-    bounds = (
-        np.array([0, len(indices)], dtype=np.int64)
-        if curve_offsets is None
-        else curve_offsets.numpy().astype(np.int64)
-    )
-
-    pairs: list[np.ndarray] = []
-    for begin, end in itertools.pairwise(bounds):
-        curve = indices[begin:end]
-        if len(curve) < 2:
-            continue
-        pairs.append(np.stack([curve[:-1], curve[1:]], axis=1))
-        if closed:
-            pairs.append(np.array([[curve[-1], curve[0]]], dtype=curve.dtype))
-    if not pairs:
-        return twt.empty_2d((0, 2), wp.int32, device=curve_vertices.device)
-    segments = np.ascontiguousarray(np.concatenate(pairs), dtype=np.int32)
-    return twt.as_array2d(
-        wp.array(segments, dtype=wp.int32, device=curve_vertices.device), wp.int32
-    )
-
-
 def _solve_poisson_zero_set(
     operator: wps.BsrMatrix[wp.float64],
     divergence: wp.array[wp.float64],
@@ -628,10 +530,12 @@ def _solve_poisson_zero_set(
     if n_free == 0:
         return wp.zeros(n_vertices, dtype=wp.float64, device=device)
 
-    zeros = wp.zeros((1, n_vertices), dtype=wp.float64, device=device)
-    operator_uu, rhs = twl.assemble_interior_system(
-        operator, fixed_mask, free_map, twt.as_array2d(zeros, wp.float64), n_free
-    )
+    # No pinned-value right-hand side to assemble: the curve is pinned to zero, so ``-Q_ub bc``
+    # vanishes and the extraction is asked for none. The system's one right-hand side is the
+    # compacted divergence, which writes every free row.
+    no_values = twt.empty_2d((0, n_vertices), wp.float64, device=device)
+    operator_uu, _ = twl.assemble_interior_system(operator, fixed_mask, free_map, no_values, n_free)
+    rhs = twt.empty_2d((1, n_free), wp.float64, device=device)
     # ``divergence`` is already the -div right-hand side the -L operator takes.
     wp.launch(
         kernel_heat.scatter_free_rhs,
@@ -811,17 +715,21 @@ def vector_heat_operators(
     device = vertices.device
     n_vertices = int(vertices.shape[0])
     connection = connection_laplacian(vertices, faces)
+    edge_sums = None
     if t is None:
         # Shares the scalar solver's timestep convention -- the unique-edge mean, matching
         # ``igl::heat_geodesics``. The two solvers must agree: ``log_map``'s radius is asserted to
         # *be* the ``heat_geodesic`` distance, so giving them different diffusion times would split
-        # a quantity that is supposed to be one number. They do by construction: both read the
-        # mean off their operator's sparsity, and the connection Laplacian's is the cotangent
-        # Laplacian's, twelve triplets per face and nothing pruned.
-        h = _mean_edge_length(vertices, connection)
-        t = h * h
+        # a quantity that is supposed to be one number. They do by construction: the mean is read
+        # off the connection Laplacian's sparsity, which is the cotangent Laplacian's, twelve
+        # triplets per face and nothing pruned -- and the scalar bundle built here takes these
+        # very sums. Both systems square it on the device, so nothing is read back.
+        edge_sums = _edge_length_sums(vertices, connection)
 
-    mass = mass_matrix_entries(vertices, faces, dtype=wp.float64)
+    if scalar_operators is None:
+        scalar_operators, mass = _heat_operators(vertices, faces, t, edge_sums=edge_sums)
+    else:
+        mass = mass_matrix_entries(vertices, faces, dtype=wp.float64)
     mass_blocks = wp.empty(n_vertices, dtype=wp.mat22d, device=device)
     wp.map(kernel_heat.block_mass, mass, out=mass_blocks)
     # ``M + t L_connection`` over the connection Laplacian's own pattern, as the scalar system is
@@ -835,44 +743,141 @@ def vector_heat_operators(
             connection.columns,
             connection.values,
             mass_blocks,
-            wp.float64(t),
+            wp.float64(1.0 if t is None else t),
+            edge_sums,
+            wp.int32(1 if t is None else 0),
             wp.int32(0),
         ],
         outputs=[vector_values, None],
         device=device,
     )
     vector_system = cast("wps.BsrMatrix[wp.mat22d]", twl.bsr_with_values(connection, vector_values))
-    if scalar_operators is None:
-        scalar_operators = heat_operators(vertices, faces, t)
     if frames is None:
         frames = vertex_tangent_frames(vertices, faces)
     preconditioner = twl.jacobi_preconditioner(vector_system)
     return vector_system, scalar_operators, frames, preconditioner
 
 
-def _mean_edge_length(vertices: wp.array[wp.vec3], operator: wps.BsrMatrix[Any]) -> float:
+def _heat_operators(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    t: float | None,
+    *,
+    use_robust: bool = False,
+    cot_entries: twt.Array2dFloat | None = None,
+    edge_sums: wp.array[wp.float64] | None = None,
+) -> tuple[HeatOperators, wp.array[wp.float64]]:
     """
-    Mean unique-edge length, read off an operator with one entry per edge.
+    ``heat_operators``' assembly, returning the ``float64`` lumped mass it built alongside.
+
+    ``vector_heat_operators`` reuses the mass for its own system, and hands over the edge-length
+    sums it already reduced for the default timestep as ``edge_sums``: the connection Laplacian's
+    sparsity is the cotangent Laplacian's, so the sums are the ones this would reduce.
+    """
+    # Per-face half-cotangent weights (float32, O(1) and safe) reused for both the Laplacian and
+    # the divergence. The cotangent stiffness follows the igl convention (negative diagonal, so
+    # ``-L`` is positive semi-definite) but is assembled here in float64.
+    if use_robust:
+        # Mollified lengths: one global constant added to every edge so no triangle is degenerate.
+        # The gradient and divergence stages below still use the extrinsic positions, so this makes
+        # the *solves* robust rather than turning the whole method intrinsic.
+        lengths, _ = mollify_intrinsic(vertices, faces)
+        cot_entries = cotmatrix_entries_intrinsic(lengths)
+    elif cot_entries is None:
+        cot_entries = cotmatrix_entries(vertices, faces)
+    # ``cotmatrix`` casts the shared float32 half-cotangent weights to float64 and assembles the
+    # operator natively in a single build, avoiding a recast rebuild (see cotmatrix's kernel note).
+    laplacian = cotmatrix(vertices, faces, cot_entries=cot_entries, dtype=wp.float64)
+    if t is None and edge_sums is None:
+        # The unique-edge average, which is what ``igl::heat_geodesics`` uses for its timestep --
+        # read off the Laplacian's own sparsity, which already holds the unique edges, and left on
+        # the device for the system's assembly to square.
+        edge_sums = _edge_length_sums(vertices, laplacian)
+
+    # The divergence kernel this bundle feeds (``kernels/heat.py::unit_gradient_divergence``) is
+    # hardcoded ``wp.array2d[wp.float32]`` -- ``cotmatrix`` above accepts either precision because
+    # it casts internally, but this tuple's own ``cot_entries`` field is documented and used
+    # downstream as float32 only, so a caller-supplied float64 table must be narrowed before it is
+    # returned rather than passed through at whatever precision it arrived in.
+    if cot_entries.dtype is not wp.float32:
+        narrowed_cot_entries = twt.empty_2d(
+            (int(cot_entries.shape[0]), int(cot_entries.shape[1])),
+            wp.float32,
+            device=vertices.device,
+        )
+        wp.utils.array_cast(cot_entries.flatten(), narrowed_cot_entries.flatten())
+        cot_entries = narrowed_cot_entries
+
+    # Face normals / areas (float32) for the gradient; the lumped mass is built natively in float64
+    # by ``mass_matrix_entries``.
+    normals, areas = face_normals_and_areas(vertices, faces)
+    mass = mass_matrix_entries(vertices, faces, dtype=wp.float64)
+
+    # Heat system (M - t L) and Poisson operator ``-L``, both over the Laplacian's own pattern
+    # (which stores every referenced vertex's diagonal) and written in one pass
+    # (``kernels/heat.shifted_system_values``), so all three operators share one pattern. The two
+    # preconditioners are mesh-only, so they belong here rather than in every solve. See Notes.
+    heat_values = wp.empty_like(laplacian.values)
+    poisson_values = wp.empty_like(laplacian.values)
+    wp.launch(
+        kernel_heat.SHIFTED_SYSTEM_VALUES[wp.float64],
+        dim=int(laplacian.nrow),
+        inputs=[
+            laplacian.offsets,
+            laplacian.columns,
+            laplacian.values,
+            mass,
+            wp.float64(-1.0 if t is None else -t),
+            edge_sums if t is None else None,
+            wp.int32(1 if t is None else 0),
+            wp.int32(1),
+        ],
+        outputs=[heat_values, poisson_values],
+        device=vertices.device,
+    )
+    heat_system = cast("wps.BsrMatrix[wp.float64]", twl.bsr_with_values(laplacian, heat_values))
+    poisson_system = cast(
+        "wps.BsrMatrix[wp.float64]", twl.bsr_with_values(laplacian, poisson_values)
+    )
+    operators = (
+        heat_system,
+        twl.jacobi_preconditioner(heat_system),
+        laplacian,
+        poisson_system,
+        twl.chebyshev_preconditioner(poisson_system),
+        # Narrowed to float32 by the block above, whichever precision it arrived in.
+        cast(twt.Array2dFloat32, cot_entries),
+        normals,
+        areas,
+    )
+    return operators, mass
+
+
+def _edge_length_sums(
+    vertices: wp.array[wp.vec3], operator: wps.BsrMatrix[Any]
+) -> wp.array[wp.float64]:
+    """
+    Sum and count of the unique-edge lengths, read off an operator with one entry per edge.
 
     The strict upper triangle of the heat method's Laplacians is the mesh's unique edge set, so the
-    timestep costs one launch and one readback over an operator that already exists, where
+    default timestep costs one launch over an operator that already exists, where
     [`mean_unique_edge_length`][triwarp.edges.mean_unique_edge_length] would re-sort every edge of
-    the mesh to recover the same set. ``0`` for a mesh with no edges, as that function returns.
+    the mesh to recover the same set. The two sums stay on the device, where
+    ``kernels/heat.shifted_system_values`` squares their mean -- ``0`` for a mesh with no edges, as
+    that function returns.
     """
     device = vertices.device
     n_rows = int(operator.nrow)
-    if n_rows == 0:
-        return 0.0
     sum_and_count = wp.zeros(2, dtype=wp.float64, device=device)
-    wp.launch_tiled(
-        kernel_heat.upper_edge_length_sum_and_count,
-        dim=[kernel_reduce.blocks_1d(n_rows)],
-        inputs=[operator.offsets, operator.columns, vertices, sum_and_count],
-        block_dim=TILE_1D,
-        device=device,
-    )
-    total, count = (float(x) for x in sum_and_count.numpy())
-    return total / count if count > 0.0 else 0.0
+    if n_rows > 0:
+        wp.launch_tiled(
+            kernel_heat.upper_edge_length_sum_and_count,
+            dim=[kernel_reduce.blocks_1d(n_rows)],
+            inputs=[operator.offsets, operator.columns, vertices, sum_and_count],
+            block_dim=TILE_1D,
+            device=device,
+        )
+    return sum_and_count
 
 
 def extend_scalar(

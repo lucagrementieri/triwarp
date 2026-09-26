@@ -227,13 +227,28 @@ def csr_row_diagonal(
 
 
 @wp.func
-def dominance_ratio(diagonal: wp.float64, off_sum: wp.float64) -> wp.float64:
+def dominance_ratio(diagonal: wp.Float, off_sum: wp.Float) -> wp.Float:
     # A row's Gershgorin ratio ``sum_{j != i} |A_ij| / |A_ii|``, 0 for a zero diagonal -- see
     # ``offdiagonal_dominance_rows`` for why both halves of that are load-bearing.
     magnitude = wp.abs(diagonal)
-    if magnitude == wp.float64(0.0):
-        return wp.float64(0.0)
+    if magnitude == type(magnitude)(0.0):
+        return type(magnitude)(0.0)
     return off_sum / magnitude
+
+
+@wp.func
+def jacobi_row(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.Float],
+    i: wp.int32,
+) -> tuple[wp.Float, wp.Float]:
+    # Row ``i``'s Jacobi inverse diagonal (``array.inverse_or_one``, so an empty row scales by 1)
+    # and its Gershgorin ratio, from one walk of the row: every kernel that scales by the Jacobi
+    # diagonal or fits an interval to the discs reads them here, so the diagonal's convention is
+    # written once. A caller wanting one of the two leaves the other dead, and it compiles away.
+    diagonal, off_sum = csr_row_diagonal(offsets, columns, values, i)
+    return inverse_or_one(diagonal), dominance_ratio(diagonal, off_sum)
 
 
 @wp.kernel
@@ -259,8 +274,8 @@ def offdiagonal_dominance_rows(
     # that reads like a well-conditioned operator and silently declines the gate. Caught on
     # ``min_quad_with_fixed`` driven with a raw ``cotmatrix``.
     i = wp.int32(wp.tid())
-    diagonal, off_sum = csr_row_diagonal(offsets, columns, values, i)
-    out_ratio[i] = dominance_ratio(diagonal, off_sum)
+    _inverse, ratio = jacobi_row(offsets, columns, values, i)
+    out_ratio[i] = ratio
 
 
 @wp.kernel
@@ -276,9 +291,9 @@ def jacobi_dominance_rows(
     # Gershgorin interval of one operator, which ``wps.bsr_get_diag``, a map and a second row walk
     # otherwise took three launches and a buffer to produce.
     i = wp.int32(wp.tid())
-    diagonal, off_sum = csr_row_diagonal(offsets, columns, values, i)
-    out_inverse_diagonal[i] = inverse_or_one(diagonal)
-    out_ratio[i] = dominance_ratio(diagonal, off_sum)
+    inverse, ratio = jacobi_row(offsets, columns, values, i)
+    out_inverse_diagonal[i] = inverse
+    out_ratio[i] = ratio
 
 
 @wp.kernel
@@ -290,10 +305,10 @@ def jacobi_inverse_diagonal(
 ) -> None:
     # The Jacobi inverse diagonal of a scalar CSR operator in one launch, where
     # ``wps.bsr_get_diag`` followed by a ``wp.map`` of ``array.inverse_or_one`` is two and an
-    # intermediate buffer. The row's off-diagonal sum is dead code here and compiles away.
+    # intermediate buffer. The row's ratio is dead code here and compiles away.
     i = wp.int32(wp.tid())
-    diagonal, _off_sum = csr_row_diagonal(offsets, columns, values, i)
-    out_inverse_diagonal[i] = inverse_or_one(diagonal)
+    inverse, _ratio = jacobi_row(offsets, columns, values, i)
+    out_inverse_diagonal[i] = inverse
 
 
 @wp.kernel
@@ -331,10 +346,10 @@ def refresh_pooled_operator(
         if narrow != 0:
             out_narrowed[e] = wp.float32(value)
     if derive != 0:
-        diagonal, off_sum = csr_row_diagonal(offsets, columns, values, i)
-        out_inverse_diagonal[i] = inverse_or_one(diagonal)
+        inverse, ratio = jacobi_row(offsets, columns, values, i)
+        out_inverse_diagonal[i] = inverse
         if derive == 2:
-            out_ratio[i] = dominance_ratio(diagonal, off_sum)
+            out_ratio[i] = ratio
 
 
 @wp.kernel

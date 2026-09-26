@@ -23,7 +23,7 @@ from triwarp.kernels.predicates import (
     triangle_aspect_ratio,
     triangle_double_area,
 )
-from triwarp.kernels.reduce import block_argmin, block_sum
+from triwarp.kernels.reduce import block_argmin, block_barrier
 from triwarp.kernels.triangles import corner_triple
 
 # Big-but-finite penalty for a triangulation the metric rejects: lets the DP keep a bad
@@ -1327,9 +1327,9 @@ def stitch_dp_tile(
                     out_dp[i, j] = best
                     out_came[i, j] = best_came
             di += wp.block_dim()
-        # Block barrier: every lane must see this anti-diagonal's writes before reading them as
-        # the next one's predecessors. The sum itself is discarded.
-        _ = block_sum(wp.float32(t))
+        # Every lane must see this anti-diagonal's writes before reading them as the next one's
+        # predecessors.
+        block_barrier()
 
 
 @wp.kernel
@@ -1360,20 +1360,20 @@ def scatter_fillable_loop_slots(
     loop_starts: wp.array[wp.int32],
     vertex_counts: wp.array[wp.int32],
     out_fillable: wp.array[wp.bool],
-    out_loop_of_vertex: wp.array[wp.int32],
-    out_position_in_loop: wp.array[wp.int32],
+    out_loop_slots: wp.array[wp.vec2i],
 ) -> None:
     # The pinch test, then which loop owns each mesh vertex and where along it, for the chord test
     # below. One occurrence count answers both pinch tests at once: a vertex holding two packed
     # slots is visited twice by one loop (that loop is pinched at it) or once by each of two loops
     # (both are pinched there), and in either case every loop touching it is unfillable -- so
     # "occupies more than one slot" is exactly the union of the two conditions. Such a vertex is
-    # not written into the tables, and every other one is held by exactly one slot, which is what
-    # makes them single-valued with no collision to resolve. A loop the pinch test clears may
-    # still write its other vertices, and the chord test may then clear it again: every write to
-    # ``out_fillable`` is an idempotent ``False``, and a loop still fillable at the end had every
-    # vertex written. The range test repeats ``count_loop_vertices``', which has already cleared
-    # such a loop.
+    # not written into the table, and every other one is held by exactly one slot, which is what
+    # makes it single-valued with no collision to resolve -- and, since a vertex holds a slot
+    # exactly when its count is 1, lets the chord test read the count as the table's validity and
+    # the table start uninitialized. A loop the pinch test clears may still write its other
+    # vertices, and the chord test may then clear it again: every write to ``out_fillable`` is an
+    # idempotent ``False``, and a loop still fillable at the end had every vertex written. The
+    # range test repeats ``count_loop_vertices``', which has already cleared such a loop.
     t = wp.int32(wp.tid())
     v = flat_loops[t]
     if v < 0 or v >= vertex_counts.shape[0]:
@@ -1382,16 +1382,15 @@ def scatter_fillable_loop_slots(
     if vertex_counts[v] > 1:
         out_fillable[ell] = False
         return
-    out_loop_of_vertex[v] = ell
-    out_position_in_loop[v] = t - loop_starts[ell]
+    out_loop_slots[v] = wp.vec2i(ell, t - loop_starts[ell])
 
 
 @wp.func
 def clear_loop_if_chord(
     a: wp.int32,
     b: wp.int32,
-    loop_of_vertex: wp.array[wp.int32],
-    position_in_loop: wp.array[wp.int32],
+    vertex_counts: wp.array[wp.int32],
+    loop_slots: wp.array[wp.vec2i],
     loop_sizes: wp.array[wp.int32],
     out_fillable: wp.array[wp.bool],
 ) -> None:
@@ -1400,11 +1399,17 @@ def clear_loop_if_chord(
     # chord as a fill edge -- and the mesh already has one, which makes the result non-manifold.
     # That is the hazard ``fill_min_weight(resolve_multiple_edges=True)`` works around after the
     # fact; naming it per loop lets a caller decide before filling. Symmetric in ``a`` and ``b``.
-    loop = loop_of_vertex[a]
-    if loop < 0 or loop_of_vertex[b] != loop:
+    # ``loop_slots[v]`` is written exactly where ``vertex_counts[v] == 1``
+    # (``scatter_fillable_loop_slots``), so the count is tested before the table is read.
+    if vertex_counts[a] != 1 or vertex_counts[b] != 1:
+        return
+    slot_a = loop_slots[a]
+    slot_b = loop_slots[b]
+    loop = slot_a[0]
+    if slot_b[0] != loop:
         return
     size = loop_sizes[loop]
-    gap = position_in_loop[a] - position_in_loop[b]
+    gap = slot_a[1] - slot_b[1]
     if gap < 0:
         gap = -gap
     if gap != 1 and gap != size - 1:
@@ -1414,8 +1419,8 @@ def clear_loop_if_chord(
 @wp.kernel
 def clear_loops_with_chords(
     faces: wp.array[wp.int32],
-    loop_of_vertex: wp.array[wp.int32],
-    position_in_loop: wp.array[wp.int32],
+    vertex_counts: wp.array[wp.int32],
+    loop_slots: wp.array[wp.vec2i],
     loop_sizes: wp.array[wp.int32],
     out_fillable: wp.array[wp.bool],
 ) -> None:
@@ -1425,9 +1430,9 @@ def clear_loops_with_chords(
     # needed to deduplicate them.
     f = wp.int32(wp.tid())
     a, b, c = corner_triple(faces, f)
-    clear_loop_if_chord(a, b, loop_of_vertex, position_in_loop, loop_sizes, out_fillable)
-    clear_loop_if_chord(b, c, loop_of_vertex, position_in_loop, loop_sizes, out_fillable)
-    clear_loop_if_chord(c, a, loop_of_vertex, position_in_loop, loop_sizes, out_fillable)
+    clear_loop_if_chord(a, b, vertex_counts, loop_slots, loop_sizes, out_fillable)
+    clear_loop_if_chord(b, c, vertex_counts, loop_slots, loop_sizes, out_fillable)
+    clear_loop_if_chord(c, a, vertex_counts, loop_slots, loop_sizes, out_fillable)
 
 
 @wp.kernel

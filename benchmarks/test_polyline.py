@@ -310,10 +310,11 @@ def test_polyline_normal(bench_case: BenchCase) -> None:
     reduction, while this one accumulated one ``wp.atomic_add`` per thread into a single
     ``wp.vec3`` slot -- every thread in the launch contending for one address, and the reduction
     serialized. Converting it to the lane-strided form
-    (``kernels/polyline.py::accumulate_newell_normal``) is worth one to two orders of magnitude at
-    the point counts this axis reaches, with the answer three orders of magnitude more accurate
-    against a float64 reference. So the representative had the *good*
-    shape and the class member it stood in for did not, which is what a one-row class cannot show.
+    (``kernels/polyline.py::accumulate_radius_frame``, which ``polyline_normal`` launches) is worth
+    one to two orders of magnitude at the point counts this axis reaches, with the answer three
+    orders of magnitude more accurate against a float64 reference. So the representative had the
+    *good* shape and the class member it stood in for did not, which is what a one-row class cannot
+    show.
     ``polyline_centroid`` stays unrepresented: it reaches ``triwarp.reduce`` the way
     ``polyline_length`` does.
 

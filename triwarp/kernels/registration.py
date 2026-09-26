@@ -4,7 +4,7 @@ from triwarp.constants import FLOAT32_INF_CONSTANT
 from triwarp.kernels.array import LOOP_CONDITION, LOOP_ROUND, binary_search_index_left
 from triwarp.kernels.neighbors import mesh_nearest_point
 from triwarp.kernels.predicates import normalize_or_zero
-from triwarp.kernels.proximity import closest_point_query, write_closest_point_query
+from triwarp.kernels.proximity import closest_point_query
 from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, block_chunk_1d, block_sum, commit_block_sum
 from triwarp.kernels.transform import transform_point_mat44
 
@@ -331,16 +331,6 @@ def residual_valid(
 
 
 @wp.func
-def correspondence_normal(source: wp.array[wp.vec3], index: wp.int32) -> wp.vec3:
-    # The target normal a correspondence points at, or the zero vector where there is none.
-    # ``source`` is the face-normal table for a mesh target and the per-vertex one for a cloud,
-    # which is why the two ICP passes below differ only in what they hand it.
-    if index >= 0:
-        return source[index]
-    return wp.vec3(0.0, 0.0, 0.0)
-
-
-@wp.func
 def distance_threshold_weight(
     distance: wp.float32, triangle_id: wp.int32, max_distance: wp.float32
 ) -> wp.float32:
@@ -354,54 +344,57 @@ def distance_threshold_weight(
     )
 
 
-@wp.kernel
-def mesh_correspondence_pass(
+@wp.func
+def icp_match(
     mesh_id: wp.uint64,
+    target_points: wp.array[wp.vec3],
+    cloud: wp.bool,
+    q: wp.vec3,
+    query_max: wp.float32,
+) -> tuple[wp.vec3, wp.float32, wp.int32]:
+    # One moved source point's match on an ICP target: the matched point, its distance and its
+    # index (``-1`` for a miss). ``cloud`` selects the target, warp-uniformly: a point-cloud
+    # target's ``neighbors.mesh_from_points`` answers the nearest vertex (unbounded, so it always
+    # hits), whose position is the match; a mesh target's closest point on the surface within
+    # ``query_max``, whose index is the face. The one target dispatch both ICP loops share.
+    if cloud:
+        index, distance = mesh_nearest_point(mesh_id, target_points, q, FLOAT32_INF_CONSTANT)
+        return target_points[wp.max(index, wp.int32(0))], distance, index
+    return closest_point_query(mesh_id, q, query_max)
+
+
+@wp.kernel
+def point_to_plane_correspondence_pass(
+    mesh_id: wp.uint64,
+    target_points: wp.array[wp.vec3],
     points: wp.array[wp.vec3],
     step: wp.array[wp.mat44],
+    cloud: wp.bool,
     query_max: wp.float32,
-    normal_source: wp.array[wp.vec3],
     out_points: wp.array[wp.vec3],
     out_closest: wp.array[wp.vec3],
     out_distance: wp.array[wp.float32],
-    out_face: wp.array[wp.int32],
-    out_normals: wp.array[wp.vec3],
+    out_index: wp.array[wp.int32],
 ) -> None:
-    # One ICP iteration's whole correspondence step against a mesh target: the previous
-    # iteration's rigid step applied to each source point, the closest-point query at the moved
-    # point, and the target normal it points at.
+    # One ``icp_point_to_plane`` iteration's whole correspondence step: the previous iteration's
+    # rigid step applied to each source point and published, and its match (``icp_match``). The
+    # target normal is not gathered here: the accumulation reads it at ``out_index``, and the index
+    # is all a valid correspondence needs to find it.
+    #
+    # Differs from ``point_to_point_correspondence_pass`` by what it publishes: this loop moves
+    # its points incrementally and reads the distance and index back in the accumulation, where
+    # that one re-derives each point from the source and keeps only the match and a weight.
     #
     # The step is ``apply_transform_mat44``'s own ``transform_point_mat44`` on the same operands,
     # so ``out_points`` holds the bits that kernel wrote when it ran as its own launch at the tail
     # of the previous iteration; the loop now applies the last step once after it exits instead.
-    # The query re-reads ``out_points[tid]``, which this thread has just written, so
-    # ``write_closest_point_query``'s publication protocol stays the one shared definition.
-    #
-    # The distance gate is not reported: the only reader of a per-point valid mask was an "is
-    # anything left?" test, and the accumulation kernel's weight sum -- which it gates on the same
-    # ``residual_valid`` -- already answers that.
-    #
-    # The three ran as three launches at the same width, and the second and third read nothing
-    # but what the first had just written at their own index -- so each paid a launch and a full
-    # round trip through global memory to re-read a face index this pass holds in a register.
-    # Inside a loop that runs up to ``max_iterations`` times, that is the launch count of the
-    # iteration rather than a one-off: measured, it takes a 13-iteration point-to-plane run from
-    # 82 launches to 56, output byte-identical on the CPU device (the CUDA plateau is not
-    # bit-reproducible on its own -- see ``accumulate_point_to_plane``).
-    #
-    # **The wall clock is flat all the same, and that is the honest reading**: this loop reads a
-    # scalar back every iteration for its convergence test, so the host is already waiting on the
-    # device rather than the other way round, and the launches it issues were overlapping with
-    # work. What the fusion buys here is the two ``(n,)`` round trips through global memory and a
-    # third of the launch count -- worth having, and not a speedup to quote. Do not re-measure
-    # this against a run with the convergence break live: the two arms then stop at different
-    # iterations and the ratio is fiction.
     tid = wp.int32(wp.tid())
-    out_points[tid] = transform_point_mat44(points[tid], step[0])
-    _distance, face = write_closest_point_query(
-        mesh_id, out_points, query_max, tid, out_closest, out_distance, out_face
-    )
-    out_normals[tid] = correspondence_normal(normal_source, face)
+    q = transform_point_mat44(points[tid], step[0])
+    out_points[tid] = q
+    closest, distance, index = icp_match(mesh_id, target_points, cloud, q, query_max)
+    out_closest[tid] = closest
+    out_distance[tid] = distance
+    out_index[tid] = index
 
 
 @wp.kernel
@@ -417,30 +410,37 @@ def point_to_point_correspondence_pass(
     out_weights: wp.array[wp.float32],
 ) -> None:
     # ``registration.icp``'s whole correspondence step: the source point moved by the transform the
-    # loop has kept so far, its match on the target, and -- when ``out_weights`` is not zero-length
-    # -- the binary distance gate its Procrustes fit weights by.
-    #
-    # ``cloud`` selects the target, warp-uniformly: a point-cloud target's
-    # ``neighbors.mesh_from_points`` answers the nearest vertex (unbounded, so it always hits),
-    # whose position is the match; a mesh target's closest point on the surface within
-    # ``query_max``. Either way the match, the distance and the index stay in registers, where the
-    # host loop this replaced wrote all three and gathered the cloud's match in a copy of its own.
+    # loop has kept so far, its match on the target (``icp_match``), and -- when ``out_weights`` is
+    # not zero-length -- the binary distance gate its Procrustes fit weights by. The match, the
+    # distance and the index stay in registers.
     #
     # The move is ``transform_point_mat44`` on the operands the host loop's fit applied when it
     # published the points this search then read, so the query sees the same bits.
     tid = wp.int32(wp.tid())
     q = transform_point_mat44(source[tid], total[0])
-    index = wp.int32(-1)
-    distance = wp.float32(0.0)
-    closest = q
-    if cloud:
-        index, distance = mesh_nearest_point(mesh_id, target_points, q, FLOAT32_INF_CONSTANT)
-        closest = target_points[wp.max(index, wp.int32(0))]
-    else:
-        closest, distance, index = closest_point_query(mesh_id, q, query_max)
+    closest, distance, index = icp_match(mesh_id, target_points, cloud, q, query_max)
     out_closest[tid] = closest
     if out_weights.shape[0] > 0:
         out_weights[tid] = distance_threshold_weight(distance, index, max_distance)
+
+
+@wp.func
+def continue_icp_loop(
+    old_cost: wp.float64,
+    cost: wp.float64,
+    threshold: wp.float64,
+    max_iterations: wp.int32,
+    out_state: wp.array[wp.int32],
+) -> None:
+    # Both ICP loops' shared stopping rule, run once a round has kept a fit of cost ``cost``: count
+    # the round, and continue while fewer than ``max_iterations`` have run and the cost fell from
+    # ``old_cost`` by at least ``threshold``. ``old_cost`` is ``inf`` before the first kept fit,
+    # which no finite threshold's test reads as convergence -- the ``float64`` test of two
+    # ``float32`` values the host loops formed from their Python floats.
+    iteration = out_state[LOOP_ROUND] + 1
+    out_state[LOOP_ROUND] = iteration
+    keep_going = not (old_cost - cost < threshold) and iteration < max_iterations
+    out_state[LOOP_CONDITION] = wp.where(keep_going, wp.int32(1), wp.int32(0))
 
 
 @wp.kernel
@@ -468,9 +468,8 @@ def point_to_point_round(
       while fewer than ``max_iterations`` have run and the cost fell by at least ``threshold``.
 
     ``out_cost[0]`` doubles as the previous iteration's cost: seeded ``inf``, it is exactly the
-    host loop's ``old_cost`` whenever the test reads it, and the ``float64`` test of two ``float32``
-    values is the one the host formed from their Python floats. The accumulator is zeroed after it
-    is read, by this one thread, so no memset precedes the next round's fit.
+    host loop's ``old_cost`` whenever ``continue_icp_loop`` reads it. The accumulator is zeroed
+    after it is read, by this one thread, so no memset precedes the next round's fit.
     """
     w_sum = out_acc[ACC_W_SUM]
     cost = out_acc[ACC_COST]
@@ -479,34 +478,10 @@ def point_to_point_round(
     if w_sum == wp.float32(0.0):
         out_state[LOOP_CONDITION] = 0
         return
-    converged = wp.float64(out_cost[0]) - wp.float64(cost) < threshold
+    old_cost = out_cost[0]
     out_total[0] = fitted[0]
     out_cost[0] = cost
-    iteration = out_state[LOOP_ROUND] + 1
-    out_state[LOOP_ROUND] = iteration
-    keep_going = not converged and iteration < max_iterations
-    out_state[LOOP_CONDITION] = wp.where(keep_going, wp.int32(1), wp.int32(0))
-
-
-@wp.kernel
-def cloud_correspondence_pass(
-    target_vertices: wp.array[wp.vec3],
-    normal_source: wp.array[wp.vec3],
-    index: wp.array[wp.int32],
-    out_closest: wp.array[wp.vec3],
-    out_normals: wp.array[wp.vec3],
-) -> None:
-    # The cloud-target tail of ``mesh_correspondence_pass``: the nearest-neighbour search is a
-    # ``neighbors.query_nearest`` call rather than a kernel here, so only what consumes its answer
-    # fuses -- the matched point and its normal, both read at one correspondence's own index. The
-    # point was a Python-scope gather and a ``wp.copy`` of its own before.
-    #
-    # ``index`` is never ``-1`` here (the search has no radius cap and the cloud is non-empty); the
-    # clamp only keeps the read in range should that ever change.
-    tid = wp.int32(wp.tid())
-    i = index[tid]
-    out_closest[tid] = target_vertices[wp.max(i, wp.int32(0))]
-    out_normals[tid] = correspondence_normal(normal_source, i)
+    continue_icp_loop(wp.float64(old_cost), wp.float64(cost), threshold, max_iterations, out_state)
 
 
 @wp.func
@@ -550,12 +525,15 @@ def robust_residual_keys(
     out_keys: wp.array[wp.float32],
 ) -> None:
     # Each correspondence's point-to-plane residual where it is in range, ``+inf`` where it is not.
+    # ``normals`` is the target's normal table, read at the correspondence's index as
+    # ``point_to_plane_tile`` reads it -- behind the range test, which is what keeps a miss's
+    # ``-1`` from indexing it (a ``wp.where`` evaluates both arms).
     i = wp.int32(wp.tid())
-    out_keys[i] = wp.where(
-        residual_valid(triangle_id[i], distance[i], max_distance),
-        point_to_plane_residual(current[i], closest[i], normals[i]),
-        FLOAT32_INF_CONSTANT,
-    )
+    key = wp.float32(FLOAT32_INF_CONSTANT)
+    index = triangle_id[i]
+    if residual_valid(index, distance[i], max_distance):
+        key = point_to_plane_residual(current[i], closest[i], normals[index])
+    out_keys[i] = key
 
 
 @wp.kernel
@@ -648,7 +626,6 @@ def point_to_plane_tile(
     max_distance: wp.float32,
     robust_kind: wp.int32,
     robust_scale: wp.float32,
-    gather: wp.int32,
     offset: wp.int32,
     remaining: wp.int32,
     lane: wp.int32,
@@ -658,13 +635,9 @@ def point_to_plane_tile(
     # caller is the kernel that knows its own launch shape, and passing the stride in keeps this
     # usable from a serial caller too.
     #
-    # ``gather`` selects where a correspondence's target point and normal are read. Unset, they
-    # are ``target[idx]`` / ``normals[idx]``, one per correspondence, which is what a mesh target's
-    # correspondence pass writes. Set, ``target`` and ``normals`` are a cloud target's own vertices
-    # and per-vertex normals and are read at the nearest-neighbour index ``triangle_id[idx]`` --
-    # what ``cloud_correspondence_pass`` would have gathered into the per-correspondence buffers,
-    # read here directly so the gather is not a launch of its own. A valid correspondence has a
-    # non-negative index, so this is that pass's read exactly.
+    # ``target`` is the per-correspondence matched point, and ``normals`` the target's own normal
+    # table -- per face for a mesh, per vertex for a cloud -- read at the correspondence's index,
+    # which a valid correspondence has non-negative.
     count = wp.min(remaining, ITEMS_PER_BLOCK_1D)
     jtj = wp.spatial_matrix(wp.float32(0.0))
     jtr = wp.spatial_vector(
@@ -692,12 +665,9 @@ def point_to_plane_tile(
         # ``wp.normalize`` on that entry is ``0/0``, and one poisoned lane's NaN spreads to the
         # whole block through the ``wp.tile_sum`` commit below. Same guard, same zero tolerance,
         # as ``transform.transform_normal_mat33``'s identical hazard.
-        row = idx
-        if gather != 0:
-            row = triangle_id[idx]
-        nrm = normalize_or_zero(normals[row], wp.float32(0.0))
+        nrm = normalize_or_zero(normals[triangle_id[idx]], wp.float32(0.0))
         x = source[idx]
-        r = point_to_plane_residual(x, target[row], nrm)
+        r = point_to_plane_residual(x, target[idx], nrm)
         w, loss = robust_weight_and_loss(r, robust_scale, robust_kind)
         # Jacobian of the point-to-plane residual: [x x n ; n]
         j = wp.spatial_vector(wp.cross(x, nrm), nrm)
@@ -718,7 +688,6 @@ def accumulate_point_to_plane(
     max_distance: wp.float32,
     robust_kind: wp.int32,
     robust_scale: wp.float32,
-    gather: wp.int32,
     out_jtj: wp.array[wp.spatial_matrix],
     out_jtr: wp.array[wp.spatial_vector],
     out_scalars: wp.array[wp.float32],
@@ -743,7 +712,6 @@ def accumulate_point_to_plane(
     if remaining <= 0:
         return
 
-    # ``gather``: see ``point_to_plane_tile``.
     tile_jtj, tile_jtr, tile_cost, tile_weight_sum = point_to_plane_tile(
         source,
         target,
@@ -753,7 +721,6 @@ def accumulate_point_to_plane(
         max_distance,
         robust_kind,
         robust_scale,
-        gather,
         offset,
         remaining,
         lane,
@@ -870,9 +837,8 @@ def point_to_plane_round(
     - otherwise the damped system is solved, ``out_step`` written, ``out_total`` composed in place
       (``step * total``, the product and order the host ping-pong formed) and the accumulators
       zeroed for the next iteration -- after they are read, by this one thread, so no memset;
-    - the loop continues while fewer than ``max_iterations`` have run and, past the first, the
-      cost fell by at least ``threshold``. The test is the host's ``old_cost - cost < threshold``
-      in ``float64``, where the host held both costs as Python floats of the ``float32`` values.
+    - the loop continues by ``continue_icp_loop``, the point-to-point loop's own rule, against
+      ``out_old_cost``: seeded ``inf``, so the first round never reads as converged.
 
     Every ``out_`` argument but ``out_step`` is loop state, read *and* rewritten every round; they
     wear the prefix as ``kernels/array.loop_advance``'s ``out_state`` does.
@@ -921,9 +887,6 @@ def point_to_plane_round(
     for slot in range(ICP_SCALAR_ACC_SIZE):
         out_scalars[slot] = wp.float32(0.0)
 
-    iteration = out_state[LOOP_ROUND]
-    converged = iteration > 0 and out_old_cost[0] - cost < threshold
+    old_cost = out_old_cost[0]
     out_old_cost[0] = cost
-    out_state[LOOP_ROUND] = iteration + 1
-    keep_going = not converged and iteration + 1 < max_iterations
-    out_state[LOOP_CONDITION] = wp.where(keep_going, wp.int32(1), wp.int32(0))
+    continue_icp_loop(old_cost, cost, threshold, max_iterations, out_state)

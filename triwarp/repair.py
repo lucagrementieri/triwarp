@@ -299,12 +299,13 @@ def remove_unreferenced_vertices(
     n_vertices = int(vertices.shape[0])
 
     # The referenced flags are marked as ``int32`` and scanned in place, and one pass reads the scan
-    # to write all three maps: the tail of the scan is the referenced count, which sizes the
-    # outputs and is the one readback.
+    # to write all three maps and the remapped faces: the tail of the scan is the referenced count,
+    # which sizes the outputs and is the one readback.
     remap = wp.empty(n_vertices, dtype=wp.int32, device=device)
     if n_vertices == 0:
         new_vertices = wp.empty(0, dtype=wp.vec3, device=device)
         inverse = wp.empty(0, dtype=wp.int32, device=device)
+        new_faces = tw.array.remap_indices(faces, remap)
     else:
         inclusive = wp.zeros(n_vertices, dtype=wp.int32, device=device)
         n_indices = int(faces.shape[0])
@@ -319,13 +320,13 @@ def remove_unreferenced_vertices(
         n_referenced = int(read_scalar(inclusive))
         new_vertices = wp.empty(n_referenced, dtype=wp.vec3, device=device)
         inverse = wp.empty(n_referenced, dtype=wp.int32, device=device)
+        new_faces = wp.empty(n_indices, dtype=wp.int32, device=device)
         wp.launch(
             kernel_repair.compact_referenced,
-            dim=n_vertices,
-            inputs=[vertices, inclusive, remap, new_vertices, inverse],
+            dim=max(n_vertices, n_indices),
+            inputs=[vertices, faces, inclusive, remap, new_vertices, inverse, new_faces],
             device=device,
         )
-    new_faces = tw.array.remap_indices(faces, remap)
 
     if return_inverse:
         return new_vertices, new_faces, remap, inverse
@@ -1401,16 +1402,18 @@ def remove_degree3_vertices(
         tw.halfedge.halfedge_twins(faces, n_vertices, validate=True)
     # Scratch hoisted to the pass-0 size and sliced, rather than reallocated per pass: the vertex
     # count is constant across the loop (compaction is deferred to the end, below) and the face
-    # count only ever shrinks, so one allocation each serves every pass. ``tables`` holds each
+    # count only ever shrinks, so one allocation each serves every pass. ``state`` holds each
     # vertex's corner count, link sum and decrement tally (``degree3_fan_tables`` and
-    # ``emit_degree3_replacement`` say what each means) and is zeroed per pass in one fill;
-    # ``counters`` holds the emit cursor -- the selection size -- in slot 0 and the next-pass
-    # candidate count in slot 1, read back together.
-    tables = wp.zeros((3, n_vertices), dtype=wp.int32, device=device)
-    counts, link_sums, lost = tables[0], tables[1], tables[2]
-    fans = twt.empty_2d((n_vertices, 3), wp.int32, device=device)
-    counters = wp.zeros(2, dtype=wp.int32, device=device)
+    # ``emit_degree3_replacement`` say what each means), then the emit cursor -- the selection
+    # size -- and the next-pass candidate count, the two read back together; one fill zeroes all
+    # of it per pass.
+    state = wp.zeros(3 * n_vertices + 2, dtype=wp.int32, device=device)
+    counts = state[:n_vertices]
+    link_sums = state[n_vertices : 2 * n_vertices]
+    lost = state[2 * n_vertices : 3 * n_vertices]
+    counters = twt.as_dense(state[3 * n_vertices :])
     cursor, next_candidates = counters[0:1], counters[1:2]
+    fans = twt.empty_2d((n_vertices, 3), wp.int32, device=device)
     new_faces = twt.empty_2d((max(n_faces0 // 3, 1), 3), wp.int32, device=device)
     # The kept-face flags, scanned in place into their inclusive ranks.
     keep_ranks = wp.empty(n_faces0, dtype=wp.int32, device=device)
@@ -1419,18 +1422,16 @@ def remove_degree3_vertices(
         if n_faces == 0:
             break
         if pass_index > 0:
-            tables.zero_()
-            counters.zero_()
+            state.zero_()
+        # Every face starts kept (the table pass sets the flags) and the emit pass clears the fans
+        # it replaces, so the kept flags come straight out of those two passes.
+        ranks = keep_ranks[:n_faces]
         wp.launch(
             kernel_repair.degree3_fan_tables,
             dim=3 * n_faces,
-            inputs=[faces, counts, link_sums, fans],
+            inputs=[faces, counts, link_sums, fans, ranks],
             device=device,
         )
-        # Every face starts kept and the emit pass clears the fans it replaces, so the kept flags
-        # come straight out of that pass.
-        ranks = keep_ranks[:n_faces]
-        ranks.fill_(1)
         wp.launch(
             kernel_repair.emit_degree3_replacement,
             dim=n_vertices,

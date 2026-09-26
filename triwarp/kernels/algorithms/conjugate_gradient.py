@@ -34,9 +34,9 @@ from typing import Any
 import warp as wp
 
 from triwarp.kernels.algorithms.multigrid import chebyshev_update, csr_row_dot
-from triwarp.kernels.array import LOOP_CONDITION, LOOP_ROUND, OverloadTable, inverse_or_one
-from triwarp.kernels.linalg import csr_row_diagonal
-from triwarp.kernels.reduce import block_chunk_1d, block_max, block_sum
+from triwarp.kernels.array import LOOP_CONDITION, LOOP_ROUND, OverloadTable
+from triwarp.kernels.linalg import jacobi_row
+from triwarp.kernels.reduce import block_barrier, block_chunk_1d, block_max, block_sum
 
 # Lanes per block for both stages of the conjugate-gradient dot product. The partial stage gets one
 # block per ``CG_TILE`` entries *of each column*, which is what makes its grid grow with the system
@@ -76,29 +76,20 @@ def cg_layout(n: int, fold_max_blocks: int) -> tuple[int, int, bool]:
     return span, (n + span - 1) // span, False
 
 
-@wp.func
-def sum_block_partials(row: wp.array[wp.float64], n_blocks: wp.int32, t: wp.int32) -> wp.float64:
-    # The block-wide sum of one row of first-stage partials -- ``cg_seed``'s fold of ``||b||^2``,
-    # ``cg_fold_column``'s shape for one quantity: the lanes stride the ``n_blocks`` live entries
-    # by ``wp.block_dim()`` (section 2.2) and ``block_sum`` folds them. Block-collective.
-    acc = wp.float64(0.0)
-    for k in range(t, n_blocks, wp.block_dim()):
-        acc += row[k]
-    return block_sum(acc)
-
-
 @wp.kernel
 def cg_initial(
     n: wp.int32,
     stride: wp.int32,
     span: wp.int32,
     jacobi: wp.int32,
+    copy_x: wp.int32,
     offsets: wp.array[wp.int32],
     columns: wp.array[wp.int32],
     values: wp.array[wp.Float],
     rhs: wp.array[wp.Float],
     x: wp.array[wp.Float],
     inv_diag: wp.array[wp.Float],
+    out_x: wp.array[wp.Float],
     out_r: wp.array[wp.Float],
     out_u: wp.array[wp.Float],
     out_p: wp.array[wp.Float],
@@ -113,8 +104,11 @@ def cg_initial(
     # writes ``u``; another preconditioner writes ``u`` in its own launches after this one --
     # ``p = s = 0``, and the first
     # stage of ``||b||^2`` into ``out_partials[0]``, which ``cg_seed`` folds into the tolerance. The
-    # pad rows are written as zeros, which is what every reduction over them assumes. The lanes
-    # stride by ``wp.block_dim()`` for the CPU device (section 2.2).
+    # pad rows are written as zeros, which is what every reduction over them assumes. With
+    # ``copy_x`` set the initial guess is read from the caller's ``x`` and copied into the solver's
+    # own ``out_x`` (pitch ``n``) by the same pass, which a kept state's replayed graph then updates
+    # -- the copy a separate ``wp.copy`` would otherwise make; unset, ``out_x`` is never touched and
+    # may be ``None``. The lanes stride by ``wp.block_dim()`` for the CPU device (section 2.2).
     #
     # Generic over the vectors' storage precision (see ``cg_update``); the residual is formed and
     # the norm accumulated in ``float64``.
@@ -128,6 +122,8 @@ def cg_initial(
         u = wp.float64(0.0)
         if local < n:
             b = wp.float64(rhs[c * n + local])
+            if copy_x != 0:
+                out_x[c * n + local] = x[c * n + local]
             r = b - wp.float64(csr_row_dot(local, c * n, offsets, columns, values, x))
             if jacobi != 0:
                 u = wp.float64(inv_diag[local]) * r
@@ -162,8 +158,14 @@ def cg_seed(
     # ``alpha = 1``, in the ``*_new`` slots the first ``cg_matvec_dots`` carries from; and the
     # round-loop state at ``[0, 1]`` with a zero count. A zero condition would run no rounds at
     # all, since ``wp.capture_while`` reads it first.
+    #
+    # The fold is ``cg_fold_column``'s for one quantity: the lanes stride the ``n_blocks`` live
+    # partials by ``wp.block_dim()`` (section 2.2) and ``block_sum`` folds them.
     c, t = wp.tid()
-    b_norm_sq = sum_block_partials(partials[0, c], n_blocks, t)
+    acc = wp.float64(0.0)
+    for k in range(t, n_blocks, wp.block_dim()):
+        acc += partials[0, c, k]
+    b_norm_sq = block_sum(acc)
     if t == 0:
         out_atol_sq[c] = cg_threshold(tol_sq, atol_sq, b_norm_sq)
         out_gamma_new[c] = wp.float64(wp.inf)
@@ -659,13 +661,6 @@ ONE_BLOCK_NARROW_SLOTS = 5
 
 
 @wp.func
-def block_barrier() -> None:
-    # A full block barrier: a block-wide reduction synchronizes before and after (``reduce``), and
-    # Warp spells no bare ``__syncthreads``. The sum itself is discarded.
-    _ = block_sum(wp.float64(0.0))
-
-
-@wp.func
 def one_block_chebyshev(
     n: wp.int32,
     column_base: wp.int32,
@@ -851,8 +846,7 @@ def cg_one_block(
         scratch[p_base + row] = zero
         scratch[s_base + row] = zero
         if polynomial == 0:
-            diagonal, _off_sum = csr_row_diagonal(offsets, columns, values, row)
-            inverse = inverse_or_one(diagonal)
+            inverse, _ratio = jacobi_row(offsets, columns, values, row)
             scratch[inv_base + row] = inverse
             scratch[u_base + row] = inverse * residual
         else:
@@ -1034,9 +1028,9 @@ def _register_overloads() -> None:
     CG_INITIAL = OverloadTable(
         cg_initial,
         {
-            (d, v): [wp.int32] * 4
+            (d, v): [wp.int32] * 5
             + [wp.array[wp.int32], wp.array[wp.int32], wp.array[v]]
-            + [wp.array[d]] * 7
+            + [wp.array[d]] * 8
             + [wp.array3d[f64]]
             for d, v in _CG_STORAGE
         },

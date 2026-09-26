@@ -166,9 +166,11 @@ def mesh_with_plane_segments(
     vertex_dots: wp.array[wp.float32],
     plane_normal: wp.vec3,
     plane_origin: wp.vec3,
-    out_valid: wp.array[wp.bool],
+    out_cut: wp.array[wp.int32],
     out_segments: wp.array2d[wp.vec3],
 ) -> None:
+    # ``out_cut`` is a ``0`` / ``1`` flag, the ``int32`` that ``compact_cut_segments``' caller scans
+    # in place, so no mask has to be converted before the scan.
     f = wp.int32(wp.tid())
     i0 = faces[f * 3]
     i1 = faces[f * 3 + 1]
@@ -182,7 +184,7 @@ def mesh_with_plane_segments(
     valid, p0, p1 = mesh_with_plane_segment_for_face(
         plane_normal, plane_origin, v0, v1, v2, s0, s1, s2
     )
-    out_valid[f] = valid
+    out_cut[f] = wp.where(valid, 1, 0)
     out_segments[f, 0] = p0
     out_segments[f, 1] = p1
 
@@ -443,9 +445,10 @@ def triangle_pair_segments(
     target_faces: wp.array[wp.int32],
     pairs: wp.array2d[wp.int32],
     out_segments: wp.array2d[wp.vec3],
-    out_valid: wp.array[wp.bool],
+    out_cut: wp.array[wp.int32],
 ) -> None:
-    # The segment *and* whether it is a real one, in a pass that already knows both.
+    # The segment *and* whether it is a real one, in a pass that already knows both, as the ``0`` /
+    # ``1`` flag ``compact_cut_segments``' caller scans.
     #
     # These were two launches, and the second read ``out_segments`` back to measure it. That was
     # a latent hazard as well as a cost: this kernel writes the row only when the narrow phase
@@ -465,7 +468,7 @@ def triangle_pair_segments(
     if valid:
         out_segments[tid, 0] = p0
         out_segments[tid, 1] = p1
-    out_valid[tid] = valid and wp.length(p1 - p0) > TOLERANCE_MERGE_CONSTANT
+    out_cut[tid] = wp.where(valid and wp.length(p1 - p0) > TOLERANCE_MERGE_CONSTANT, 1, 0)
 
 
 @wp.func
@@ -1068,7 +1071,7 @@ def marching_triangles_segments(
     values: wp.array[wp.Float],
     isovalue: wp.Float,
     key_base: wp.int64,
-    out_valid: wp.array[wp.bool],
+    out_cut: wp.array[wp.int32],
     out_segments: wp.array2d[wp.vec3],
     out_edges: wp.array2d[wp.int64],
 ) -> None:
@@ -1089,7 +1092,7 @@ def marching_triangles_segments(
     # returned curve with no filter anywhere downstream (unlike ``mesh_with_mesh``, whose
     # ``triangle_pair_segments`` rejects a degenerate segment as it writes it).
     if wp.isnan(d0) or wp.isnan(d1) or wp.isnan(d2):
-        out_valid[f] = False
+        out_cut[f] = 0
         return
 
     p0 = d0 >= values.dtype(0.0)
@@ -1097,7 +1100,7 @@ def marching_triangles_segments(
     p2 = d2 >= values.dtype(0.0)
 
     if p0 == p1 and p1 == p2:
-        out_valid[f] = False
+        out_cut[f] = 0
         return
 
     # Local index of the vertex whose sign differs from the other two.
@@ -1141,7 +1144,7 @@ def marching_triangles_segments(
     # Orient the segment so the region where the field exceeds the isovalue lies to its left, with
     # the face normal as up. That makes the crossing shared by two faces an outgoing endpoint of one
     # and an incoming endpoint of the other, which is what lets the curves be linked at all.
-    out_valid[f] = True
+    out_cut[f] = 1
     lone_is_positive = p0
     if lone == wp.int32(1):
         lone_is_positive = p1
@@ -1158,6 +1161,33 @@ def marching_triangles_segments(
         out_segments[f, 1] = point_next
         out_edges[f, 0] = edge_prev
         out_edges[f, 1] = edge_next
+
+
+@wp.kernel
+def compact_cut_segments(
+    inclusive: wp.array[wp.int32],
+    segments: wp.array2d[wp.vec3],
+    edges: wp.array2d[wp.int64],
+    out_segments: wp.array2d[wp.vec3],
+    out_edges: wp.array2d[wp.int64],
+    out_rows: wp.array[wp.int32],
+) -> None:
+    # The cut rows of the three segment producers above, in row order, from the in-place inclusive
+    # scan of their ``0`` / ``1`` flags: ``flatnonzero`` and one gather per buffer in one pass.
+    # ``edges`` / ``out_edges`` (``marching_triangles_segments``' crossing keys) and ``out_rows``
+    # (the source row of each kept segment) are optional -- a caller that has no use for one passes
+    # ``None``, whose shape reads 0.
+    i = wp.int32(wp.tid())
+    slot, cut = kernel_array.scanned_count(inclusive, i)
+    if cut == 0:
+        return
+    out_segments[slot, 0] = segments[i, 0]
+    out_segments[slot, 1] = segments[i, 1]
+    if out_edges.shape[0] > 0:
+        out_edges[slot, 0] = edges[i, 0]
+        out_edges[slot, 1] = edges[i, 1]
+    if out_rows.shape[0] > 0:
+        out_rows[slot] = i
 
 
 # Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
@@ -1183,7 +1213,7 @@ def _register_overloads() -> None:
                 wp.array[d],
                 d,
                 wp.int64,
-                wp.array[wp.bool],
+                wp.array[wp.int32],
                 wp.array2d[wp.vec3],
                 wp.array2d[wp.int64],
             ]

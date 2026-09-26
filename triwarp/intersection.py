@@ -23,13 +23,14 @@ its result splats straight into any of them.
 from __future__ import annotations
 
 import math
+from typing import Literal
 
 import numpy as np
 import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import require_nonempty_mesh, require_same_device
+from triwarp._device import read_scalar, require_nonempty_mesh, require_same_device
 from triwarp.constants import TOLERANCE_MERGE
 from triwarp.kernels import intersection as kernel_intersections
 from triwarp.kernels import predicates as kernel_predicates
@@ -153,28 +154,19 @@ def mesh_with_plane(
 
     vertex_dots = _plane_dots(vertices, plane_normal, plane_origin)
 
-    valid = wp.empty(n_faces, dtype=wp.bool, device=device)
+    cut = wp.empty(n_faces, dtype=wp.int32, device=device)
     segments = twt.empty_2d((n_faces, 2), wp.vec3, device=device)
     wp.launch(
         kernel_intersections.mesh_with_plane_segments,
         dim=n_faces,
-        inputs=[vertices, faces, vertex_dots, plane_normal, plane_origin, valid, segments],
+        inputs=[vertices, faces, vertex_dots, plane_normal, plane_origin, cut, segments],
         device=device,
     )
 
-    hit_faces = tw.array.flatnonzero(valid)
-    n_hit = int(hit_faces.shape[0])
-    if n_hit == 0:
-        empty_segments = twt.empty_2d((0, 2), wp.vec3, device=device)
-        if return_faces:
-            return empty_segments, wp.empty(0, dtype=wp.int32, device=device)
-        return empty_segments
-
-    lines = twt.as_array2d(tw.array.gather(segments, hit_faces), wp.vec3)
+    lines, _, hit_faces = _compact_cut_segments(cut, segments, return_rows=return_faces)
     if not return_faces:
         return lines
-    # ``hit_faces`` is already a fresh dense buffer out of ``flatnonzero``; nothing else holds it,
-    # so it is returned directly rather than copied.
+    assert hit_faces is not None
     return lines, hit_faces
 
 
@@ -258,7 +250,7 @@ def marching_triangles(
     # The key base only has to exceed every vertex index the faces reference; ``vertices`` is the
     # buffer they index, so its length is the bound whenever the caller did not give one.
     key_base = int(n_vertices) if n_vertices is not None else int(vertices.shape[0])
-    valid = wp.empty(n_faces, dtype=wp.bool, device=device)
+    cut = wp.empty(n_faces, dtype=wp.int32, device=device)
     segments = twt.empty_2d((n_faces, 2), wp.vec3, device=device)
     segment_edges = twt.empty_2d((n_faces, 2), wp.int64, device=device)
     wp.launch(
@@ -270,20 +262,18 @@ def marching_triangles(
             values,
             values.dtype(isovalue),
             wp.int64(key_base),
-            valid,
+            cut,
             segments,
             segment_edges,
         ],
         device=device,
     )
 
-    cut_faces = tw.array.flatnonzero(valid)
-    n_segments = int(cut_faces.shape[0])
+    hit_segments, hit_edges, _ = _compact_cut_segments(cut, segments, segment_edges)
+    n_segments = int(hit_segments.shape[0])
     if n_segments == 0:
         return [], []
-
-    hit_segments = tw.array.gather(segments, cut_faces)
-    hit_edges = twt.as_array2d(tw.array.gather(segment_edges, cut_faces), wp.int64)
+    assert hit_edges is not None
 
     slots_np, starts_np, closed = _link_segments(hit_edges.numpy())
 
@@ -463,7 +453,7 @@ def mesh_with_mesh(
     n_hit = int(hit_pairs.shape[0])
 
     segments = twt.empty_2d((n_hit, 2), wp.vec3, device=device)
-    seg_valid = wp.empty(n_hit, dtype=wp.bool, device=device)
+    seg_cut = wp.empty(n_hit, dtype=wp.int32, device=device)
     # One launch: the degeneracy test rides in the kernel that computes the segment, which both
     # removes a pass over the segment buffer and keeps the test off the rows that pass never
     # wrote -- see the kernel.
@@ -477,17 +467,11 @@ def mesh_with_mesh(
             target_faces,
             hit_pairs,
             segments,
-            seg_valid,
+            seg_cut,
         ],
         device=device,
     )
-
-    keep = tw.array.flatnonzero(seg_valid)
-    n_keep = int(keep.shape[0])
-    if n_keep == 0:
-        return twt.empty_2d((0, 2), wp.vec3, device=device)
-
-    return twt.as_array2d(tw.array.gather(segments, keep), wp.vec3)
+    return _compact_cut_segments(seg_cut, segments)[0]
 
 
 def _colliding_face_pairs(
@@ -1512,3 +1496,35 @@ def _slice_class_partition(
     starts = [sum(class_counts[:block_index]) for block_index in range(n_classes)]
     blocks = [block(start, count) for start, count in zip(starts, class_counts, strict=True)]
     return blocks, class_counts, indices
+
+
+def _compact_cut_segments(
+    cut: wp.array[wp.int32],
+    segments: twt.Array2dVec3,
+    edges: wp.array[wp.int64, Literal[2]] | None = None,
+    *,
+    return_rows: bool = False,
+) -> tuple[twt.Array2dVec3, wp.array[wp.int64, Literal[2]] | None, wp.array[wp.int32] | None]:
+    """
+    Keep the rows of ``segments`` (and ``edges``) whose ``0`` / ``1`` ``cut`` flag is set, in order.
+
+    ``cut`` is scanned in place, and its tail -- the kept count, the one readback -- sizes the
+    outputs, which one ``compact_cut_segments`` launch fills; with ``return_rows`` it also writes
+    the source row of each kept segment. Returns ``(segments, edges, rows)``, the last two ``None``
+    when not asked for.
+    """
+    device = cut.device
+    n = int(cut.shape[0])
+    wp.utils.array_scan(cut, out_array=cut, inclusive=True)
+    n_kept = int(read_scalar(cut)) if n > 0 else 0
+    out_segments = twt.empty_2d((n_kept, 2), wp.vec3, device=device)
+    out_edges = twt.empty_2d((n_kept, 2), wp.int64, device=device) if edges is not None else None
+    out_rows = wp.empty(n_kept, dtype=wp.int32, device=device) if return_rows else None
+    if n_kept > 0:
+        wp.launch(
+            kernel_intersections.compact_cut_segments,
+            dim=n,
+            inputs=[cut, segments, edges, out_segments, out_edges, out_rows],
+            device=device,
+        )
+    return out_segments, out_edges, out_rows

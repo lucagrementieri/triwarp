@@ -17,7 +17,6 @@ from triwarp._device import (
 )
 from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
-from triwarp.kernels import neighbors as kernel_neighbors
 from triwarp.kernels import reduce as kernel_reduce
 from triwarp.kernels import registration as kernel_registration
 from triwarp.kernels import transform as kernel_transform
@@ -359,7 +358,9 @@ def icp(
     # answer of a call that runs no iteration.
     total = _resolve_initial(initial, device)
     transformed = wp.empty(n, dtype=wp.vec3, device=device)
-    _apply_transform(a, total, transformed)
+    seeded = max_iterations <= 0 or _is_mesh_target(target_faces)
+    if seeded:
+        _apply_transform(a, total, transformed)
     if max_iterations <= 0:
         return total, transformed, math.inf
     mesh, query_max, target_index = _resolve_icp_target(
@@ -445,6 +446,8 @@ def icp(
         replay = record_device_loop(device, state[kernel_array.LOOP_CONDITION_VIEW], iterate)
         if max_distance is not None and int(read_scalar(state, int(kernel_array.LOOP_ROUND))) == 0:
             # Weightless at the seed: ``total`` is the seed, and ``transformed`` its image.
+            if not seeded:
+                _apply_transform(a, total, transformed)
             return total, transformed, math.inf
         replay()
     _apply_transform(a, total, transformed)
@@ -594,7 +597,7 @@ def icp_point_to_plane(
         and target_normals is not None
         and int(target_normals.shape[0]) != int(target_vertices.shape[0])
     ):
-        # ``target_normals`` feeds ``cloud_correspondence_pass`` below, indexed by a nearest-vertex
+        # ``target_normals`` feeds ``accumulate_point_to_plane`` below, indexed by a nearest-vertex
         # id that ranges over ``target_vertices``; a shorter buffer is an out-of-bounds read on
         # both devices (CLAUDE.md §12.1), not merely a wrong answer.
         raise ValueError(
@@ -605,7 +608,12 @@ def icp_point_to_plane(
     if n == 0 or int(target_vertices.shape[0]) == 0:
         return _identity_mat44(device), wp.clone(a), math.inf
 
-    initial_matrix, current = _seed_transform(a, initial, device)
+    # ``current`` is the moving source. Every search writes it, the first from ``a`` and the seed,
+    # so only a mesh target, whose query radius is sized from it, needs the seed image first.
+    initial_matrix = _resolve_initial(initial, device)
+    current = wp.empty(n, dtype=wp.vec3, device=device)
+    if is_mesh:
+        _apply_transform(a, initial_matrix, current)
 
     mesh, query_max, target_index = _resolve_icp_target(
         target_vertices, target_faces, current, max_distance, "icp_point_to_plane"
@@ -620,87 +628,51 @@ def icp_point_to_plane(
 
     # All buffers are allocated once and the loop rewrites them in place: the step is applied to
     # ``current`` by the next correspondence search, the solve composes into ``total`` and zeroes
-    # the accumulators it has just read. ``total`` is ``_seed_transform``'s own copy, so composing
+    # the accumulators it has just read. ``total`` is ``_resolve_initial``'s own copy, so composing
     # into it never touches a caller's array.
     closest = wp.empty(n, dtype=wp.vec3, device=device)
-    normals = wp.empty(n, dtype=wp.vec3, device=device)
-    # The correspondence buffers, written in full every iteration. A mesh target's query writes
-    # them itself; a cloud target's nearest-vertex search writes the ``(n, 1)`` rows the k-NN
-    # kernel takes, read here through rank-1 views taken once.
-    if mesh is not None:
-        distance = twt.empty_1d(n, wp.float32, device=device)
-        triangle_id = twt.empty_1d(n, wp.int32, device=device)
-        nearest_rows = None
-    else:
-        nearest_rows = (
-            twt.empty_2d((n, 1), wp.int32, device=device),
-            twt.empty_2d((n, 1), wp.float32, device=device),
-        )
-        triangle_id = cast(twt.Array1dInt32, nearest_rows[0].reshape(-1))
-        distance = cast(twt.Array1dFloat32, nearest_rows[1].reshape(-1))
+    distance = wp.empty(n, dtype=wp.float32, device=device)
+    triangle_id = wp.empty(n, dtype=wp.int32, device=device)
     jtj = wp.zeros(1, dtype=wp.spatial_matrix, device=device)
     jtr = wp.zeros(1, dtype=wp.spatial_vector, device=device)
     scalar_acc = wp.zeros(kernel_registration.ICP_SCALAR_ACC_SIZE, dtype=wp.float32, device=device)
     step = wp.empty(1, dtype=wp.mat44, device=device)
     total = initial_matrix
-    # The loop's state: the shared round and condition slots. ``old_cost`` is written by the first
-    # round before any round reads it.
+    # The loop's state: the shared round and condition slots, and the previous kept cost, seeded
+    # ``inf`` so the first round never reads as converged.
     state = wp.zeros(kernel_array.LOOP_STATE_SIZE, dtype=wp.int32, device=device)
-    old_cost = wp.empty(1, dtype=wp.float64, device=device)
+    old_cost = wp.full(1, math.inf, dtype=wp.float64, device=device)
 
-    # The correspondence step is one launch, not three: the closest-point query, the target-normal
-    # gather and the distance gate all read one source point's own correspondence, so the second
-    # and third used to pay a launch and a round trip through global memory to re-read a face
-    # index the first had in a register. See ``kernel_registration.mesh_correspondence_pass``.
-    # Every search but the first also applies the previous iteration's step, in place -- each
-    # thread reads and writes only its own point -- so an iteration is three launches: search,
-    # accumulate, and the ``dim=1`` round. The first search re-derives the seed from ``a`` (a mesh
-    # target, bit for bit what ``current`` already holds) or searches ``current`` unmoved (a cloud).
+    # The correspondence step is one launch: the step applied to each point, and its match on the
+    # target -- the closest point on a mesh, or the nearest vertex of a cloud through the hoisted
+    # collapsed-triangle mesh (``kernel_registration.icp_match``). The target normal is read by
+    # the accumulation at the match's index, from the face normals of a mesh or the per-vertex
+    # normals of a cloud, so an iteration is three launches: search, accumulate, and the ``dim=1``
+    # round. The first search moves ``a`` by the seed, bit for bit what ``_apply_transform``
+    # writes.
     #
     # Measure this kind of change with ``threshold=-inf``, or the reading is fiction: with the
     # convergence break live the two arms stop at *different* iterations. The plateau is also not
     # bit-reproducible on CUDA -- the point-to-plane normal equations are accumulated with
     # ``float32`` atomics, so two runs of the identical build disagree in the last digits once the
     # cost stops moving.
-    #
-    # One gather either way: for a mesh target the correspondence indexes the face normals, for a
-    # cloud it indexes the target's own per-vertex normals.
-    normal_source = face_normals if mesh is not None else target_normals
-    assert normal_source is not None
-    # What the accumulation reads a correspondence's target and normal from: the per-correspondence
-    # buffers a mesh target's pass writes, or -- for a cloud -- the target's own vertices and
-    # normals at the nearest-neighbour index, which saves the cloud a gather launch per iteration.
-    gather = 0 if mesh is not None else 1
-    accumulate_target = closest if mesh is not None else target_vertices
-    accumulate_normals = normals if mesh is not None else normal_source
+    normal_table = face_normals if mesh is not None else target_normals
+    assert normal_table is not None
+    search_mesh = mesh if mesh is not None else target_index
+    assert search_mesh is not None
+    search_target = [search_mesh.id, target_vertices]
+    search_options = [mesh is None, wp.float32(query_max)]
+    search_outputs = [current, closest, distance, triangle_id]
 
     def search(stepped: bool) -> None:
-        if mesh is not None:
-            source, source_step = (current, step) if stepped else (a, total)
-            wp.launch(
-                kernel_registration.mesh_correspondence_pass,
-                dim=n,
-                inputs=[
-                    mesh.id,
-                    source,
-                    source_step,
-                    wp.float32(query_max),
-                    normal_source,
-                    current,
-                    closest,
-                    distance,
-                    triangle_id,
-                    normals,
-                ],
-                device=device,
-            )
-            return
-        assert target_index is not None
-        assert nearest_rows is not None
-        if stepped:
-            _nearest_into(target_vertices, current, target_index, nearest_rows, step, current)
-        else:
-            _nearest_into(target_vertices, current, target_index, nearest_rows)
+        source, source_step = (current, step) if stepped else (a, total)
+        wp.launch(
+            kernel_registration.point_to_plane_correspondence_pass,
+            dim=n,
+            inputs=[*search_target, source, source_step, *search_options],
+            outputs=search_outputs,
+            device=device,
+        )
 
     def accumulate() -> None:
         wp.launch_tiled(
@@ -708,14 +680,13 @@ def icp_point_to_plane(
             dim=kernel_reduce.blocks_1d(n),
             inputs=[
                 current,
-                accumulate_target,
-                accumulate_normals,
+                closest,
+                normal_table,
                 distance,
                 triangle_id,
                 wp.float32(max_d),
                 wp.int32(kind),
                 wp.float32(scale_value if scale_value is not None else 0.0),
-                wp.int32(gather),
                 jtj,
                 jtr,
                 scalar_acc,
@@ -725,21 +696,12 @@ def icp_point_to_plane(
         )
 
     def resolve_scale() -> None:
-        # The robust scale's residual pass is the only reader of a cloud's gathered
-        # correspondences; the accumulation gathers its own (``accumulate_point_to_plane``'s
-        # ``gather``). It reads the residuals back, so it runs before any recorded round.
+        # It reads the residuals back, so it runs before any recorded round.
         nonlocal scale_value
         if kind == 0 or scale_value is not None:
             return
-        if mesh is None:
-            wp.launch(
-                kernel_registration.cloud_correspondence_pass,
-                dim=n,
-                inputs=[target_vertices, normal_source, triangle_id, closest, normals],
-                device=device,
-            )
         scale_value = _robust_scale_from_residuals(
-            current, closest, normals, distance, triangle_id, max_d, kind
+            current, closest, normal_table, distance, triangle_id, max_d, kind
         )
 
     round_inputs = [wp.float32(damping), wp.float64(threshold), wp.int32(max_iterations)]
@@ -814,51 +776,6 @@ def icp_point_to_plane(
     return total, current, float(scalars[kernel_registration.ICP_COST])
 
 
-def _nearest_into(
-    target_vertices: wp.array[wp.vec3],
-    queries: wp.array[wp.vec3],
-    target_index: wp.Mesh,
-    out_rows: tuple[twt.Array2dInt32, twt.Array2dFloat32],
-    step: wp.array[wp.mat44] | None = None,
-    out_moved: wp.array[wp.vec3] | None = None,
-) -> None:
-    """
-    Nearest target vertex of every query, written into caller-owned ``(m, 1)`` rows.
-
-    With ``step`` the queries are first moved by ``step[0]`` and the moved points written into
-    ``out_moved``, in the same launch (``kernels/neighbors.query_nearest_via_mesh_after_step``).
-
-    This is [`query_nearest`][triwarp.neighbors.query_nearest]'s ``k = 1`` BVH-backend launch on
-    the hoisted ``target_index`` (a [`mesh_from_points`][triwarp.neighbors.mesh_from_points]),
-    issued into buffers both ICP loops allocate once. Calling ``query_nearest`` every iteration
-    would repeat its device check, accelerator resolution, argument validation and two output
-    allocations for an identical launch -- several times the launch's own host cost, in a loop the
-    host paces. ``test_nearest_into_matches_query_nearest`` pins the two to each other.
-
-    An ``out=`` keyword on ``query_nearest`` would remove this coupling to the kernel's argument
-    list, and it does not pay: the result's ``k = 1`` shape is rank-1, so every call would build
-    two ``(m, 1)`` views of the caller's buffers on top of the device check and the shape guard --
-    about twice this launch's host cost, which reads as a 0.97x on a 20 000-point cloud call.
-    """
-    unbounded = wp.float32(math.inf)
-    if step is not None:
-        wp.launch(
-            kernel_neighbors.query_nearest_via_mesh_after_step,
-            dim=int(queries.shape[0]),
-            inputs=[target_index.id, target_vertices, queries, step, unbounded],
-            outputs=[*out_rows, out_moved],
-            device=queries.device,
-        )
-        return
-    wp.launch(
-        kernel_neighbors.query_nearest_via_mesh,
-        dim=int(queries.shape[0]),
-        inputs=[target_index.id, target_vertices, queries, unbounded],
-        outputs=list(out_rows),
-        device=queries.device,
-    )
-
-
 def _robust_scale_from_residuals(
     current: wp.array[wp.vec3],
     closest: wp.array[wp.vec3],
@@ -870,6 +787,9 @@ def _robust_scale_from_residuals(
 ) -> float:
     """
     Robust scale (Huber/Tukey) from the MAD of the current point-to-plane residuals.
+
+    ``normals`` is the target's normal table -- per face or per vertex -- read at each
+    correspondence's index.
 
     Both medians are taken on the device, over the sorted prefix of in-range residuals
     (``kernel_registration.robust_residual_keys``), so the whole estimate is one readback of the
@@ -932,11 +852,23 @@ def _residual_standard_deviation(
     triangle_id: wp.array[wp.int32],
     max_distance: float,
 ) -> float:
-    """``sqrt(mean((r - mean(r))^2))`` over the in-range residuals, in their original order."""
+    """
+    ``sqrt(mean((r - mean(r))^2))`` over the in-range residuals, in their original order.
+
+    ``normals`` is the target's normal table, read at each correspondence's index.
+    """
     device = current.device
     n = int(current.shape[0])
+    # The residuals ``robust_residual_keys`` keys the medians' sort by, before any sort: the
+    # in-range ones are the residuals this averages, and the ``+inf`` of the rest is never kept.
     residual = wp.empty(n, dtype=wp.float32, device=device)
-    wp.map(kernel_registration.point_to_plane_residual, current, closest, normals, out=residual)
+    wp.launch(
+        kernel_registration.robust_residual_keys,
+        dim=n,
+        inputs=[current, closest, normals, triangle_id, distance, wp.float32(max_distance)],
+        outputs=[residual],
+        device=device,
+    )
     valid = wp.empty(n, dtype=wp.bool, device=device)
     wp.map(
         kernel_registration.residual_valid,
@@ -960,33 +892,6 @@ def _identity_mat44(device: wp.DeviceLike) -> wp.array[wp.mat44]:
         1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0
     )
     return wp.array([identity], dtype=wp.mat44, device=device)
-
-
-def _seed_transform(
-    a: wp.array[wp.vec3], initial: wp.array[wp.mat44] | wp.mat44 | None, device: wp.DeviceLike
-) -> tuple[wp.array[wp.mat44], wp.array[wp.vec3]]:
-    """
-    Normalize the initial transform and apply it, giving both ICP loops their starting state.
-
-    Parameters
-    ----------
-    a
-        ``(n,)`` source point cloud.
-    initial
-        Initial transform as a ``(1,)`` ``wp.mat44`` array, a scalar ``wp.mat44``, or ``None`` for
-        the identity.
-    device
-        Device to allocate on.
-
-    Returns
-    -------
-    tuple[wp.array[wp.mat44], wp.array[wp.vec3]]
-        ``(initial_matrix, current)`` -- the resolved transform and the image of ``a`` under it.
-    """
-    initial_matrix = _resolve_initial(initial, device)
-    current = wp.empty(int(a.shape[0]), dtype=wp.vec3, device=device)
-    _apply_transform(a, initial_matrix, current)
-    return initial_matrix, current
 
 
 def _apply_transform(
